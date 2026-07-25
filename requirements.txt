@@ -1,2 +1,3 @@
 comtypes
 pywin32
+pytest
