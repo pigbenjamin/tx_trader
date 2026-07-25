@@ -119,6 +119,40 @@ def test_background_error_is_rethrown(tmp_path) -> None:
         writer.stop(timeout=1)
 
 
+def test_background_error_notifies_once_and_notifier_error_is_secondary(
+    tmp_path,
+) -> None:
+    class FailingRepository(SQLiteMarketDataRepository):
+        def append_batch(self, events):
+            raise StorageError("original fatal")
+
+    class RaisingNotifier:
+        def __init__(self):
+            self.calls = 0
+
+        def notify_storage_failure(self):
+            self.calls += 1
+            raise RuntimeError("secondary notifier failure")
+
+    repository = FailingRepository(tmp_path / "events.db")
+    events = _begin_for(repository)
+    notifier = RaisingNotifier()
+    writer = SQLiteMarketDataWriter(
+        repository,
+        capacity=2,
+        batch_size=1,
+        flush_interval_seconds=10,
+        notifier=notifier,
+    )
+    writer.start()
+    writer.publish(events[0])
+    assert writer._thread is not None
+    writer._thread.join(1)
+    assert notifier.calls == 1
+    with pytest.raises(StorageError, match="original fatal"):
+        writer.flush(timeout=1)
+
+
 def test_publish_and_flush_are_rejected_after_atomic_stop_cutoff(tmp_path) -> None:
     class BlockingRepository(SQLiteMarketDataRepository):
         entered = threading.Event()

@@ -13,7 +13,19 @@ from tx_trade.market_data.models import (
     TAIPEI,
 )
 from tx_trade.market_data.pipeline import CapturedEventPipeline
+from tx_trade.market_data.ingress import (
+    BoundedIngress,
+    BoundedIngressProcessor,
+    IngressProcessorHaltedError,
+)
 from tx_trade.market_data.sequencer import IngestSequencer
+from tx_trade.monitoring.health import (
+    ControlledShutdown,
+    HealthState,
+    PipelineHealth,
+    SessionImpactTracker,
+)
+from tx_trade.monitoring.metrics import IngressMetrics
 
 NOW = datetime(2026, 7, 26, 9, 30, tzinfo=TAIPEI)
 SESSION = UUID("12345678-1234-5678-1234-567812345678")
@@ -186,3 +198,70 @@ def test_pipeline_rejects_mapper_metadata_tampering_without_publish(field, tampe
         pipeline.accept(make_captured())
     assert sequencer.peek_last(SESSION) == 0
     assert sink.events == []
+
+
+class Clock:
+    def now(self):
+        return NOW
+
+
+def _processor(mapper=None, sink=None):
+    health = PipelineHealth(Clock())
+    metrics = IngressMetrics()
+    impact = SessionImpactTracker(2)
+    shutdown = ControlledShutdown()
+    ingress = BoundedIngress(
+        control_capacity=2,
+        diagnostic_capacity=1,
+        quote_capacity=1,
+        tick_capacity=1,
+        dedupe_capacity=2,
+        health=health,
+        metrics=metrics,
+        session_impact=impact,
+        shutdown=shutdown,
+    )
+    sequencer = IngestSequencer()
+    pipeline = CapturedEventPipeline(mapper or Mapper(), sink or Sink(), sequencer)
+    processor = BoundedIngressProcessor(
+        ingress, pipeline, health, metrics, impact, shutdown
+    )
+    return processor, ingress, sequencer, health, metrics, impact, shutdown
+
+
+def test_bounded_processor_only_sequences_after_pop_and_drains_bounded_count():
+    processor, ingress, sequencer, *_ = _processor()
+    ingress.try_publish(make_captured(3))
+    ingress.try_publish(replace(make_captured(4), dedupe_candidate="second"))
+    assert sequencer.peek_last(SESSION) is None
+    assert processor.drain(1) == 1
+    assert sequencer.peek_last(SESSION) == 0
+    assert processor.drain(10) == 1
+    assert sequencer.peek_last(SESSION) == 1
+    assert processor.process_one() is False
+    with pytest.raises(ValueError):
+        processor.drain(0)
+
+
+def test_bounded_processor_audits_popped_event_failure_and_requests_shutdown():
+    sink = Sink()
+    sink.error = RuntimeError("writer queue full")
+    processor, ingress, sequencer, health, metrics, impact, shutdown = _processor(
+        sink=sink
+    )
+    ingress.try_publish(make_captured())
+    ingress.try_publish(replace(make_captured(4), dedupe_candidate="second"))
+    with pytest.raises(RuntimeError, match="writer queue full"):
+        processor.process_one()
+    assert ingress.depth() == 1
+    assert sequencer.peek_last(SESSION) == 0
+    assert metrics.snapshot().processing_failures == 1
+    assert health.snapshot().state is HealthState.FAILED
+    assert impact.effective_terminal_status(SESSION, "complete") == "incomplete"
+    assert shutdown.snapshot().request_count == 1
+    assert processor.snapshot().is_halted
+    assert processor.snapshot().in_flight_failed_event == make_captured()
+    with pytest.raises(IngressProcessorHaltedError, match="halted"):
+        processor.process_one()
+    assert ingress.depth() == 1
+    assert metrics.snapshot().processing_failures == 1

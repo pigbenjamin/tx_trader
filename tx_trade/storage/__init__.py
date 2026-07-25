@@ -12,6 +12,7 @@ from .sqlite_repository import (
 from .sqlite_writer import (
     SQLiteMarketDataWriter,
     StorageBackpressureError,
+    StorageFailureNotifier,
     WriterState,
     WriterStats,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "SQLiteMarketDataWriter",
     "SQLiteReplaySource",
     "StorageBackpressureError",
+    "StorageFailureNotifier",
     "StorageError",
     "WriterState",
     "WriterStats",

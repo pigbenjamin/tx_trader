@@ -7,8 +7,15 @@ Supported keys:
 * ``TX_TRADE_EXECUTION_MODE``
 * ``TX_TRADE_ENABLE_LIVE_QUOTE``
 * ``TX_TRADE_INGRESS_QUEUE_CAPACITY``
+* ``TX_TRADE_INGRESS_CONNECTION_CAPACITY``
+* ``TX_TRADE_INGRESS_DIAGNOSTIC_RESERVED_CAPACITY``
+* ``TX_TRADE_INGRESS_QUOTE_CAPACITY``
+* ``TX_TRADE_INGRESS_TICK_CAPACITY``
+* ``TX_TRADE_INGRESS_DEDUPE_CAPACITY``
 * ``TX_TRADE_STA_QUOTE_ENRICHMENT_CAPACITY``
 * ``TX_TRADE_STORAGE_WRITER_QUEUE_CAPACITY``
+* ``TX_TRADE_STORAGE_BATCH_SIZE``
+* ``TX_TRADE_STORAGE_FLUSH_INTERVAL_MS``
 
 This module deliberately does not read the environment or filesystem.  A
 composition root may pass a previously captured mapping to
@@ -62,8 +69,15 @@ class Phase1Settings:
     execution_mode: ExecutionMode
     live_quote_opt_in: bool
     ingress_queue_capacity: int
+    ingress_control_capacity: int
+    ingress_diagnostic_capacity: int
+    ingress_quote_capacity: int
+    ingress_tick_capacity: int
+    ingress_dedupe_capacity: int
     sta_quote_enrichment_capacity: int
     storage_writer_queue_capacity: int
+    storage_batch_size: int
+    storage_flush_interval_ms: int
 
     def __post_init__(self) -> None:
         if type(self.preset) is not RuntimePreset:
@@ -76,12 +90,29 @@ class Phase1Settings:
             raise ConfigError("live_quote_opt_in must be bool")
         for name in (
             "ingress_queue_capacity",
+            "ingress_control_capacity",
+            "ingress_diagnostic_capacity",
+            "ingress_quote_capacity",
+            "ingress_tick_capacity",
+            "ingress_dedupe_capacity",
             "sta_quote_enrichment_capacity",
             "storage_writer_queue_capacity",
+            "storage_batch_size",
+            "storage_flush_interval_ms",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ConfigError(f"{name} must be a positive integer")
+        lane_capacity = (
+            self.ingress_control_capacity
+            + self.ingress_diagnostic_capacity
+            + self.ingress_quote_capacity
+            + self.ingress_tick_capacity
+        )
+        if lane_capacity > self.ingress_queue_capacity:
+            raise ConfigError(
+                "ingress lane capacities must not exceed ingress_queue_capacity"
+            )
 
         if (self.quote_source, self.execution_mode) != _PRESET_MODES[self.preset]:
             raise ConfigError("quote_source/execution_mode must match preset")
@@ -121,10 +152,52 @@ def _positive_int(values: Mapping[str, str], key: str, default: int) -> int:
     return value
 
 
+_LANE_KEYS = (
+    "TX_TRADE_INGRESS_CONNECTION_CAPACITY",
+    "TX_TRADE_INGRESS_DIAGNOSTIC_RESERVED_CAPACITY",
+    "TX_TRADE_INGRESS_QUOTE_CAPACITY",
+    "TX_TRADE_INGRESS_TICK_CAPACITY",
+)
+_LANE_DEFAULTS = (256, 64, 1024, 2752)
+
+
+def _ingress_capacities(values: Mapping[str, str]) -> tuple[int, int, int, int, int]:
+    aggregate = _positive_int(values, "TX_TRADE_INGRESS_QUEUE_CAPACITY", 4096)
+    lane_override = any(key in values for key in _LANE_KEYS)
+    aggregate_override = "TX_TRADE_INGRESS_QUEUE_CAPACITY" in values
+    if aggregate_override and not lane_override:
+        if aggregate < 4:
+            raise ConfigError(
+                "TX_TRADE_INGRESS_QUEUE_CAPACITY must be at least 4"
+            )
+        remaining = aggregate - 4
+        weighted = [remaining * weight // 4096 for weight in _LANE_DEFAULTS]
+        remainder = remaining - sum(weighted)
+        fractions = [
+            (remaining * weight % 4096, index)
+            for index, weight in enumerate(_LANE_DEFAULTS)
+        ]
+        for _, index in sorted(fractions, reverse=True)[:remainder]:
+            weighted[index] += 1
+        lanes = tuple(value + 1 for value in weighted)
+    else:
+        lanes = tuple(
+            _positive_int(values, key, default)
+            for key, default in zip(_LANE_KEYS, _LANE_DEFAULTS, strict=True)
+        )
+    return (aggregate, *lanes)
+
+
 def parse_phase1_settings(
     values: Mapping[str, str] | None = None,
 ) -> Phase1Settings:
-    """Parse an explicit mapping without consulting ambient process state."""
+    """Parse an explicit mapping without consulting ambient process state.
+
+    An aggregate-only ingress capacity override is deterministically divided
+    across four positive lanes using the default lane weights. Once any lane
+    is explicitly supplied, explicit/default lane values are instead checked
+    against the aggregate fail-closed.
+    """
 
     supplied: Mapping[str, str] = {} if values is None else values
     if not isinstance(supplied, Mapping):
@@ -160,13 +233,25 @@ def parse_phase1_settings(
     if opt_in_raw not in {"0", "1"}:
         raise ConfigError("TX_TRADE_ENABLE_LIVE_QUOTE must be exactly '0' or '1'")
 
-    return Phase1Settings(
+    (
+        ingress_capacity,
+        control_capacity,
+        diagnostic_capacity,
+        quote_capacity,
+        tick_capacity,
+    ) = _ingress_capacities(supplied)
+    settings = Phase1Settings(
         preset=preset,
         quote_source=quote_source,
         execution_mode=execution_mode,
         live_quote_opt_in=opt_in_raw == "1",
-        ingress_queue_capacity=_positive_int(
-            supplied, "TX_TRADE_INGRESS_QUEUE_CAPACITY", 4096
+        ingress_queue_capacity=ingress_capacity,
+        ingress_control_capacity=control_capacity,
+        ingress_diagnostic_capacity=diagnostic_capacity,
+        ingress_quote_capacity=quote_capacity,
+        ingress_tick_capacity=tick_capacity,
+        ingress_dedupe_capacity=_positive_int(
+            supplied, "TX_TRADE_INGRESS_DEDUPE_CAPACITY", 4096
         ),
         sta_quote_enrichment_capacity=_positive_int(
             supplied, "TX_TRADE_STA_QUOTE_ENRICHMENT_CAPACITY", 1024
@@ -174,4 +259,11 @@ def parse_phase1_settings(
         storage_writer_queue_capacity=_positive_int(
             supplied, "TX_TRADE_STORAGE_WRITER_QUEUE_CAPACITY", 4096
         ),
+        storage_batch_size=_positive_int(
+            supplied, "TX_TRADE_STORAGE_BATCH_SIZE", 128
+        ),
+        storage_flush_interval_ms=_positive_int(
+            supplied, "TX_TRADE_STORAGE_FLUSH_INTERVAL_MS", 250
+        ),
     )
+    return settings

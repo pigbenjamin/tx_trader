@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Protocol, runtime_checkable
 
 from tx_trade.market_data.models import MarketDataEnvelope
 
@@ -16,6 +17,11 @@ from .sqlite_repository import SQLiteMarketDataRepository, StorageError
 
 class StorageBackpressureError(StorageError):
     pass
+
+
+@runtime_checkable
+class StorageFailureNotifier(Protocol):
+    def notify_storage_failure(self) -> None: ...
 
 
 class WriterState(StrEnum):
@@ -51,6 +57,7 @@ class SQLiteMarketDataWriter:
         capacity: int,
         batch_size: int,
         flush_interval_seconds: float,
+        notifier: StorageFailureNotifier | None = None,
     ) -> None:
         if type(capacity) is not int or capacity < 1:
             raise ValueError("capacity must be positive")
@@ -63,11 +70,16 @@ class SQLiteMarketDataWriter:
             or flush_interval_seconds <= 0
         ):
             raise ValueError("flush_interval_seconds must be finite and positive")
+        if notifier is not None and not isinstance(
+            notifier, StorageFailureNotifier
+        ):
+            raise TypeError("notifier must implement StorageFailureNotifier")
         self._repository = repository
         self._queue: queue.Queue[object] = queue.Queue(maxsize=capacity)
         self._capacity = capacity
         self._batch_size = batch_size
         self._interval = float(flush_interval_seconds)
+        self._notifier = notifier
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._state = WriterState.NEW
@@ -238,6 +250,13 @@ class SQLiteMarketDataWriter:
             with self._lock:
                 self._fatal = fatal
                 self._state = WriterState.FAILED
+            if self._notifier is not None:
+                try:
+                    self._notifier.notify_storage_failure()
+                except BaseException:
+                    # Notification is secondary; the original storage fatal state
+                    # must remain the error observed by writer callers.
+                    pass
             while True:
                 try:
                     pending = self._queue.get_nowait()
