@@ -1,3 +1,4 @@
 comtypes==1.4.16
 pytest==9.1.1
 pywin32==312
+tzdata==2026.3
