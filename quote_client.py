@@ -25,8 +25,9 @@ SK_SUBJECT_CONNECTION_STOCKS_READY = 3003  # 報價商品載入完成，此後�
 class QuoteClient:
     """最小報價客戶端，優先嘗試連接 Capital API，若缺少 DLL 則退回離線模式。"""
 
-    def __init__(self, dll_path: Optional[str] = None):
+    def __init__(self, dll_path: Optional[str] = None, quote_only: bool = False):
         self.dll_path = dll_path or str(API_DLL_PATH)
+        self.quote_only = quote_only
         self._connected = False
         self._symbols: List[str] = []
         self._quote_service = None
@@ -40,6 +41,9 @@ class QuoteClient:
         self._dll_candidates = self._build_dll_candidates()
         self._reply_registered = False
         self._event_connection = None
+        self._monitor_active = False
+        self._stock_subscriptions: set[str] = set()
+        self._tick_subscriptions: set[str] = set()
 
     def _build_dll_candidates(self) -> List[str]:
         candidates: List[str] = []
@@ -73,9 +77,12 @@ class QuoteClient:
                 self._api_objects = {
                     "center": comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib),
                     "quote": comtypes.client.CreateObject(sk.SKQuoteLib, interface=sk.ISKQuoteLib),
-                    "order": comtypes.client.CreateObject(sk.SKOrderLib, interface=sk.ISKOrderLib),
-                    "reply": comtypes.client.CreateObject(sk.SKReplyLib, interface=sk.ISKReplyLib),
                 }
+                if not self.quote_only:
+                    self._api_objects.update({
+                        "order": comtypes.client.CreateObject(sk.SKOrderLib, interface=sk.ISKOrderLib),
+                        "reply": comtypes.client.CreateObject(sk.SKReplyLib, interface=sk.ISKReplyLib),
+                    })
                 self._center_service = self._api_objects.get("center")
                 self._quote_service = self._api_objects.get("quote")
                 self._order_service = self._api_objects.get("order")
@@ -167,8 +174,11 @@ class QuoteClient:
             return {"success": False, "mode": "api", "steps": steps, "message": str(exc)}
 
         try:
-            self._register_reply_callback()
-            steps.append("register_reply")
+            if self.quote_only:
+                steps.append("skip_reply_quote_only")
+            else:
+                self._register_reply_callback()
+                steps.append("register_reply")
         except Exception as exc:
             steps.append(f"register_reply_failed:{exc}")
             return {"success": False, "mode": "api", "steps": steps, "message": str(exc)}
@@ -355,10 +365,81 @@ class QuoteClient:
         if self._offline_mode:
             return {"success": True, "mode": "offline", "message": "enter monitor offline"}
 
+        # Mark this before the COM call so cleanup still attempts LeaveMonitor
+        # when callback registration or the API call partially succeeds.
+        self._monitor_active = True
         self._register_quote_callback()
 
         code = self._invoke_method(self._quote_service, ["SKQuoteLib_EnterMonitorLONG"])
         return {"success": code == 0, "code": int(code), "message": self._get_return_code_message(int(code))}
+
+    def leave_monitor(self) -> Dict[str, Any]:
+        """Best-effort cancellation and disconnection for quote-only sessions.
+
+        This method is intentionally idempotent and never raises, so it is safe
+        to call from a fixture ``finally`` block after partial setup.
+        """
+        result: Dict[str, Any] = {"success": True, "steps": [], "errors": []}
+
+        if self._offline_mode or self._quote_service is None:
+            self._monitor_active = False
+            self._stock_subscriptions.clear()
+            self._tick_subscriptions.clear()
+            result["steps"].append("not_connected")
+            return result
+
+        if not self._monitor_active and not self._stock_subscriptions and not self._tick_subscriptions:
+            result["steps"].append("already_left")
+            return result
+
+        cleanup_calls = (
+            ("cancel_ticks", "SKQuoteLib_CancelRequestTicks", self._tick_subscriptions),
+            ("cancel_stocks", "SKQuoteLib_CancelRequestStocks", self._stock_subscriptions),
+        )
+        for step, method_name, subscriptions in cleanup_calls:
+            if not subscriptions:
+                continue
+            try:
+                code = self._invoke_method(
+                    self._quote_service,
+                    [method_name],
+                    ",".join(sorted(subscriptions)),
+                )
+                result["steps"].append({"name": step, "code": int(code)})
+                if int(code) == 0:
+                    subscriptions.clear()
+                else:
+                    result["success"] = False
+                    result["errors"].append({
+                        "name": step,
+                        "code": int(code),
+                        "message": self._get_return_code_message(int(code)),
+                    })
+            except Exception as exc:
+                result["success"] = False
+                result["errors"].append({"name": step, "message": str(exc)})
+
+        if self._monitor_active:
+            try:
+                code = self._invoke_method(self._quote_service, ["SKQuoteLib_LeaveMonitor"])
+                result["steps"].append({"name": "leave_monitor", "code": int(code)})
+                if int(code) == 0:
+                    self._monitor_active = False
+                    state = getattr(self, "_quote_connection_state", None)
+                    if state is not None:
+                        state["stocks_ready"] = False
+                else:
+                    result["success"] = False
+                    result["errors"].append({
+                        "name": "leave_monitor",
+                        "code": int(code),
+                        "message": self._get_return_code_message(int(code)),
+                    })
+            except Exception as exc:
+                result["success"] = False
+                result["errors"].append({"name": "leave_monitor", "message": str(exc)})
+
+        return result
 
     def _pump_com_messages(self, duration: float) -> None:
         """在等待期間持續抽送 COM 訊息，讓 comtypes 事件回呼(OnConnection 等)得以被派送執行。"""
@@ -436,6 +517,7 @@ class QuoteClient:
 
         symbol_text = ",".join(target_symbols)
         method_names = ["SKQuoteLib_RequestStocksWithMarketNo"] if market_no is not None else ["SKQuoteLib_RequestStocks"]
+        self._stock_subscriptions.update(target_symbols)
         payload = self._wrap_paging_call(method_names, market_no, symbol_text)
         payload["symbols"] = target_symbols
         return payload
@@ -450,6 +532,7 @@ class QuoteClient:
         target_symbols = symbols or self._symbols
         symbol_text = ",".join(target_symbols)
         method_names = ["SKQuoteLib_RequestTicksWithMarketNo"] if market_no is not None else ["SKQuoteLib_RequestTicks"]
+        self._tick_subscriptions.update(target_symbols)
         payload = self._wrap_paging_call(method_names, market_no, symbol_text)
         payload["symbols"] = target_symbols
         return payload
