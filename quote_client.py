@@ -1,7 +1,10 @@
 import os
 import time
+from collections.abc import Mapping
+from copy import deepcopy
 from ctypes import POINTER, c_short, pointer
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 try:
@@ -14,27 +17,65 @@ try:
 except Exception:  # pragma: no cover - environment dependent
     comtypes = None
 
-from config import API_DLL_PATH, DEFAULT_SYMBOLS, DEFAULT_ACCOUNT, DEFAULT_PASSWORD
-
 # OnConnection 事件的 nKind 代碼（見群益「策略王COM元件使用說明」6.代碼定義表）
 SK_SUBJECT_CONNECTION_CONNECTED = 3001
 SK_SUBJECT_CONNECTION_DISCONNECT = 3002
 SK_SUBJECT_CONNECTION_STOCKS_READY = 3003  # 報價商品載入完成，此後才可訂閱/查詢商品
 
 
+def _defensive_copy(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _defensive_copy(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_defensive_copy(item) for item in value]
+    if isinstance(value, list):
+        return [_defensive_copy(item) for item in value]
+    return deepcopy(value)
+
+
+class QuoteClientUnsupportedOperationError(RuntimeError):
+    """The adapter-backed quote-only façade does not expose this operation."""
+
+
+class QuoteClientStoppedError(RuntimeError):
+    """The adapter-backed façade has reached its terminal stopped state."""
+
+
 class QuoteClient:
     """最小報價客戶端，優先嘗試連接 Capital API，若缺少 DLL 則退回離線模式。"""
 
-    def __init__(self, dll_path: Optional[str] = None, quote_only: bool = False):
-        self.dll_path = dll_path or str(API_DLL_PATH)
-        self.quote_only = quote_only
+    def __init__(
+        self,
+        dll_path: Optional[str] = None,
+        quote_only: bool = False,
+        *,
+        quote_adapter: Any = None,
+        event_snapshot_provider: Any = None,
+    ):
+        self._quote_adapter = quote_adapter
+        self._event_snapshot_provider = event_snapshot_provider
+        self._adapter_mode = quote_adapter is not None
+        self._adapter_stopped = False
+        self._adapter_stop_lock = Lock()
+        self._default_symbols: List[str] = []
+        if self._adapter_mode:
+            # The injected adapter is already the result of composition and mode
+            # validation.  Do not import legacy config or inspect the environment.
+            self.dll_path = dll_path
+            self.quote_only = True
+        else:
+            from config import API_DLL_PATH, DEFAULT_SYMBOLS
+
+            self.dll_path = dll_path or str(API_DLL_PATH)
+            self.quote_only = quote_only
+            self._default_symbols = list(DEFAULT_SYMBOLS)
         self._connected = False
         self._symbols: List[str] = []
         self._quote_service = None
         self._center_service = None
         self._order_service = None
         self._reply_service = None
-        self._offline_mode = True
+        self._offline_mode = not self._adapter_mode
         self._last_error: Optional[str] = None
         self._sk_module = None
         self._api_objects: dict[str, Any] = {}
@@ -60,6 +101,34 @@ class QuoteClient:
             r"C:\Program Files (x86)\CapitalAPI\SKCOM.dll",
         ])
         return list(dict.fromkeys(candidates))
+
+    def _ensure_adapter_active(self) -> None:
+        if self._adapter_stopped:
+            raise QuoteClientStoppedError("quote adapter façade is stopped")
+
+    def _unsupported_in_adapter_mode(self, operation: str) -> None:
+        raise QuoteClientUnsupportedOperationError(
+            f"{operation} is unsupported by the adapter-backed quote-only façade"
+        )
+
+    @staticmethod
+    def _snapshot_value(snapshot: Any, name: str, default: Any = None) -> Any:
+        if isinstance(snapshot, dict):
+            return snapshot.get(name, default)
+        return getattr(snapshot, name, default)
+
+    def _adapter_connection_payload(self) -> Dict[str, Any]:
+        snapshot = self._quote_adapter.snapshot()
+        state = self._snapshot_value(snapshot, "state")
+        state_value = getattr(state, "value", state)
+        connected = state_value in ("stocks_ready", "subscribed")
+        return {
+            "success": True,
+            "connected": connected,
+            "status": state_value,
+            "last_kind": self._snapshot_value(snapshot, "last_kind"),
+            "last_code": self._snapshot_value(snapshot, "last_code"),
+        }
 
     def _try_load_api(self) -> bool:
         if comtypes is None:
@@ -98,8 +167,14 @@ class QuoteClient:
 
     def initialize(self) -> bool:
         """初始化 COM 物件與 API 連線；若缺少 DLL，改為離線模式。"""
+        if self._adapter_mode:
+            self._ensure_adapter_active()
+            self._connected = False
+            self._quote_adapter.start()
+            self._connected = True
+            return True
         self._connected = False
-        self._symbols = list(DEFAULT_SYMBOLS)
+        self._symbols = list(self._default_symbols)
         if self._try_load_api():
             self._connected = True
             return True
@@ -153,6 +228,16 @@ class QuoteClient:
         """登入 Capital API；離線模式下回傳詳細狀態。"""
         if not account or not password:
             raise ValueError("帳號與密碼不可為空")
+        if self._adapter_mode:
+            self._ensure_adapter_active()
+            self._quote_adapter.login(account, password)
+            return {
+                "success": True,
+                "mode": "adapter",
+                "code": 0,
+                "steps": ["login"],
+                "message": "login completed",
+            }
         if self._offline_mode:
             return {"success": True, "mode": "offline", "code": 0, "message": "offline mode"}
 
@@ -360,6 +445,18 @@ class QuoteClient:
 
     def enter_monitor(self) -> Dict[str, Any]:
         """進入行情監看並返回狀態。"""
+        if self._adapter_mode:
+            self._ensure_adapter_active()
+            if not self._connected:
+                raise RuntimeError("尚未初始化報價客戶端")
+            self._quote_adapter.enter_monitor()
+            self._monitor_active = True
+            return {
+                "success": True,
+                "mode": "adapter",
+                "code": 0,
+                "message": "enter monitor completed",
+            }
         if not self._connected:
             raise RuntimeError("尚未初始化報價客戶端")
         if self._offline_mode:
@@ -380,6 +477,32 @@ class QuoteClient:
         to call from a fixture ``finally`` block after partial setup.
         """
         result: Dict[str, Any] = {"success": True, "steps": [], "errors": []}
+
+        if self._adapter_mode:
+            with self._adapter_stop_lock:
+                if self._adapter_stopped:
+                    result["steps"].append("already_stopped")
+                    return result
+                # Stopping is terminal even when the adapter reports a stop error.
+                self._adapter_stopped = True
+                self._connected = False
+                self._monitor_active = False
+                self._stock_subscriptions.clear()
+                self._tick_subscriptions.clear()
+                try:
+                    self._quote_adapter.stop(5.0)
+                except Exception:
+                    result["success"] = False
+                    result["steps"].append("stop_failed")
+                    result["errors"].append(
+                        {
+                            "name": "stop",
+                            "message": "quote adapter stop failed",
+                        }
+                    )
+                    return result
+                result["steps"].append("stop")
+                return result
 
         if self._offline_mode or self._quote_service is None:
             self._monitor_active = False
@@ -453,6 +576,11 @@ class QuoteClient:
 
     def is_quote_connected(self) -> Dict[str, Any]:
         """檢查報價商品是否已就緒（依 OnConnection 事件的 SK_SUBJECT_CONNECTION_STOCKS_READY 判斷）。"""
+        if self._adapter_mode:
+            self._ensure_adapter_active()
+            if not self._connected:
+                raise RuntimeError("尚未初始化報價客戶端")
+            return self._adapter_connection_payload()
         if not self._connected:
             raise RuntimeError("尚未初始化報價客戶端")
         if self._offline_mode:
@@ -468,6 +596,37 @@ class QuoteClient:
 
     def wait_for_quote_ready(self, timeout: float = 12.0, interval: float = 1.0) -> Dict[str, Any]:
         """等待 OnConnection 事件回報 SK_SUBJECT_CONNECTION_STOCKS_READY(商品資料下載完成)。"""
+        if self._adapter_mode:
+            self._ensure_adapter_active()
+            if not self._connected:
+                raise RuntimeError("尚未初始化報價客戶端")
+            started_at = time.monotonic()
+            status = self._quote_adapter.wait_until_ready(float(timeout))
+            from tx_trade.market_data.models import ConnectionStatus
+
+            if not isinstance(status, ConnectionStatus):
+                raise TypeError(
+                    "adapter wait_until_ready must return ConnectionStatus"
+                )
+            is_ready = status.is_ready
+            last_kind = status.broker_kind_raw
+            last_code = status.broker_code_raw
+            state_value = status.state.value
+            legacy_status = {
+                "success": is_ready,
+                "connected": is_ready,
+                "status": state_value,
+                "last_kind": last_kind,
+                "last_code": last_code,
+            }
+            return {
+                "success": is_ready,
+                "connected": is_ready,
+                "status": legacy_status,
+                "last_kind": last_kind,
+                "last_code": last_code,
+                "elapsed": time.monotonic() - started_at,
+            }
         if not self._connected:
             raise RuntimeError("尚未初始化報價客戶端")
         if self._offline_mode:
@@ -490,8 +649,14 @@ class QuoteClient:
         status["success"] = False
         return status
 
+    def wait_until_ready(self, timeout_seconds: float = 12.0) -> Dict[str, Any]:
+        """Adapter-style spelling retained alongside the legacy façade method."""
+        return self.wait_for_quote_ready(timeout=timeout_seconds)
+
     def request_server_time(self) -> Dict[str, Any]:
         """回傳主機時間。"""
+        if self._adapter_mode:
+            self._unsupported_in_adapter_mode("request_server_time")
         if not self._connected:
             raise RuntimeError("尚未初始化報價客戶端")
         if self._offline_mode:
@@ -502,6 +667,23 @@ class QuoteClient:
 
     def request_stocks(self, symbols: Optional[List[str]] = None, market_no: Optional[int] = None) -> Dict[str, Any]:
         """請求商品清單或商品查詢。"""
+        if self._adapter_mode:
+            self._ensure_adapter_active()
+            if market_no is not None:
+                self._unsupported_in_adapter_mode("request_stocks(market_no=...)")
+            if not self._connected:
+                raise RuntimeError("尚未初始化報價客戶端")
+            target_symbols = list(symbols or self._symbols)
+            self._quote_adapter.subscribe_quotes(target_symbols)
+            self._stock_subscriptions.update(target_symbols)
+            return {
+                "success": True,
+                "code": 0,
+                "message": "quote subscription completed",
+                "page_no": 0,
+                "response": [],
+                "symbols": target_symbols,
+            }
         if not self._connected:
             raise RuntimeError("尚未初始化報價客戶端")
 
@@ -513,6 +695,7 @@ class QuoteClient:
                     {"symbol": symbol, "market": "TX", "status": "offline"}
                     for symbol in target_symbols
                 ],
+                "symbols": target_symbols,
             }
 
         symbol_text = ",".join(target_symbols)
@@ -524,6 +707,23 @@ class QuoteClient:
 
     def request_ticks(self, symbols: Optional[List[str]] = None, market_no: Optional[int] = None) -> Dict[str, Any]:
         """請求 Tick 資料。"""
+        if self._adapter_mode:
+            self._ensure_adapter_active()
+            if market_no is not None:
+                self._unsupported_in_adapter_mode("request_ticks(market_no=...)")
+            if not self._connected:
+                raise RuntimeError("尚未初始化報價客戶端")
+            target_symbols = list(symbols or self._symbols)
+            self._quote_adapter.subscribe_ticks(target_symbols)
+            self._tick_subscriptions.update(target_symbols)
+            return {
+                "success": True,
+                "code": 0,
+                "message": "tick subscription completed",
+                "page_no": 0,
+                "response": [],
+                "symbols": target_symbols,
+            }
         if not self._connected:
             raise RuntimeError("尚未初始化報價客戶端")
         if self._offline_mode:
@@ -539,6 +739,8 @@ class QuoteClient:
 
     def get_stock_by_symbol(self, symbol: str, market_no: Optional[int] = None) -> Dict[str, Any]:
         """根據代碼取得商品資訊。"""
+        if self._adapter_mode:
+            self._unsupported_in_adapter_mode("get_stock_by_symbol")
         if not self._connected:
             raise RuntimeError("尚未初始化報價客戶端")
         if self._offline_mode:
@@ -554,6 +756,8 @@ class QuoteClient:
 
     def get_tick_long(self, market_no: int, stock_idx: int, n_ptr: int = 0) -> Dict[str, Any]:
         """取得長格式 tick 資料。"""
+        if self._adapter_mode:
+            self._unsupported_in_adapter_mode("get_tick_long")
         if not self._connected:
             raise RuntimeError("尚未初始化報價客戶端")
         if self._offline_mode:
@@ -566,6 +770,11 @@ class QuoteClient:
 
     def pump_events(self, duration: float = 1.0) -> None:
         """抽送 COM 訊息一段時間，讓已註冊的事件回呼(報價/Tick/OnConnection等)有機會被觸發執行。"""
+        if self._adapter_mode:
+            self._ensure_adapter_active()
+            if duration > 0:
+                time.sleep(min(float(duration), 0.05))
+            return
         if self._offline_mode:
             time.sleep(duration)
             return
@@ -573,10 +782,30 @@ class QuoteClient:
 
     def get_latest_event_data(self) -> Dict[str, Any]:
         """回傳自事件回調蒐集到的最新報價資料。"""
+        if self._adapter_mode:
+            provider = self._event_snapshot_provider
+            if provider is None:
+                return {
+                    "server_time": None,
+                    "stock_list": None,
+                    "quotes": [],
+                    "ticks": [],
+                }
+            if callable(provider):
+                snapshot = provider()
+            elif callable(getattr(provider, "snapshot", None)):
+                snapshot = provider.snapshot()
+            elif callable(getattr(provider, "get_latest_event_data", None)):
+                snapshot = provider.get_latest_event_data()
+            else:
+                raise TypeError("event snapshot provider is not readable")
+            return _defensive_copy(snapshot)
         return getattr(self, '_quote_event_data', {})
 
     def connect_reply_by_id(self, user_id: str) -> Dict[str, Any]:
         """連線 ReplyLib，讓回報機制可用。"""
+        if self._adapter_mode:
+            self._unsupported_in_adapter_mode("connect_reply_by_id")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
@@ -587,6 +816,8 @@ class QuoteClient:
 
     def order_initialize(self) -> Dict[str, Any]:
         """初始化下單元件。"""
+        if self._adapter_mode:
+            self._unsupported_in_adapter_mode("order_initialize")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
@@ -597,6 +828,8 @@ class QuoteClient:
 
     def order_load_commodity_gw(self, login_id: str) -> Dict[str, Any]:
         """載入 GW 下單商品資訊。"""
+        if self._adapter_mode:
+            self._unsupported_in_adapter_mode("order_load_commodity_gw")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
@@ -607,6 +840,8 @@ class QuoteClient:
 
     def order_initial_proxy_by_id(self, login_id: str) -> Dict[str, Any]:
         """初始化 proxy 下單；適用特定帳號 ID。"""
+        if self._adapter_mode:
+            self._unsupported_in_adapter_mode("order_initial_proxy_by_id")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
@@ -617,6 +852,8 @@ class QuoteClient:
 
     def get_order_login_type(self, login_id: str) -> Dict[str, Any]:
         """查詢下單帳號類型。"""
+        if self._adapter_mode:
+            self._unsupported_in_adapter_mode("get_order_login_type")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
