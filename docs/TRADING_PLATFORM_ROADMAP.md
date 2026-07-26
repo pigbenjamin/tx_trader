@@ -554,13 +554,129 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 
 ## 14. 下一個工作項目
 
-下一步執行 Phase 2 設計：
+下一個且唯一的 implementation slice 是：
 
 1. 固定 Phase 2A `ReplayRuntime` 的 public contract、狀態機、clock 與
-   cursor semantics。
-2. 以 Phase 1 兩個完整 offline session 建立 deterministic replay
-   acceptance fixtures。
-3. 定義 Phase 2B 最小 broker abstraction、paper fill policy 與費用模型，
-   維持與 SKCOM Order/Reply 完全隔離。
-4. 在市場時段完成 Phase 1 live quote-only smoke；此項是 Phase 2 最終
-   驗收的必要條件。
+   cursor semantics；可使用 Phase 1 完整 offline session 作為同一
+   slice 的 deterministic acceptance fixture，但不得藉此擴大實作範圍。
+
+Phase 2B 的 broker abstraction、paper fill policy 與費用模型屬後續
+backlog；必須等 Phase 2A contract 通過驗收後才能開始設計。
+
+獨立的 acceptance gate：在市場時段完成 Phase 1 live quote-only smoke；
+此項不是上述 implementation slice 的範圍，但必須在 Phase 2 最終驗收前
+完成。
+
+## 15. 新工作階段交接清單（2026-07-27）
+
+### 15.1 接手基線
+
+- 分支為 `main`；交接開始時 `HEAD` 為文件提交 `3980b0d`，其前一個
+  `ab9e5b9` 是目前最新的程式碼提交，Phase 1 七個 slice 的程式碼提交
+  範圍為 `f2b24be` 至 `ab9e5b9`。
+- 既有文件記錄的自動化證據為 `268 passed, 1 skipped`；唯一 skip 是
+  預設停用的真實 SKCOM quote-only integration test，本次交接未重跑。
+- 既有文件記錄的 release validation SQLite 證據：同一資料庫內兩個不同 session，
+  狀態皆為 `complete`，各 6 個事件，最後 `ingest_sequence=5`，完整
+  readback 成功；本次交接未重驗。
+- repository root 既有未追蹤檔 `phase1_smoke.sqlite3` 是本機 release
+  validation artifact，不得加入 commit。
+
+### 15.2 Phase 0 尚待完成
+
+現有 `venv_tx_trade\pyvenv.cfg` 記錄 Python `3.13.14`，可作為 known
+baseline。本次受限工具宿主因 Windows Store/App Execution Alias 限制
+無法重驗 executable，不能據此判斷既有 venv 是否健康；fresh-env 執行
+證據仍然缺少。除非未來另有正式 pin 決策，Phase 0 的 Python policy 是
+使用 Python 3.13 系列，並記錄實際完整版本，不要求 patch 必須是
+`3.13.14`。接手者須先把下列可重建步驟補入 README，再在全新 venv
+實際執行：
+
+```powershell
+py -3.13 -m venv .\venv_tx_trade_fresh
+.\venv_tx_trade_fresh\Scripts\python.exe --version
+.\venv_tx_trade_fresh\Scripts\python.exe -m pip install -r .\requirements.txt
+.\venv_tx_trade_fresh\Scripts\python.exe -m pip check
+.\venv_tx_trade_fresh\Scripts\python.exe -c "import comtypes, pytest, win32api, tzdata"
+.\venv_tx_trade_fresh\Scripts\python.exe -m pytest -q
+```
+
+若 launcher 無法提供 Python 3.13 系列，先安裝／選定 3.13 再建立 venv。
+不得用既有 venv metadata 代替 fresh-env 執行證據。記錄 Python 的完整
+版本、pip install、`pip check`、imports 及完整 pytest 的實際結果後，
+才可將 Phase 0 標為「已完成」。
+
+Phase 0 的 README 待辦也包含安全化目前的 live 明文 assignment 示例：
+不得示範把真實 credential literal 指派在可留存的 shell history。
+
+### 15.3 Phase 1 live quote-only smoke
+
+測試與 production 使用兩個不同的 opt-in，禁止混用：
+
+- integration test opt-in：`TX_TRADE_RUN_LIVE_QUOTE_TEST=1`。測試還要求
+  Windows、`TX_TRADE_SKCOM_DLL_PATH` 指向存在的 DLL，以及非空的
+  `TX_TRADE_ACCOUNT`、`TX_TRADE_PASSWORD`。symbol 固定為 `TX00`。
+- production recorder opt-in：`TX_TRADE_RUNTIME_PRESET=phase1_live_quote`
+  與 `TX_TRADE_ENABLE_LIVE_QUOTE=1`；app 另外要求
+  `TX_TRADE_ACCOUNT`、`TX_TRADE_PASSWORD`、
+  `TX_TRADE_SKCOM_DLL_PATH`、`TX_TRADE_SYMBOLS`。可選設定為
+  `TX_TRADE_RECORDING_DB_PATH`、`TX_TRADE_LIVE_READY_TIMEOUT_SECONDS`
+  與 `TX_TRADE_LIVE_STOP_TIMEOUT_SECONDS`。
+- integration test 不使用 `TX_TRADE_ENABLE_LIVE_QUOTE`；production app
+  也不以 `TX_TRADE_RUN_LIVE_QUOTE_TEST` 授權 live。
+
+`.env` 不會由目前的 integration test 或 app entry point 自動載入。帳密
+與 DLL path 必須由核准的 secret store、無 history prompt，或專用的短
+生命 shell 注入目前 process；不得使用包含真值的 literal assignment，
+也不得把值寫入文件、command history、log 或 commit。下例假設必要值已
+安全注入，並在結束時清除或還原所有觸及的環境變數：
+
+```powershell
+$names = @(
+    "TX_TRADE_RUN_LIVE_QUOTE_TEST",
+    "TX_TRADE_ACCOUNT",
+    "TX_TRADE_PASSWORD",
+    "TX_TRADE_SKCOM_DLL_PATH"
+)
+$saved = @{}
+foreach ($name in $names) {
+    $saved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+}
+try {
+    if (-not $env:TX_TRADE_ACCOUNT -or -not $env:TX_TRADE_PASSWORD) { throw "SKCOM credentials are not configured" }
+    if (-not (Test-Path -LiteralPath $env:TX_TRADE_SKCOM_DLL_PATH -PathType Leaf)) { throw "SKCOM DLL path is invalid" }
+    $env:TX_TRADE_RUN_LIVE_QUOTE_TEST = "1"
+    .\venv_tx_trade_fresh\Scripts\python.exe -m pytest .\tests\integration\test_skcom_quote_live.py -v
+} finally {
+    foreach ($name in $names) {
+        if ($null -eq $saved[$name]) {
+            [Environment]::SetEnvironmentVariable($name, $null, "Process")
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $saved[$name], "Process")
+        }
+    }
+}
+```
+
+若同一短生命 shell 也執行 production recorder，須以相同方式清除或還原
+`TX_TRADE_RUNTIME_PRESET`、`TX_TRADE_ENABLE_LIVE_QUOTE`、
+`TX_TRADE_SYMBOLS`、`TX_TRADE_RECORDING_DB_PATH` 與 timeout 變數。
+
+未設定 `TX_TRADE_RUN_LIVE_QUOTE_TEST=1` 時，真實 live case 預期 skip；整份
+測試檔仍會執行兩個不連線的 safety tests。啟用後的驗收是登入、quote
+monitor ready、`TX00` lookup、quote 與 tick subscription 成功；休市時
+不要求收到 tick。此路徑只建立 Center/Quote，不建立 Order/Reply、不註冊
+Reply callback、不送單。
+
+live smoke 成功後，必須把日期、指令（遮蔽敏感值）、結果與上述四項證據
+補入本 roadmap 及 `WORK_LOG.md`，再把 Phase 1 標為「已完成」。此 smoke
+可與 Phase 2A 設計並行，但必須在 Phase 2 最終驗收前完成。
+
+### 15.4 Phase 2 下一個安全切片
+
+Phase 2 的下一個且唯一 slice 僅做 Phase 2A 設計：固定 `ReplayRuntime`
+public contract、狀態機、clock abstraction 與 cursor semantics；offline
+fixtures 僅可作同一 slice 的 acceptance。第一個 slice 不實作或設計
+PaperBroker；Phase 2B 的 abstraction、fill policy、fees 必須等 Phase 2A
+contract 驗收通過後才設計。Phase 2A 全程不得載入 COM、建立
+SKOrderLib/SKReplyLib、註冊 Order/Reply callback 或送單。
