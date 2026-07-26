@@ -1,7 +1,8 @@
 # 程式交易平台建置藍圖
 
-> 文件狀態：初版  
+> 文件狀態：執行中
 > 建立日期：2026-07-25  
+> 最後更新：2026-07-27
 > 適用專案：`tx_trade`
 
 ## 1. 文件目的
@@ -45,27 +46,30 @@
 
 目前已具備：
 
-- 載入 `SKCOM.dll`。
-- 登入 Capital API。
-- 進入報價監控。
-- 訂閱商品 Quote 與 Tick。
-- 接收報價、Tick、伺服器時間及連線事件。
-- OrderLib 初始化與商品資料載入。
-- ReplyLib 連線入口。
+- Phase 0 的依賴與安全模式基線；fresh-env 建立文件及乾淨環境驗證尚待
+  完成。
+- Phase 1 的標準行情模型、pipeline contract、SQLite event log/readback、
+  bounded ingress、health/metrics、Capital quote-only STA adapter、相容 façade
+  與安全 recorder entry point。
+- 預設 `offline/disabled`；live quote 必須明確 opt-in，失敗時不會降級成
+  offline success。
+- 離線錄製可建立彼此獨立的 session，依 session-global
+  `ingest_sequence` 完整讀回。
+- live quote composition 僅建立 SKCOM Center/Quote，不建立 Order/Reply、
+  不註冊 Reply callback，也不提供下單能力。
 
 目前主要缺口：
 
-- `QuoteClient` 同時負責連線、行情、委託與回報，責任過多。
+- Phase 1 尚待市場開盤時執行真實 SKCOM quote-only smoke，確認登入、
+  ready、`TX00` lookup 與 quote/tick subscription。
+- Phase 2 replay runtime 與 PaperBroker 尚未開始。
+- 舊 `QuoteClient` façade 仍保留相容行為，後續須在不破壞既有 contract
+  的前提下逐步收斂。
 - 尚未實作完整的新單、改單、刪單。
 - 尚未解析完整委託及成交回報。
 - 沒有委託狀態機、冪等控制及重啟對帳。
 - 沒有部位與損益管理。
 - 沒有集中式風控。
-- 行情事件持續存入 list，長時間運行有記憶體風險。
-- API 初始化失敗時可能進入 offline 並回報成功，不適合實盤。
-- 自動化測試只涵蓋少量回傳格式。
-- Python 虛擬環境目前無法正常啟動，環境不可重現。
-- README 與部分原始碼註解有文字編碼異常。
 
 ## 3.1 API 官方參考資料
 
@@ -244,6 +248,14 @@ SUBMITTING
 
 ### Phase 0：專案基線與安全修正
 
+目前交付狀態（2026-07-27）：
+
+- 依賴檔、安全模式與 live fail-closed 基線已建立。
+- 尚未完成可供 fresh environment 依循的完整重建文件；README 仍需明列
+  Python 版本、建立 venv、安裝 requirements 的指令。
+- 尚未在乾淨環境依文件從零建立 venv、執行 `pip install` 並驗證測試，
+  因此 Phase 0 維持「進行中」。
+
 工作內容：
 
 - 重建可正常啟動的 Python 虛擬環境。
@@ -264,6 +276,21 @@ SUBMITTING
 
 ### Phase 1：穩定行情服務
 
+目前交付狀態（2026-07-27）：
+
+- 七個 implementation slice 已完成：資料模型與設定、ports/offline
+  fixture/readback、SQLite storage、bounded pipeline 與監控、Capital
+  quote-only STA adapter、相容 façade、安全 recorder entry point。
+- 離線 release validation 為 `268 passed, 1 skipped`；skip 是需明確
+  opt-in 的真實 SKCOM live quote 測試。
+- 同一資料庫連續執行兩次 offline recorder，得到兩個不同且
+  `complete` 的 session；每個 session 都有 6 個事件，最後
+  `ingest_sequence=5`，完整讀回驗證成功。
+- 安全邊界固定為 Center/Quote only：不建立 SKOrderLib/SKReplyLib、
+  不註冊 Reply callback、不呼叫委託或成交回報功能，也不送單。
+- 真實 SKCOM quote-only smoke 因市場時段延後；此項完成前 Phase 1
+  維持「進行中」，且必須在 Phase 2 最終驗收前完成。
+
 工作內容：
 
 - 拆出 Capital connection 與 quote adapter。
@@ -282,21 +309,65 @@ SUBMITTING
 - 人工斷線後能恢復連線及訂閱。
 - 過期行情可被辨識，且不能供實盤送單使用。
 
-### Phase 2：PaperBroker 與回放
+### Phase 2：Replay Runtime 與 PaperBroker
 
-工作內容：
+Phase 2 固定依序交付 2A、2B。整個 Phase 2 不建立或呼叫
+SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託與
+成交回報，也不送出真實委託。
 
-- 定義券商抽象介面。
-- 建立 PaperBroker。
-- 建立歷史 Tick 回放。
-- 實作基本模擬成交規則、滑價與手續費。
-- 讓策略不修改程式即可切換 broker。
+#### Phase 2A：Replay Runtime
+
+契約：
+
+- 輸入沿用 Phase 1 `ReplaySource` 與 session-global
+  `ingest_sequence`，不另造不相容的行情格式。
+- 輸出沿用 Phase 1 `MarketDataEnvelope`/consumer contract，讓下游不需
+  分辨資料來自 offline、replay 或 live quote。
+- runtime 明確定義 session 選擇、cursor、播放時鐘、速度、啟動、暫停、
+  繼續、停止與完成狀態。
+
+工作範圍：
+
+- 依 authoritative event order 讀取已完成的 recording session。
+- 實作 deterministic/最快速播放與依事件時間 pacing。
+- 實作 pause/resume/stop、游標與完成狀態，不在本階段加入策略或成交
+  模擬。
+- 對 incomplete/corrupt session、非法速度及讀回 integrity failure
+  採 fail-closed。
 
 驗收條件：
 
-- 同一策略可在 replay、paper 模式執行。
-- 固定資料重播可得到可重現結果。
-- paper 模式完全不會呼叫真實下單 API。
+- 固定 session 每次輸出相同事件、相同順序與相同終止狀態。
+- 最快速模式不依 wall clock 產生非決定性；pacing 模式可由 fake clock
+  穩定測試。
+- pause/resume 不重複、不遺漏事件；stop 後不再發送事件。
+- replay runtime 不載入 SKCOM，亦不觸及 Order/Reply。
+
+#### Phase 2B：PaperBroker
+
+契約：
+
+- 只接受專案內部的模擬委託意圖與行情 envelope；不接受 SKCOM 型別。
+- 以 deterministic 規則產生 paper order/fill/position 結果，並明確標示
+  `paper` provenance，不能冒充券商 Reply。
+- 費用、滑價、成交優先序與部分成交規則必須由設定注入並可重現。
+
+工作範圍：
+
+- 定義供策略使用的最小 broker abstraction 與 PaperBroker。
+- 以 replay 行情實作基本成交、拒絕、取消、部分成交、滑價、手續費及
+  部位更新。
+- 讓同一策略可經設定切換 replay-only observation 與 paper execution，
+  不修改策略程式。
+
+驗收條件：
+
+- 相同 session、策略輸入與設定得到完全相同的 paper 結果。
+- 成交、費用與部位守恆，非法委託有可追蹤的拒絕原因。
+- 測試以 hard guard 證明不建立、不呼叫 SKOrderLib/SKReplyLib，且不
+  註冊 Order/Reply callback、不送真單。
+- Phase 1 真實 SKCOM quote-only smoke 已完成，才可宣告 Phase 2
+  最終驗收通過。
 
 ### Phase 3：完整委託及回報
 
@@ -423,9 +494,9 @@ SUBMITTING
 
 | 階段 | 狀態 | 開始日期 | 完成日期 | 備註 |
 |---|---|---|---|---|
-| Phase 0 專案基線 | 待開始 |  |  | 優先處理 |
-| Phase 1 穩定行情 | 待開始 |  |  |  |
-| Phase 2 Paper/Replay | 待開始 |  |  |  |
+| Phase 0 專案基線 | 進行中 | 2026-07-25 |  | 依賴與安全基線完成；待 fresh-env 重建文件及乾淨環境驗證 |
+| Phase 1 穩定行情 | 進行中 | 2026-07-26 |  | 七個 slice 與離線驗證完成；待市場時段 live quote-only smoke |
+| Phase 2 Replay/Paper | 待開始 |  |  | 先 2A Replay Runtime，再 2B PaperBroker |
 | Phase 3 委託與回報 | 待開始 |  |  |  |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
@@ -471,13 +542,25 @@ SUBMITTING
 - 限制：官方範例是 GUI 示範程式，仍需轉換為隔離、可測試且 fail-closed
   的 adapter，不直接作為正式交易核心使用。
 
+### ADR-006：Phase 2 先完成 Replay Runtime，再建立 PaperBroker
+
+- 日期：2026-07-27
+- 狀態：接受
+- 決策：Phase 2 分為 2A Replay Runtime 與 2B PaperBroker，依序交付。
+- 原因：先固定 deterministic 行情時鐘、cursor 與 lifecycle，PaperBroker
+  才能在穩定且可重現的輸入上驗證成交規則。
+- 安全邊界：Phase 2 不使用 SKOrderLib/SKReplyLib 或真實 Order/Reply
+  callback；真實委託與回報留在 Phase 3。
+
 ## 14. 下一個工作項目
 
-下一步執行 Phase 0：
+下一步執行 Phase 2 設計：
 
-1. 盤點並鎖定 Python 與套件版本。
-2. 重建可用虛擬環境。
-3. 修正 live/offline 行為。
-4. 統一原始碼與文件編碼。
-5. 建立設定模型、啟動前檢查及基本測試。
-6. 更新 README，加入環境建立和安全啟動方式。
+1. 固定 Phase 2A `ReplayRuntime` 的 public contract、狀態機、clock 與
+   cursor semantics。
+2. 以 Phase 1 兩個完整 offline session 建立 deterministic replay
+   acceptance fixtures。
+3. 定義 Phase 2B 最小 broker abstraction、paper fill policy 與費用模型，
+   維持與 SKCOM Order/Reply 完全隔離。
+4. 在市場時段完成 Phase 1 live quote-only smoke；此項是 Phase 2 最終
+   驗收的必要條件。
