@@ -12,6 +12,8 @@ from tx_trade.market_data.models import (
     CapturedKind,
     CapturedMarketDataEvent,
     CapturedTickNotification,
+    ConnectionState,
+    ConnectionStatus,
     EventType,
     MarketDataEnvelope,
     SourceMode,
@@ -70,9 +72,9 @@ def make_envelope(payload=None, **changes):
         sequence=3,
         broker_sequence=None,
         dedupe_key="fixed-key",
-        event_at=payload.event_at,
-        received_at=payload.received_at,
-        trading_day=payload.trading_day,
+        event_at=getattr(payload, "event_at", None),
+        received_at=getattr(payload, "received_at", NOW),
+        trading_day=getattr(payload, "trading_day", None),
         metadata_version=1,
         raw_payload={"nested": {"prices": [10001, 10003]}},
     )
@@ -287,3 +289,34 @@ def test_schema_bool_and_wrong_runtime_types_are_rejected():
 def test_nullable_metadata_version_is_positive_when_present(version):
     with pytest.raises((TypeError, ValueError)):
         make_envelope(metadata_version=version)
+
+
+def test_connection_envelope_allows_unavailable_broker_event_time():
+    status = ConnectionStatus(
+        ConnectionState.CONNECTED, 3001, 0, None, False, NOW, 0
+    )
+    envelope = make_envelope(
+        payload=status,
+        event_type=EventType.CONNECTION_STATUS,
+        event_at=None,
+        received_at=NOW,
+        trading_day=None,
+        metadata_version=None,
+    )
+    assert envelope.event_at is None
+    assert envelope.payload.changed_at == NOW
+
+
+def test_connection_envelope_rejects_different_known_event_time():
+    status = ConnectionStatus(
+        ConnectionState.CONNECTED, 3001, 0, None, False, NOW, 0
+    )
+    with pytest.raises(ValueError, match="None or equal changed_at"):
+        make_envelope(
+            payload=status,
+            event_type=EventType.CONNECTION_STATUS,
+            event_at=NOW.replace(minute=31),
+            received_at=NOW,
+            trading_day=None,
+            metadata_version=None,
+        )

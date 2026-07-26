@@ -1,6 +1,6 @@
 from dataclasses import FrozenInstanceError
 from datetime import datetime
-from threading import Event, get_ident
+from threading import Event, Thread, get_ident
 from time import monotonic
 from uuid import UUID
 
@@ -54,6 +54,7 @@ class FakeBackend:
         self.enter_results = []
         self.leave_results = []
         self.initialize_blocker = None
+        self.cleanup_failures = {}
 
     def _call(self, name, *args):
         self.calls.append((name, get_ident(), args))
@@ -83,8 +84,17 @@ class FakeBackend:
         return result
     def request_quotes(self, csv): self._call("request_quotes", csv); return 0
     def request_ticks(self, csv): self._call("request_ticks", csv); return 0
-    def cancel_quotes(self, csv): self._call("cancel_quotes", csv); return 0
-    def cancel_ticks(self, csv): self._call("cancel_ticks", csv); return 0
+    def _cleanup_result(self, name):
+        result = self.cleanup_failures.get(name, 0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+    def cancel_quotes(self, csv):
+        self._call("cancel_quotes", csv)
+        return self._cleanup_result("cancel_quotes")
+    def cancel_ticks(self, csv):
+        self._call("cancel_ticks", csv)
+        return self._cleanup_result("cancel_ticks")
     def lookup_quote(self, market, index):
         self._call("lookup_quote", market, index)
         return QuoteSnapshotRaw(1, 2, 1, 3, 4, None, 5)
@@ -92,9 +102,15 @@ class FakeBackend:
         self._call("pump")
         if self.actions:
             self.actions.pop(0)(self.sink)
-    def release_events(self): self._call("release_events")
-    def release_objects(self): self._call("release_objects")
-    def co_uninitialize(self): self._call("co_uninitialize")
+    def release_events(self):
+        self._call("release_events")
+        self._cleanup_result("release_events")
+    def release_objects(self):
+        self._call("release_objects")
+        self._cleanup_result("release_objects")
+    def co_uninitialize(self):
+        self._call("co_uninitialize")
+        self._cleanup_result("co_uninitialize")
 
 
 def make_adapter(
@@ -148,6 +164,149 @@ def test_all_backend_calls_use_one_dedicated_thread_and_cleanup_order():
     assert names[-3:] == ["release_events", "release_objects", "co_uninitialize"]
     adapter.stop(1)
     assert adapter.snapshot().state is ConnectionState.STOPPED
+
+
+@pytest.mark.parametrize(
+    ("operation", "failure"),
+    [
+        ("cancel_ticks", 7),
+        ("cancel_ticks", RuntimeError("secret cancel ticks")),
+        ("cancel_quotes", 8),
+        ("cancel_quotes", RuntimeError("secret cancel quotes")),
+        ("leave_monitor", 9),
+        ("leave_monitor", RuntimeError("secret leave")),
+        ("release_events", RuntimeError("secret events")),
+        ("release_objects", RuntimeError("secret objects")),
+        ("co_uninitialize", RuntimeError("secret uninitialize")),
+    ],
+)
+def test_cleanup_failure_is_aggregated_and_all_release_steps_continue(
+    operation, failure
+):
+    backend = FakeBackend()
+    adapter, _ = make_adapter(backend)
+    adapter.start()
+    adapter.login("acct", "secret")
+    adapter.enter_monitor()
+    adapter._actual_ticks.add("TX00")
+    adapter._actual_quotes.add("TX00")
+    if operation == "leave_monitor":
+        backend.leave_results.append(failure)
+    else:
+        backend.cleanup_failures[operation] = failure
+
+    adapter.stop(1)
+
+    names = [name for name, *_ in backend.calls]
+    cleanup_start = names.index("cancel_ticks")
+    assert names[cleanup_start:] == [
+        "cancel_ticks",
+        "cancel_quotes",
+        "leave_monitor",
+        "release_events",
+        "release_objects",
+        "co_uninitialize",
+    ]
+    assert adapter.snapshot().state is ConnectionState.STOPPED
+    assert adapter._impact.snapshot(SESSION).is_incomplete
+    assert adapter._shutdown.snapshot().reason == "quote_cleanup_failure"
+    assert adapter._health.snapshot().state.value == "failed"
+    assert "secret" not in repr(adapter._health.snapshot())
+    assert "secret" not in repr(adapter._impact.snapshot(SESSION))
+
+
+@pytest.mark.parametrize("notification_count", [1, 5])
+def test_stop_drains_pending_sta_quotes_before_monitor_cleanup(notification_count):
+    backend = FakeBackend()
+    adapter, ingress = make_adapter(backend)
+    queued = Event()
+    release_pump = Event()
+
+    def enqueue_then_block(sink):
+        for stock_idx in range(notification_count):
+            sink.OnNotifyQuoteLONG(0, stock_idx)
+        queued.set()
+        assert release_pump.wait(1)
+
+    adapter.start()
+    adapter.login("acct", "secret")
+    adapter.enter_monitor()
+    adapter._actual_quotes.add("TX00")
+    backend.actions.append(enqueue_then_block)
+    assert queued.wait(1)
+
+    stop_errors = []
+
+    def stop():
+        try:
+            adapter.stop(1)
+        except Exception as exc:
+            stop_errors.append(exc)
+
+    stop_thread = Thread(target=stop)
+    stop_thread.start()
+    wait_for(adapter._stop_event.is_set)
+    release_pump.set()
+    stop_thread.join(1)
+    assert not stop_thread.is_alive()
+    assert stop_errors == []
+
+    events = []
+    while True:
+        event = ingress.try_pop()
+        if event is None:
+            break
+        events.append(event)
+    quotes = [
+        event
+        for event in events
+        if event.captured_kind.value == "quote_snapshot"
+    ]
+    assert len(quotes) == notification_count
+    assert [event.payload.stock_idx_raw for event in quotes] == list(
+        range(notification_count)
+    )
+
+    names = [name for name, *_ in backend.calls]
+    last_lookup = max(
+        index for index, name in enumerate(names) if name == "lookup_quote"
+    )
+    cancel = names.index("cancel_quotes", last_lookup)
+    leave = names.index("leave_monitor", cancel)
+    final_release = max(
+        index for index, name in enumerate(names) if name == "release_events"
+    )
+    assert last_lookup < cancel < leave < final_release
+
+
+def test_incomplete_shutdown_drain_marks_session_and_still_releases_backend():
+    backend = FakeBackend()
+    adapter, _ = make_adapter(backend)
+    queued = Event()
+    release_pump = Event()
+
+    def enqueue_without_generation_token(sink):
+        sink.OnNotifyQuoteLONG(0, 7)
+        adapter._quote_generations.clear()
+        queued.set()
+        assert release_pump.wait(1)
+
+    adapter.start()
+    adapter.login("acct", "secret")
+    adapter.enter_monitor()
+    backend.actions.append(enqueue_without_generation_token)
+    assert queued.wait(1)
+    stop_thread = Thread(target=lambda: adapter.stop(1))
+    stop_thread.start()
+    wait_for(adapter._stop_event.is_set)
+    release_pump.set()
+    stop_thread.join(1)
+
+    assert not stop_thread.is_alive()
+    assert adapter._impact.snapshot(SESSION).is_incomplete
+    assert adapter._shutdown.snapshot().reason == "quote_generation_token_missing"
+    names = [name for name, *_ in backend.calls]
+    assert names[-3:] == ["release_events", "release_objects", "co_uninitialize"]
 
 
 def test_command_is_immutable_and_repr_redacts_values():

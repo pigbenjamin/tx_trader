@@ -688,8 +688,13 @@ class MarketDataEnvelope:
     def _validate_metadata_mapping(self) -> None:
         payload = self.payload
         if isinstance(payload, ConnectionStatus):
-            if self.event_at != payload.changed_at:
-                raise ValueError("connection_status event_at must equal changed_at")
+            # A broker connection callback may not carry an authoritative event
+            # time. In that case event_at remains None while changed_at records
+            # the local callback receipt time.
+            if self.event_at is not None and self.event_at != payload.changed_at:
+                raise ValueError(
+                    "connection_status event_at must be None or equal changed_at"
+                )
             if self.connection_generation != payload.connection_generation:
                 raise ValueError("connection generation must match envelope")
         elif isinstance(payload, Instrument):

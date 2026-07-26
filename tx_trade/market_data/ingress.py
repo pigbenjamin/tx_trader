@@ -467,6 +467,13 @@ class IngressProcessorHaltedError(RuntimeError):
     """Raised after the first popped event fails processing."""
 
 
+class AcceptedEventObserverError(RuntimeError):
+    """A sanitized failure after the pipeline sink accepted an event.
+
+    Sink acceptance is not a durability guarantee for asynchronous sinks.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class BoundedIngressProcessorSnapshot:
     is_halted: bool
@@ -484,6 +491,7 @@ class BoundedIngressProcessor:
         metrics: IngressMetrics,
         session_impact: SessionImpactTracker,
         shutdown: ControlledShutdown,
+        accepted_event_observer: Callable[[CapturedMarketDataEvent], None] | None = None,
     ) -> None:
         self._ingress = ingress
         self._pipeline = pipeline
@@ -491,6 +499,11 @@ class BoundedIngressProcessor:
         self._metrics = metrics
         self._impact = session_impact
         self._shutdown = shutdown
+        if accepted_event_observer is not None and not callable(
+            accepted_event_observer
+        ):
+            raise TypeError("accepted_event_observer must be callable")
+        self._accepted_event_observer = accepted_event_observer
         self._lock = Lock()
         self._halted = False
         self._in_flight_failed_event: CapturedMarketDataEvent | None = None
@@ -517,6 +530,27 @@ class BoundedIngressProcessor:
                 if self._shutdown.request_shutdown(reason):
                     self._metrics.record_shutdown_request()
                 raise
+            # This callback is a non-authoritative compatibility view. With an
+            # asynchronous sink, acceptance may precede durable storage.
+            observer = self._accepted_event_observer
+            if observer is not None:
+                try:
+                    observer(event)
+                except Exception:
+                    self._halted = True
+                    self._in_flight_failed_event = event
+                    reason = "accepted_event_observer_failure"
+                    self._metrics.record_processing_failure()
+                    self._health.degrade(reason)
+                    try:
+                        self._impact.mark_incomplete(event.session_id, reason)
+                    except RuntimeError:
+                        self._health.fail("session_impact_capacity_exhausted")
+                    if self._shutdown.request_shutdown(reason):
+                        self._metrics.record_shutdown_request()
+                    raise AcceptedEventObserverError(
+                        "accepted event observer failed"
+                    ) from None
             return True
 
     def drain(self, max_events: int) -> int:

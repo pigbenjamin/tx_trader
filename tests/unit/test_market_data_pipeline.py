@@ -16,6 +16,7 @@ from tx_trade.market_data.pipeline import CapturedEventPipeline
 from tx_trade.market_data.ingress import (
     BoundedIngress,
     BoundedIngressProcessor,
+    AcceptedEventObserverError,
     IngressProcessorHaltedError,
 )
 from tx_trade.market_data.sequencer import IngestSequencer
@@ -205,7 +206,7 @@ class Clock:
         return NOW
 
 
-def _processor(mapper=None, sink=None):
+def _processor(mapper=None, sink=None, observer=None):
     health = PipelineHealth(Clock())
     metrics = IngressMetrics()
     impact = SessionImpactTracker(2)
@@ -224,7 +225,13 @@ def _processor(mapper=None, sink=None):
     sequencer = IngestSequencer()
     pipeline = CapturedEventPipeline(mapper or Mapper(), sink or Sink(), sequencer)
     processor = BoundedIngressProcessor(
-        ingress, pipeline, health, metrics, impact, shutdown
+        ingress,
+        pipeline,
+        health,
+        metrics,
+        impact,
+        shutdown,
+        accepted_event_observer=observer,
     )
     return processor, ingress, sequencer, health, metrics, impact, shutdown
 
@@ -264,4 +271,50 @@ def test_bounded_processor_audits_popped_event_failure_and_requests_shutdown():
     with pytest.raises(IngressProcessorHaltedError, match="halted"):
         processor.process_one()
     assert ingress.depth() == 1
+    assert metrics.snapshot().processing_failures == 1
+
+
+def test_observer_runs_once_only_after_pipeline_publish_succeeds():
+    sink = Sink()
+    observed = []
+    processor, ingress, *_ = _processor(sink=sink, observer=observed.append)
+    event = make_captured()
+    ingress.try_publish(event)
+    assert processor.process_one() is True
+    assert len(sink.events) == 1
+    assert observed == [event]
+
+
+def test_pipeline_failure_does_not_call_observer():
+    sink = Sink()
+    sink.error = RuntimeError("persist failed")
+    observed = []
+    processor, ingress, *_ = _processor(sink=sink, observer=observed.append)
+    ingress.try_publish(make_captured())
+    with pytest.raises(RuntimeError, match="persist failed"):
+        processor.process_one()
+    assert observed == []
+
+
+def test_observer_failure_halts_without_republishing_persisted_event():
+    sink = Sink()
+
+    def fail_observer(_event):
+        raise RuntimeError("sensitive observer detail")
+
+    processor, ingress, _, health, metrics, impact, shutdown = _processor(
+        sink=sink, observer=fail_observer
+    )
+    event = make_captured()
+    ingress.try_publish(event)
+    with pytest.raises(AcceptedEventObserverError, match="observer failed"):
+        processor.process_one()
+    assert len(sink.events) == 1
+    assert processor.snapshot().is_halted
+    assert health.snapshot().state is HealthState.DEGRADED
+    assert impact.effective_terminal_status(SESSION, "complete") == "incomplete"
+    assert shutdown.snapshot().reason == "accepted_event_observer_failure"
+    with pytest.raises(IngressProcessorHaltedError):
+        processor.process_one()
+    assert len(sink.events) == 1
     assert metrics.snapshot().processing_failures == 1

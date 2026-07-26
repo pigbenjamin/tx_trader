@@ -9,11 +9,6 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from config import API_DLL_PATH, DEFAULT_ACCOUNT, DEFAULT_PASSWORD
-from quote_client import QuoteClient
-import quote_client as quote_client_module
-
-
 LIVE_OPT_IN = "TX_TRADE_RUN_LIVE_QUOTE_TEST"
 SYMBOL = "TX00"
 
@@ -23,6 +18,9 @@ def _forbid_order_or_reply(*args, **kwargs):
 
 
 def test_quote_only_api_creation_and_login_avoid_order_reply(monkeypatch):
+    from quote_client import QuoteClient
+    import quote_client as quote_client_module
+
     created = []
 
     fake_sk = types.SimpleNamespace(
@@ -80,6 +78,8 @@ def test_quote_only_api_creation_and_login_avoid_order_reply(monkeypatch):
 
 
 def test_leave_monitor_preserves_failed_steps_for_retry():
+    from quote_client import QuoteClient
+
     class FakeQuote:
         def __init__(self):
             self.tick_calls = 0
@@ -128,10 +128,15 @@ def live_quote_client(monkeypatch):
         pytest.skip("SKCOM live quote test requires Windows")
     if os.getenv(LIVE_OPT_IN) != "1":
         pytest.skip(f"set {LIVE_OPT_IN}=1 to run the live quote-only test")
-    if not Path(API_DLL_PATH).is_file():
-        pytest.skip(f"SKCOM DLL not found at configured path: {API_DLL_PATH}")
-    if not DEFAULT_ACCOUNT or not DEFAULT_PASSWORD:
+    dll_path = os.getenv("TX_TRADE_SKCOM_DLL_PATH", "")
+    account = os.getenv("TX_TRADE_ACCOUNT", "")
+    password = os.getenv("TX_TRADE_PASSWORD", "")
+    if not dll_path or not Path(dll_path).is_file():
+        pytest.skip("TX_TRADE_SKCOM_DLL_PATH does not name an SKCOM DLL")
+    if not account or not password:
         pytest.skip("live SKCOM credentials are not configured")
+
+    from quote_client import QuoteClient
 
     forbidden_methods = (
         "connect_reply_by_id",
@@ -143,19 +148,19 @@ def live_quote_client(monkeypatch):
     for method_name in forbidden_methods:
         monkeypatch.setattr(QuoteClient, method_name, _forbid_order_or_reply)
 
-    client = QuoteClient(quote_only=True)
+    client = QuoteClient(dll_path=dll_path, quote_only=True)
     try:
-        yield client
+        yield client, account, password
     finally:
         cleanup = client.leave_monitor()
         assert cleanup.get("success") is True, f"quote cleanup failed: {cleanup.get('errors')}"
 
 
 def test_live_login_and_quote_subscription(live_quote_client):
-    client = live_quote_client
+    client, account, password = live_quote_client
 
     assert client.initialize() is True
-    login = client.login(DEFAULT_ACCOUNT, DEFAULT_PASSWORD)
+    login = client.login(account, password)
     assert login.get("mode") == "api"
     assert login.get("success") is True
     assert login.get("code") == 0

@@ -1036,32 +1036,50 @@ class CapitalQuoteStaAdapter:
             raw_payload,
         )
 
-    def _drain_sta_quotes(self) -> None:
-        overflow = self._sta_queue.try_pop_overflow()
-        if overflow is not None:
-            generation = self._pop_quote_generation(overflow)
-            if generation is None:
-                return
-            self._emit_diagnostic(
-                "adapter_error",
-                overflow.callback_sequence,
-                overflow.received_at,
-                generation,
-                message="sta quote notification overflow",
-                raw={
-                    "market_no": overflow.market_no_raw,
-                    "stock_idx": overflow.stock_idx_raw,
-                    "is_long_callback": overflow.is_long_callback,
-                },
-            )
-        while True:
+    def _drain_sta_quotes(
+        self,
+        *,
+        max_items: int | None = None,
+        enrich_overflow: bool = False,
+    ) -> int:
+        processed = 0
+        if not enrich_overflow:
+            overflow = self._sta_queue.try_pop_overflow()
+            if overflow is not None:
+                generation = self._pop_quote_generation(overflow)
+                if generation is None:
+                    return processed
+                self._emit_diagnostic(
+                    "adapter_error",
+                    overflow.callback_sequence,
+                    overflow.received_at,
+                    generation,
+                    message="sta quote notification overflow",
+                    raw={
+                        "market_no": overflow.market_no_raw,
+                        "stock_idx": overflow.stock_idx_raw,
+                        "is_long_callback": overflow.is_long_callback,
+                    },
+                )
+                processed += 1
+        while max_items is None or processed < max_items:
             notification = self._sta_queue.try_pop()
             if notification is None:
-                return
+                break
             generation = self._pop_quote_generation(notification)
             if generation is None:
-                return
+                return processed
             self._enrich_quote(notification, generation)
+            processed += 1
+        if enrich_overflow and (max_items is None or processed < max_items):
+            overflow = self._sta_queue.try_pop_overflow()
+            if overflow is not None:
+                generation = self._pop_quote_generation(overflow)
+                if generation is None:
+                    return processed
+                self._enrich_quote(overflow, generation)
+                processed += 1
+        return processed
 
     def _pop_quote_generation(
         self, notification: StaLocalQuoteNotification
@@ -1303,6 +1321,7 @@ class CapitalQuoteStaAdapter:
             self._fatal("reconnect_exhausted")
 
     def _cleanup(self) -> None:
+        cleanup_failed = False
         with self._state_condition:
             self._accepting_commands = False
             self._reconnect_due = None
@@ -1313,6 +1332,20 @@ class CapitalQuoteStaAdapter:
                 ConnectionState.STOPPED,
             ):
                 self._transition_locked(ConnectionState.STOPPING)
+        pending_quotes = self._sta_queue.depth
+        if pending_quotes:
+            if self._objects_initialized:
+                try:
+                    drained = self._drain_sta_quotes(
+                        max_items=pending_quotes,
+                        enrich_overflow=True,
+                    )
+                    if drained != pending_quotes or self._sta_queue.depth:
+                        self._fatal("sta_shutdown_drain_incomplete")
+                except Exception:
+                    self._fatal("sta_shutdown_drain_failure")
+            else:
+                self._fatal("sta_shutdown_drain_unavailable")
         self._fail_pending()
         for actual, method in (
             (self._actual_ticks, self._backend.cancel_ticks),
@@ -1320,34 +1353,45 @@ class CapitalQuoteStaAdapter:
         ):
             if actual:
                 try:
-                    self._code(method(",".join(sorted(actual))), "cleanup")
+                    code = self._code(
+                        method(",".join(sorted(actual))), "cleanup"
+                    )
+                    if code != 0:
+                        cleanup_failed = True
                 except Exception:
-                    pass
+                    cleanup_failed = True
                 actual.clear()
         if self._monitor_active:
             try:
-                self._code(self._backend.leave_monitor(), "cleanup")
+                code = self._code(self._backend.leave_monitor(), "cleanup")
+                if code != 0:
+                    cleanup_failed = True
             except Exception:
-                pass
+                cleanup_failed = True
             self._monitor_active = False
         if self._events_registered:
             try:
                 self._backend.release_events()
             except Exception:
-                pass
+                cleanup_failed = True
             self._events_registered = False
         if self._objects_initialized:
             try:
                 self._backend.release_objects()
             except Exception:
-                pass
+                cleanup_failed = True
             self._objects_initialized = False
         if self._co_initialized:
             try:
                 self._backend.co_uninitialize()
             except Exception:
-                pass
+                cleanup_failed = True
             self._co_initialized = False
+        if cleanup_failed:
+            reason = "quote_cleanup_failure"
+            self._health.fail(reason)
+            self._mark_incomplete(reason)
+            self._shutdown.request_shutdown(reason)
         with self._state_condition:
             if self._state is not ConnectionState.STOPPED:
                 self._transition_locked(ConnectionState.STOPPED)
