@@ -51,6 +51,7 @@ class RejectionCode(StrEnum):
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     INSTRUMENT_UNAVAILABLE = "instrument_unavailable"
     MARKET_DATA_UNAVAILABLE = "market_data_unavailable"
+    CAPACITY_EXCEEDED = "capacity_exceeded"
     INTERNAL_REJECTED = "internal_rejected"
 
     @property
@@ -65,8 +66,29 @@ _REJECTION_MESSAGES = {
     RejectionCode.IDEMPOTENCY_CONFLICT: "paper order idempotency conflict",
     RejectionCode.INSTRUMENT_UNAVAILABLE: "paper instrument is unavailable",
     RejectionCode.MARKET_DATA_UNAVAILABLE: "paper market data is unavailable",
+    RejectionCode.CAPACITY_EXCEEDED: "paper broker capacity was exceeded",
     RejectionCode.INTERNAL_REJECTED: "paper order was rejected",
 }
+
+
+class MatchDisposition(StrEnum):
+    PROCESSED = "processed"
+    DUPLICATE = "duplicate"
+
+
+class MatchSkipReason(StrEnum):
+    EVENT_NOT_QUOTE = "event_not_quote"
+    METADATA_UNAVAILABLE = "metadata_unavailable"
+    METADATA_MISMATCH = "metadata_mismatch"
+    PRICE_SCALE_UNAVAILABLE = "price_scale_unavailable"
+    QUANTITY_SCALE_UNAVAILABLE = "quantity_scale_unavailable"
+    PRICE_UNAVAILABLE = "price_unavailable"
+    QUANTITY_UNAVAILABLE = "quantity_unavailable"
+    SIMULATED_QUOTE = "simulated_quote"
+    INVALID_BOOK = "invalid_book"
+    NO_LIQUIDITY = "no_liquidity"
+    ORDER_NOT_ELIGIBLE = "order_not_eligible"
+    LIMIT_NOT_CROSSED = "limit_not_crossed"
 
 
 class PaperEventType(StrEnum):
@@ -141,15 +163,20 @@ def _positive_int(value: Any, name: str) -> None:
         raise ValueError(f"{name} must be at least 1")
 
 
+def _nonnegative_int(value: Any, name: str, *, optional: bool = False) -> None:
+    if value is None and optional:
+        return
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+
+
 def _source_pair(session_id: UUID | None, sequence: int | None) -> None:
     if (session_id is None) != (sequence is None):
         raise ValueError("source_session_id and source_ingest_sequence must be provided together")
     _strict_uuid(session_id, "source_session_id", optional=True)
-    if sequence is not None:
-        if type(sequence) is not int:
-            raise TypeError("source_ingest_sequence must be an integer")
-        if sequence < 0:
-            raise ValueError("source_ingest_sequence must be non-negative")
+    _nonnegative_int(sequence, "source_ingest_sequence", optional=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +192,8 @@ class OrderIntent:
     time_in_force: TimeInForce
     day_trade: bool
     created_at: datetime
+    source_session_id: UUID | None = None
+    source_ingest_sequence: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("strategy_id", "client_order_id", "account_id", "instrument_id"):
@@ -175,11 +204,26 @@ class OrderIntent:
         _strict_enum(self.time_in_force, TimeInForce, "time_in_force")
         _strict_bool(self.day_trade, "day_trade")
         _taipei_datetime(self.created_at, "created_at")
+        _source_pair(self.source_session_id, self.source_ingest_sequence)
         if self.order_type is OrderType.MARKET:
             if self.limit_price is not None:
                 raise ValueError("market orders must not have a limit_price")
         else:
             _decimal(self.limit_price, "limit_price", positive=True)
+
+
+@dataclass(frozen=True, slots=True)
+class CancelIntent:
+    strategy_id: str
+    client_order_id: str
+    paper_order_id: UUID
+    requested_at: datetime
+
+    def __post_init__(self) -> None:
+        _strict_string(self.strategy_id, "strategy_id")
+        _strict_string(self.client_order_id, "client_order_id")
+        _strict_uuid(self.paper_order_id, "paper_order_id")
+        _taipei_datetime(self.requested_at, "requested_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,6 +451,133 @@ class PaperEvent:
                 raise ValueError("fill source causation must match event")
 
 
+@dataclass(frozen=True, slots=True)
+class InstrumentMetadataSnapshot:
+    instrument_id: str
+    metadata_version: int
+    price_scale: Decimal | None
+    quantity_scale: Decimal | None
+
+    def __post_init__(self) -> None:
+        _strict_string(self.instrument_id, "instrument_id")
+        _positive_int(self.metadata_version, "metadata_version")
+        _decimal(self.price_scale, "price_scale", positive=True, optional=True)
+        _decimal(self.quantity_scale, "quantity_scale", positive=True, optional=True)
+
+
+@dataclass(frozen=True, slots=True)
+class PaperBrokerLimits:
+    max_orders: int
+    max_open_orders: int
+    max_fills: int
+    max_events: int
+    max_market_data_records: int
+    max_instrument_versions: int
+
+    def __post_init__(self) -> None:
+        _positive_int(self.max_orders, "max_orders")
+        _positive_int(self.max_open_orders, "max_open_orders")
+        _positive_int(self.max_fills, "max_fills")
+        _positive_int(self.max_events, "max_events")
+        _positive_int(self.max_market_data_records, "max_market_data_records")
+        _positive_int(self.max_instrument_versions, "max_instrument_versions")
+        if self.max_open_orders > self.max_orders:
+            raise ValueError("max_open_orders must not exceed max_orders")
+
+
+@dataclass(frozen=True, slots=True)
+class MatchResult:
+    paper_run_id: UUID
+    disposition: MatchDisposition
+    source_session_id: UUID
+    source_ingest_sequence: int
+    fills: tuple[PaperFill, ...]
+    events: tuple[PaperEvent, ...]
+    skip_reasons: tuple[MatchSkipReason, ...]
+    snapshot_version: int
+
+    def __post_init__(self) -> None:
+        _strict_uuid(self.paper_run_id, "paper_run_id")
+        _strict_enum(self.disposition, MatchDisposition, "disposition")
+        _source_pair(self.source_session_id, self.source_ingest_sequence)
+        _nonnegative_int(self.snapshot_version, "snapshot_version")
+        _strict_contract_tuple(self.fills, PaperFill, "fills")
+        _strict_contract_tuple(self.events, PaperEvent, "events")
+        _strict_contract_tuple(self.skip_reasons, MatchSkipReason, "skip_reasons")
+        if len(set(self.skip_reasons)) != len(self.skip_reasons):
+            raise ValueError("skip_reasons must not contain duplicates")
+        for fill in self.fills:
+            if fill.paper_run_id != self.paper_run_id:
+                raise ValueError("fill paper_run_id must match result")
+            if (
+                fill.source_session_id != self.source_session_id
+                or fill.source_ingest_sequence != self.source_ingest_sequence
+            ):
+                raise ValueError("fill source causation must match result")
+        for event in self.events:
+            if event.paper_run_id != self.paper_run_id:
+                raise ValueError("event paper_run_id must match result")
+            if event.source_session_id is not None and (
+                event.source_session_id != self.source_session_id
+                or event.source_ingest_sequence != self.source_ingest_sequence
+            ):
+                raise ValueError("event source causation must match result")
+        if self.disposition is MatchDisposition.DUPLICATE and (self.fills or self.events):
+            raise ValueError("duplicate results must not contain fills or events")
+
+
+@dataclass(frozen=True, slots=True)
+class PaperBrokerSnapshot:
+    paper_run_id: UUID
+    bound_source_session_id: UUID | None
+    last_committed_ingest_sequence: int | None
+    next_paper_sequence: int
+    snapshot_version: int
+    orders: tuple[PaperOrder, ...]
+    fills: tuple[PaperFill, ...]
+    events: tuple[PaperEvent, ...]
+    instruments: tuple[InstrumentMetadataSnapshot, ...]
+
+    def __post_init__(self) -> None:
+        _strict_uuid(self.paper_run_id, "paper_run_id")
+        _source_pair(
+            self.bound_source_session_id,
+            self.last_committed_ingest_sequence,
+        )
+        _positive_int(self.next_paper_sequence, "next_paper_sequence")
+        _nonnegative_int(self.snapshot_version, "snapshot_version")
+        _strict_contract_tuple(self.orders, PaperOrder, "orders")
+        _strict_contract_tuple(self.fills, PaperFill, "fills")
+        _strict_contract_tuple(self.events, PaperEvent, "events")
+        _strict_contract_tuple(
+            self.instruments,
+            InstrumentMetadataSnapshot,
+            "instruments",
+        )
+        for collection_name, collection in (
+            ("order", self.orders),
+            ("fill", self.fills),
+            ("event", self.events),
+        ):
+            if any(item.paper_run_id != self.paper_run_id for item in collection):
+                raise ValueError(f"{collection_name} paper_run_id must match snapshot")
+        expected_next_sequence = 1 if not self.events else self.events[-1].paper_sequence + 1
+        if self.next_paper_sequence != expected_next_sequence:
+            raise ValueError("next_paper_sequence must follow the event journal")
+        if any(
+            left.paper_sequence >= right.paper_sequence
+            for left, right in zip(self.events, self.events[1:], strict=False)
+        ):
+            raise ValueError("events must have strictly increasing paper_sequence")
+
+
+def _strict_contract_tuple(value: Any, item_type: type[Enum] | type[Any], name: str) -> None:
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be a tuple")
+    if any(type(item) is not item_type for item in value):
+        raise TypeError(f"{name} must contain only {item_type.__name__}")
+
+
 def to_canonical_primitive(value: Any) -> Any:
     """Convert an order contract to deterministic JSON-compatible values."""
 
@@ -482,7 +653,18 @@ def _canonical_decimal(value: Decimal) -> str:
     return f"{sign}{coefficient[:point]}.{coefficient[point:]}"
 
 
-def canonical_json(value: PaperEventPayload | PaperEvent | OrderIntent) -> str:
+def canonical_json(
+    value: (
+        PaperEventPayload
+        | PaperEvent
+        | OrderIntent
+        | CancelIntent
+        | InstrumentMetadataSnapshot
+        | PaperBrokerLimits
+        | MatchResult
+        | PaperBrokerSnapshot
+    ),
+) -> str:
     """Serialize a Phase 2B contract using stable, compact canonical JSON."""
 
     return json.dumps(

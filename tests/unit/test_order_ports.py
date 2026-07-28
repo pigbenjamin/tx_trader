@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
 from uuid import UUID
 
 from tx_trade.orders import (
+    CancelIntent,
     OrderCommandResult,
     OrderIntent,
     PaperBrokerPort,
@@ -18,7 +18,7 @@ class FakeBroker:
     def submit(self, intent: OrderIntent) -> OrderCommandResult:
         raise NotImplementedError
 
-    def cancel(self, paper_order_id: UUID, requested_at: datetime) -> OrderCommandResult:
+    def cancel(self, request: CancelIntent) -> OrderCommandResult:
         raise NotImplementedError
 
     def get_order(self, paper_order_id: UUID) -> PaperOrder | None:

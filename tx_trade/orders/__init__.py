@@ -1,7 +1,12 @@
 """Broker-neutral order contracts and paper-execution boundaries."""
 
 from .contracts import (
+    CancelIntent,
     ExecutionProvenance,
+    InstrumentMetadataSnapshot,
+    MatchDisposition,
+    MatchResult,
+    MatchSkipReason,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -10,6 +15,8 @@ from .contracts import (
     PaperEventPayload,
     PaperEventType,
     PaperFill,
+    PaperBrokerLimits,
+    PaperBrokerSnapshot,
     PaperOrder,
     PaperPosition,
     PaperRejection,
@@ -22,8 +29,13 @@ from .ports import OrderCommandResult, PaperBrokerPort, PaperEventSink
 from .state_machine import InvalidOrderTransition, can_transition, validate_order_transition
 
 __all__ = [
+    "CancelIntent",
     "ExecutionProvenance",
+    "InstrumentMetadataSnapshot",
     "InvalidOrderTransition",
+    "MatchDisposition",
+    "MatchResult",
+    "MatchSkipReason",
     "OrderCommandResult",
     "OrderIntent",
     "OrderSide",
@@ -34,6 +46,8 @@ __all__ = [
     "PaperEventSink",
     "PaperEventType",
     "PaperBrokerPort",
+    "PaperBrokerLimits",
+    "PaperBrokerSnapshot",
     "PaperFill",
     "PaperOrder",
     "PaperPosition",

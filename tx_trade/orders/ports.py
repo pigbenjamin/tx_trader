@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Protocol, TypeAlias, runtime_checkable
 from uuid import UUID
 
 from .contracts import (
+    CancelIntent,
     OrderIntent,
     PaperEvent,
     PaperOrder,
@@ -21,7 +21,7 @@ OrderCommandResult: TypeAlias = PaperOrder | PaperRejection
 class PaperBrokerPort(Protocol):
     def submit(self, intent: OrderIntent) -> OrderCommandResult: ...
 
-    def cancel(self, paper_order_id: UUID, requested_at: datetime) -> OrderCommandResult: ...
+    def cancel(self, request: CancelIntent) -> OrderCommandResult: ...
 
     def get_order(self, paper_order_id: UUID) -> PaperOrder | None: ...
 

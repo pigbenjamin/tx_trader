@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 
 from tx_trade.orders import (
+    CancelIntent,
     ExecutionProvenance,
     OrderIntent,
     OrderSide,
@@ -125,6 +126,39 @@ def test_intent_enforces_market_and_limit_price_rules() -> None:
         intent(limit_price=22100.5)
 
 
+def test_intent_source_causation_is_optional_but_must_be_a_complete_pair() -> None:
+    unpaired = intent()
+    paired = intent(source_session_id=SESSION_ID, source_ingest_sequence=7)
+
+    assert unpaired.source_session_id is None
+    assert paired.source_ingest_sequence == 7
+    assert f'"source_session_id":"{SESSION_ID}"' in canonical_json(paired)
+    assert '"source_ingest_sequence":7' in canonical_json(paired)
+    with pytest.raises(ValueError, match="provided together"):
+        intent(source_session_id=SESSION_ID)
+    with pytest.raises(TypeError, match="source_ingest_sequence must be an integer"):
+        intent(source_session_id=SESSION_ID, source_ingest_sequence=True)
+    with pytest.raises(ValueError, match="source_ingest_sequence must be non-negative"):
+        intent(source_session_id=SESSION_ID, source_ingest_sequence=-1)
+
+
+def test_cancel_intent_is_strict_immutable_and_canonical() -> None:
+    request = CancelIntent(
+        strategy_id="strategy-a",
+        client_order_id="client-1",
+        paper_order_id=ORDER_ID,
+        requested_at=NOW,
+    )
+
+    assert canonical_json(request).startswith('{"client_order_id":"client-1"')
+    with pytest.raises(FrozenInstanceError):
+        request.strategy_id = "other"  # type: ignore[misc]
+    with pytest.raises(TypeError, match="paper_order_id must be UUID"):
+        replace(request, paper_order_id=str(ORDER_ID))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="timezone-aware"):
+        replace(request, requested_at=NOW.replace(tzinfo=None))
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -228,6 +262,7 @@ def test_rejection_exposes_only_stable_public_message() -> None:
     assert rejection.message == "paper order idempotency conflict"
     assert "credential-canary" not in rejection.message
     assert len({code.public_message for code in RejectionCode}) == len(RejectionCode)
+    assert RejectionCode.CAPACITY_EXCEEDED.public_message == ("paper broker capacity was exceeded")
 
 
 @pytest.mark.parametrize(
