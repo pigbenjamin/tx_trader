@@ -216,3 +216,164 @@
 3. 僅啟動 Phase 2A 的 design-first contract slice；Phase 2B 保留在
    Phase 2A contract 驗收後的 backlog，且 Phase 2 final acceptance 前
    必須關閉前兩項缺口。
+
+## 2026-07-27：完成 Phase 0 fresh-environment 基線
+
+目標：
+
+- 依文件從零建立可執行的 Python 3.13 環境，補齊品質工具、安全測試分類
+  與不洩漏 credential 的 live 操作說明。
+
+完成：
+
+- 安裝 Python `3.13.14` 並建立全新的 `venv_tx_trade_fresh`；此完整版本是
+  本次證據，不是永久 exact patch pin。
+- README 補齊 venv、requirements、`pip check`、imports、Ruff、mypy 與
+  pytest 指令；production/test live opt-in 仍相互獨立。
+- `legacy_com`、`stress`、`live` 測試改為明確 marker，預設 suite 不會
+  意外初始化 legacy COM、執行重型 stress 或連接真實 quote service。
+- live credential 範例改為 prompt 後只注入目前 process，並在 `finally`
+  還原；未將 credential 真值寫入文件、輸出或 commit。
+- 修正 Phase 1 現有型別 narrowing，使 mypy 可對 26 個 source files
+  完整通過；未改 schema、public API 或 Order/Reply 安全邊界。
+
+驗證：
+
+- `pip check`：無 broken requirements；必要 imports 成功。
+- Ruff format check 與 lint：通過。
+- mypy：`Success: no issues found in 26 source files`。
+- 完整非交易 suite：`266 passed, 1 skipped, 2 deselected`；skip 是未
+  opt-in 的真實 quote live case，deselected 是 legacy COM tests。
+- 預設安全 suite：`263 passed, 6 deselected`。
+- stress：`3 passed`。
+- 同一 SQLite database 連續執行兩次 offline recorder：兩個不同 session
+  均為 `complete`、各 6 events、last `ingest_sequence=5`，readback
+  integrity 均為 valid。
+
+未完成／風險：
+
+- Phase 1 真實 SKCOM quote-only smoke 已嘗試執行；兩個不連線 safety
+  tests 通過，真實 case 在 login code `2017` 失敗，未進入 quote ready
+  或 subscription，因此不得視為通過。
+- 首次失敗輸出暴露了 pytest fixture tuple 中的 credential repr；相關
+  credential 必須撤銷／更換後才能重試。測試 fixture 已改為固定的
+  redacted repr，後續失敗輸出不再顯示帳號或密碼。
+- Phase 1 仍維持「進行中」，待 live login、quote ready、`TX00` lookup、
+  quote/tick subscription 與 cleanup 證據完成後再更新狀態。
+
+決策：
+
+- Phase 0 標示為「已完成」。
+- Phase 2 維持暫停；必須先完成並由使用者確認 Phase 0、Phase 1。
+
+## 2026-07-28：完成 announcement-only Reply 例外與 Phase 1 live smoke
+
+目標：
+
+- 在不接回報主機、不建立 Order、不送單的前提下，滿足 SKCOM 登入前
+  必須註冊公告 callback 的要求，並關閉 Phase 1 live gate。
+
+完成：
+
+- 隨附 SKCOM V2.13.58 文件確認 code `2017` 表示登入前必須建立
+  `SKReplyLib` 並註冊 `OnReplyMessage`；文件同時明定不需先做回報連線。
+- 經使用者明確核准，legacy quote-only façade 與 production backend
+  建立 announcement-only Reply；sink 只包含 `OnReplyMessage` 並回傳
+  `-1`。
+- hard guards 禁止 `SKOrderLib`、`SKReplyLib_ConnectByID`、`OnNewData`、
+  `OnStrategyData` 與送單；非 Phase 1 legacy façade 的相容行為保持不變。
+- cleanup 在取消 quote/tick 後加入 bounded Windows message drain，避免
+  native `SKQuoteLib_LeaveMonitor` 在非同步取消尚未完成時 access violation。
+
+驗證：
+
+- 本次 Reply／cleanup 安全回歸 targeted：`34 passed, 1 deselected`。
+- 完整非交易 suite：`273 passed, 1 skipped, 2 deselected`。
+- Ruff format/lint 與 mypy（26 source files）：通過。
+- 真實 live smoke：`8 passed`；登入、quote ready、`TX00` lookup、
+  quote/tick subscription、credential redaction 與 cleanup 均通過。
+- live process 僅建立 Center、Quote、announcement-only Reply；未建立
+  Order、未呼叫 `ConnectByID`、未註冊委託／成交 callback、未送單。
+
+決策：
+
+- Phase 1 標示為「已完成」。
+- Phase 2 仍不自動開始，等待使用者確認 Phase 0、Phase 1 結果。
+
+## 2026-07-28：開始 Phase 2A contract-first Replay Runtime
+
+目標：
+
+- 只實作 Phase 2A 第一切片：Replay contract、狀態機、可中斷播放時鐘、
+  exclusive cursor 與 complete SQLite session gate。
+- Phase 2B PaperBroker 維持未開始。
+
+完成：
+
+- 新增 immutable replay state/mode/options/session descriptor/snapshot 與
+  固定 sanitized failure codes。
+- 新增 FASTEST/PACED 背景 replay runtime；cursor 僅在成功 publish 後
+  前移，pause/resume/stop 具 acknowledgment，terminal runtime 不重啟。
+- PACED 只用 `event_at` 計時，不改變 `ingest_sequence` 權威順序；
+  `event_at=None` 立即送出，倒退時間不產生負等待。
+- 新增 SQLite fail-closed gate，只接受 complete、current-schema、
+  non-empty、integrity-valid recording；未修改 Phase 1 readback/finalize。
+- 新增同一 SQLite session 連續兩次回放的 deterministic integration test。
+- 新增 Phase 2 專用 import/security guards，確認不載入 COM/Capital、
+  不讀 live credential 或 `.env`，不建立 Order/Reply、不送單。
+
+目前驗證：
+
+- Phase 2A contracts/runtime/SQLite/security targeted：`80 passed`。
+- 完整非交易 regression suite：`353 passed, 1 skipped, 2 deselected`。
+- Ruff format/lint：通過；mypy：31 個 source files，0 errors。
+
+決策：
+
+- Phase 2A cursor 是最後成功 publish 的 `ingest_sequence`，恢復採
+  exclusive 語意；交付保證為 at-least-once，不宣稱 exactly-once。
+- 第一切片不新增 durable cursor database schema。
+- Phase 2B 必須等待 Phase 2A 第一切片驗收及使用者確認後才開始。
+
+## 2026-07-28：Phase 2A 獨立設定、composition 與 CLI
+
+目標：
+
+- 讓使用者能以既存 SQLite DB、session UUID、播放模式、速度與 exclusive
+  cursor 實際啟動 ReplayRuntime。
+- 保持 Phase 1 composition 與 live credential 路徑完全分離。
+
+完成：
+
+- 新增純函式 `parse_phase2_replay_settings`；只讀六個 replay 白名單鍵，
+  不列舉 mapping、不讀帳密、DLL 或 `.env`，parse 時不碰 filesystem。
+- 新增 frozen `Phase2ReplaySettings`，固定 preset=`phase2_replay`、
+  execution=`disabled`。
+- 新增 `ReplayRuntime.wait(timeout)`，等待自然終態而不提出 stop。
+- 新增 `tx_trade.app.phase2` composition root 與
+  `python -m tx_trade.app.phase2` CLI。
+- DB 不存在時在 repository factory 前拒絕，不建立空 DB；repository 在
+  成功、失敗與中斷路徑都關閉。
+- replay repository 強制 SQLite `mode=ro&immutable=1`，不切換 WAL、不建
+  schema；來源 DB bytes/sidecars 前後一致。偵測到 active `-wal`/`-shm`
+  即拒絕，要求 recorder 停止並 checkpoint 後才 replay。
+- CLI 使用同步 `ReplayRuntime.run()`，JSONL sink 與 source 都在主執行緒；
+  KeyboardInterrupt 不會留下仍輸出或仍存取 repository 的背景 worker。
+- stdout 僅輸出 canonical JSON Lines；summary/error 使用固定 sanitized
+  stderr 訊息，成功 exit 0、失敗或中斷 exit 2。
+- import/security guard 已擴及 replay app/config，確認不載入 COM、
+  Capital、root config、Order/Reply 或 live credential。
+
+目前驗證：
+
+- Phase 2A 全部 contract/runtime/config/composition/app/security targeted：
+  `150 passed`。
+- 完整非交易 regression suite：`423 passed, 1 skipped, 2 deselected`。
+- Ruff format/lint：通過；mypy：33 個 source files，0 errors。
+
+決策：
+
+- 不修改 root `main.py` 或 Phase 1 parser；Phase 2 使用獨立 module entry。
+- 第一版 CLI 不接受任意命令列參數，所有設定經 replay-only whitelist
+  parser；未知 argv fail closed。
+- Phase 2B PaperBroker 仍未開始。

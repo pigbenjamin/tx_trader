@@ -46,9 +46,7 @@ def test_live_quote_requires_exact_opt_in():
             parse_phase1_settings({"TX_TRADE_ENABLE_LIVE_QUOTE": value})
 
 
-@pytest.mark.parametrize(
-    "preset", ["phase2_replay", "research_paper", "live_trade"]
-)
+@pytest.mark.parametrize("preset", ["phase2_replay", "research_paper", "live_trade"])
 def test_future_or_execution_presets_are_rejected(preset):
     with pytest.raises(ConfigError):
         parse_phase1_settings(
@@ -114,9 +112,7 @@ def test_capacity_requires_ascii_digit_string(value):
 
 @pytest.mark.parametrize("capacity", [2048, 8192])
 def test_aggregate_capacity_override_derives_positive_weighted_lanes(capacity):
-    settings = parse_phase1_settings(
-        {"TX_TRADE_INGRESS_QUEUE_CAPACITY": str(capacity)}
-    )
+    settings = parse_phase1_settings({"TX_TRADE_INGRESS_QUEUE_CAPACITY": str(capacity)})
     lanes = (
         settings.ingress_control_capacity,
         settings.ingress_diagnostic_capacity,
@@ -130,9 +126,7 @@ def test_aggregate_capacity_override_derives_positive_weighted_lanes(capacity):
 @pytest.mark.parametrize("capacity", ["1", "2", "3"])
 def test_aggregate_capacity_too_small_for_four_lanes_fails(capacity):
     with pytest.raises(ConfigError, match="at least 4"):
-        parse_phase1_settings(
-            {"TX_TRADE_INGRESS_QUEUE_CAPACITY": capacity}
-        )
+        parse_phase1_settings({"TX_TRADE_INGRESS_QUEUE_CAPACITY": capacity})
 
 
 def test_lane_capacity_matrix_can_be_overridden_together():

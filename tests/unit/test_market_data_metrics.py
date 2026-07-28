@@ -1,3 +1,5 @@
+import threading
+
 from tx_trade.market_data.ports import IngressDecision
 from tx_trade.monitoring.metrics import IngressLane, IngressMetrics
 
@@ -71,4 +73,3 @@ def test_concurrent_snapshots_always_observe_accounting_invariant():
             break
     thread.join()
     assert not errors
-import threading

@@ -692,18 +692,13 @@ class MarketDataEnvelope:
             # time. In that case event_at remains None while changed_at records
             # the local callback receipt time.
             if self.event_at is not None and self.event_at != payload.changed_at:
-                raise ValueError(
-                    "connection_status event_at must be None or equal changed_at"
-                )
+                raise ValueError("connection_status event_at must be None or equal changed_at")
             if self.connection_generation != payload.connection_generation:
                 raise ValueError("connection generation must match envelope")
         elif isinstance(payload, Instrument):
             if self.event_at != payload.updated_at:
                 raise ValueError("instrument event_at must equal updated_at")
-            if (
-                self.metadata_version is None
-                or self.metadata_version != payload.metadata_version
-            ):
+            if self.metadata_version is None or self.metadata_version != payload.metadata_version:
                 raise ValueError("instrument metadata_version must match envelope")
         elif isinstance(payload, (ServerTime, Quote, Tick)):
             if self.received_at != payload.received_at:
@@ -775,8 +770,7 @@ def to_primitive(value: Any) -> Any:
         return {"encoding": "base64", "data": base64.b64encode(value).decode("ascii")}
     if isinstance(value, Mapping):
         return {
-            str(key): to_primitive(value[key])
-            for key in sorted(value, key=lambda item: str(item))
+            str(key): to_primitive(value[key]) for key in sorted(value, key=lambda item: str(item))
         }
     if isinstance(value, (tuple, list)):
         return [to_primitive(item) for item in value]

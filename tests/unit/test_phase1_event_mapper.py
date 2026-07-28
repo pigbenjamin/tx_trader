@@ -58,9 +58,7 @@ def captured(kind, payload, *, event_at=None, trading_day=None, metadata_version
         ),
         (
             CapturedKind.QUOTE_SNAPSHOT,
-            CapturedQuoteSnapshot(
-                0, 7, 100, 102, 101, 1, 2, None, True, 3, NOW
-            ),
+            CapturedQuoteSnapshot(0, 7, 100, 102, 101, 1, 2, None, True, 3, NOW),
             EventType.QUOTE,
         ),
         (
@@ -106,9 +104,7 @@ def captured(kind, payload, *, event_at=None, trading_day=None, metadata_version
         ),
     ],
 )
-def test_mapper_covers_captured_union_and_preserves_metadata(
-    kind, payload, expected_type
-):
+def test_mapper_covers_captured_union_and_preserves_metadata(kind, payload, expected_type):
     event = captured(kind, payload)
     envelope = Phase1CapturedEventMapper().build_envelope(event, 9)
     assert envelope.event_type is expected_type
@@ -142,9 +138,7 @@ def test_actual_adapter_shaped_connection_uses_received_time_only_for_changed_at
 
 
 def test_unknown_scales_keep_raw_values_and_leave_normalized_values_none():
-    quote = CapturedQuoteSnapshot(
-        0, 7, 12345, 12347, 12346, 1, 2, 3, True, 3, NOW
-    )
+    quote = CapturedQuoteSnapshot(0, 7, 12345, 12347, 12346, 1, 2, 3, True, 3, NOW)
     envelope = Phase1CapturedEventMapper().build_envelope(
         captured(CapturedKind.QUOTE_SNAPSHOT, quote, metadata_version=7), 0
     )
@@ -170,6 +164,4 @@ def test_mapper_dedupe_is_deterministic():
     payload = CapturedServerTimeNotification(9, 30, 0, 93000, 2, NOW)
     event = captured(CapturedKind.SERVER_TIME_NOTIFICATION, payload)
     mapper = Phase1CapturedEventMapper()
-    assert mapper.build_envelope(event, 0).dedupe_key == mapper.build_envelope(
-        event, 99
-    ).dedupe_key
+    assert mapper.build_envelope(event, 0).dedupe_key == mapper.build_envelope(event, 99).dedupe_key

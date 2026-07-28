@@ -41,9 +41,7 @@ class Clock:
 
 def captured(kind, sequence, *, session=SESSION, generation=1, symbol=1, dedupe=None):
     if kind is CapturedKind.QUOTE_SNAPSHOT:
-        payload = CapturedQuoteSnapshot(
-            0, symbol, 1, 2, 1, 1, 1, 1, False, sequence, NOW
-        )
+        payload = CapturedQuoteSnapshot(0, symbol, 1, 2, 1, 1, 1, 1, False, sequence, NOW)
     elif kind is CapturedKind.TICK_NOTIFICATION:
         payload = CapturedTickNotification(
             0, symbol, 0, 20260726, 93000, 0, 1, 2, 1, 1, 0, False, sequence, NOW
@@ -94,13 +92,25 @@ def components(**capacities):
 
 def test_reserved_lanes_and_overflow_policies():
     ingress, health, metrics, impact, shutdown = components()
-    assert ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 1)) is IngressDecision.ACCEPTED
+    assert (
+        ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 1)) is IngressDecision.ACCEPTED
+    )
     assert ingress.try_publish(captured(CapturedKind.QUOTE_SNAPSHOT, 2)) is IngressDecision.ACCEPTED
-    assert ingress.try_publish(captured(CapturedKind.CONNECTION_NOTIFICATION, 3)) is IngressDecision.ACCEPTED
-    assert ingress.try_publish(captured(CapturedKind.ADAPTER_DIAGNOSTIC, 4)) is IngressDecision.ACCEPTED
+    assert (
+        ingress.try_publish(captured(CapturedKind.CONNECTION_NOTIFICATION, 3))
+        is IngressDecision.ACCEPTED
+    )
+    assert (
+        ingress.try_publish(captured(CapturedKind.ADAPTER_DIAGNOSTIC, 4))
+        is IngressDecision.ACCEPTED
+    )
     assert ingress.snapshot().total_depth == 4
-    assert ingress.try_publish(captured(CapturedKind.ADAPTER_DIAGNOSTIC, 5)) is IngressDecision.DROPPED
-    assert ingress.try_publish(captured(CapturedKind.ADAPTER_DIAGNOSTIC, 6)) is IngressDecision.DROPPED
+    assert (
+        ingress.try_publish(captured(CapturedKind.ADAPTER_DIAGNOSTIC, 5)) is IngressDecision.DROPPED
+    )
+    assert (
+        ingress.try_publish(captured(CapturedKind.ADAPTER_DIAGNOSTIC, 6)) is IngressDecision.DROPPED
+    )
     assert health.snapshot().state is HealthState.FAILED
     assert impact.effective_terminal_status(SESSION, "complete") == "incomplete"
     assert shutdown.snapshot().request_count == 1
@@ -111,20 +121,58 @@ def test_quote_coalescing_stale_and_generation_isolation():
     ingress, *_ = components(quote=2)
     first = captured(CapturedKind.QUOTE_SNAPSHOT, 10, dedupe="a")
     assert ingress.try_publish(first) is IngressDecision.ACCEPTED
-    assert ingress.try_publish(replace(first, sequence=11, payload=replace(first.payload, callback_sequence=11), dedupe_candidate="b")) is IngressDecision.COALESCED
-    assert ingress.try_publish(replace(first, sequence=9, payload=replace(first.payload, callback_sequence=9), dedupe_candidate="c")) is IngressDecision.DUPLICATE
-    assert ingress.try_publish(captured(CapturedKind.QUOTE_SNAPSHOT, 1, generation=2, dedupe="a")) is IngressDecision.ACCEPTED
-    assert ingress.try_publish(captured(CapturedKind.QUOTE_SNAPSHOT, 12, symbol=2)) is IngressDecision.DROPPED
+    assert (
+        ingress.try_publish(
+            replace(
+                first,
+                sequence=11,
+                payload=replace(first.payload, callback_sequence=11),
+                dedupe_candidate="b",
+            )
+        )
+        is IngressDecision.COALESCED
+    )
+    assert (
+        ingress.try_publish(
+            replace(
+                first,
+                sequence=9,
+                payload=replace(first.payload, callback_sequence=9),
+                dedupe_candidate="c",
+            )
+        )
+        is IngressDecision.DUPLICATE
+    )
+    assert (
+        ingress.try_publish(captured(CapturedKind.QUOTE_SNAPSHOT, 1, generation=2, dedupe="a"))
+        is IngressDecision.ACCEPTED
+    )
+    assert (
+        ingress.try_publish(captured(CapturedKind.QUOTE_SNAPSHOT, 12, symbol=2))
+        is IngressDecision.DROPPED
+    )
     assert ingress.try_pop().sequence == 11
     assert ingress.try_pop().connection_generation == 2
 
 
 def test_tick_drops_and_recent_dedupe_are_exact_and_bounded():
     ingress, _, metrics, impact, _ = components(tick=1, dedupe=1)
-    assert ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 1, dedupe="x")) is IngressDecision.ACCEPTED
-    assert ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 2, dedupe="x")) is IngressDecision.DUPLICATE
-    assert ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 3, dedupe="y")) is IngressDecision.DROPPED
-    assert ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 4, dedupe="y")) is IngressDecision.DROPPED
+    assert (
+        ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 1, dedupe="x"))
+        is IngressDecision.ACCEPTED
+    )
+    assert (
+        ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 2, dedupe="x"))
+        is IngressDecision.DUPLICATE
+    )
+    assert (
+        ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 3, dedupe="y"))
+        is IngressDecision.DROPPED
+    )
+    assert (
+        ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 4, dedupe="y"))
+        is IngressDecision.DROPPED
+    )
     snapshot = metrics.snapshot()
     assert snapshot.dropped_tick_count == 2
     assert snapshot.first_dropped_tick_sequence == 3
@@ -192,16 +240,10 @@ def test_sta_queue_rejects_the_old_arbitrary_blocking_overflow_hook():
 
 
 def test_critical_and_market_lanes_are_bounded_fair():
-    ingress, *_ = components(
-        control=4, diagnostic=4, quote=2, tick=2, burst=2
-    )
+    ingress, *_ = components(control=4, diagnostic=4, quote=2, tick=2, burst=2)
     for sequence in range(1, 4):
-        ingress.try_publish(
-            captured(CapturedKind.ADAPTER_DIAGNOSTIC, sequence)
-        )
-        ingress.try_publish(
-            captured(CapturedKind.CONNECTION_NOTIFICATION, sequence + 10)
-        )
+        ingress.try_publish(captured(CapturedKind.ADAPTER_DIAGNOSTIC, sequence))
+        ingress.try_publish(captured(CapturedKind.CONNECTION_NOTIFICATION, sequence + 10))
     ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 30))
     popped = [ingress.try_pop() for _ in range(3)]
     assert [event.captured_kind for event in popped] == [
@@ -222,8 +264,7 @@ def test_session_capacity_exhaustion_makes_unknown_dropped_session_incomplete():
     session_b = UUID(int=2)
     impact.mark_incomplete(SESSION, "existing_session_damage")
     assert (
-        ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 1))
-        is IngressDecision.ACCEPTED
+        ingress.try_publish(captured(CapturedKind.TICK_NOTIFICATION, 1)) is IngressDecision.ACCEPTED
     )
     assert (
         ingress.try_publish(

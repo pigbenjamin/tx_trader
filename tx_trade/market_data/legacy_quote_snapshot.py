@@ -51,16 +51,14 @@ class LegacyQuoteSnapshotProjector:
         self._lock = Lock()
         self._server_time: dict[str, Any] | None = None
         self._stock_list: dict[str, Any] | None = None
-        self._connection = {
+        self._connection: dict[str, bool | int | None] = {
             "stocks_ready": False,
             "last_kind": None,
             "last_code": None,
         }
         self._quotes: deque[dict[str, Any]] = deque(maxlen=quote_capacity)
         self._ticks: deque[dict[str, Any]] = deque(maxlen=tick_capacity)
-        self._diagnostics: deque[dict[str, Any]] = deque(
-            maxlen=diagnostic_capacity
-        )
+        self._diagnostics: deque[dict[str, Any]] = deque(maxlen=diagnostic_capacity)
 
     def project(self, event: CapturedMarketDataEvent) -> None:
         if not isinstance(event, CapturedMarketDataEvent):
@@ -120,9 +118,7 @@ class LegacyQuoteSnapshotProjector:
                         "error_code": payload.error_code_raw,
                         "message": payload.message,
                         "attempt": payload.attempt,
-                        "raw_notification": _mutable_copy(
-                            payload.raw_notification
-                        ),
+                        "raw_notification": _mutable_copy(payload.raw_notification),
                     }
                 )
 

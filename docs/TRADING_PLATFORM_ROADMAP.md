@@ -55,14 +55,16 @@
   offline success。
 - 離線錄製可建立彼此獨立的 session，依 session-global
   `ingest_sequence` 完整讀回。
-- live quote composition 僅建立 SKCOM Center/Quote，不建立 Order/Reply、
-  不註冊 Reply callback，也不提供下單能力。
+- live quote composition 建立 SKCOM Center/Quote，以及登入必要且只註冊
+  `OnReplyMessage` 的 announcement-only Reply；不建立 Order、不呼叫
+  `ConnectByID`、不註冊委託／成交 callback，也不提供下單能力。
 
 目前主要缺口：
 
-- Phase 1 尚待市場開盤時執行真實 SKCOM quote-only smoke，確認登入、
-  ready、`TX00` lookup 與 quote/tick subscription。
-- Phase 2 replay runtime 與 PaperBroker 尚未開始。
+- Phase 1 真實 SKCOM quote-only smoke 已於 2026-07-28 完成：登入、
+  ready、`TX00` lookup、quote/tick subscription 與 cleanup 均成功。
+- Phase 2A contract-first Replay Runtime 第一切片已實作、正在最終驗收；
+  Phase 2B PaperBroker 尚未開始。
 - 舊 `QuoteClient` façade 仍保留相容行為，後續須在不破壞既有 contract
   的前提下逐步收斂。
 - 尚未實作完整的新單、改單、刪單。
@@ -251,10 +253,12 @@ SUBMITTING
 目前交付狀態（2026-07-27）：
 
 - 依賴檔、安全模式與 live fail-closed 基線已建立。
-- 尚未完成可供 fresh environment 依循的完整重建文件；README 仍需明列
-  Python 版本、建立 venv、安裝 requirements 的指令。
-- 尚未在乾淨環境依文件從零建立 venv、執行 `pip install` 並驗證測試，
-  因此 Phase 0 維持「進行中」。
+- README 已補齊 Python 3.13 series、fresh venv、requirements、品質檢查及
+  安全測試流程，並改用不把 credential literal 留在 shell history 的
+  process-scope 注入與還原範例。
+- 已以全新 Python 3.13.14 與 `venv_tx_trade_fresh` 從零安裝依賴；
+  `pip check`、imports、Ruff format/lint、mypy、完整非交易測試及 stress
+  tests 均通過，因此 Phase 0 標示為「已完成」。
 
 工作內容：
 
@@ -286,10 +290,11 @@ SUBMITTING
 - 同一資料庫連續執行兩次 offline recorder，得到兩個不同且
   `complete` 的 session；每個 session 都有 6 個事件，最後
   `ingest_sequence=5`，完整讀回驗證成功。
-- 安全邊界固定為 Center/Quote only：不建立 SKOrderLib/SKReplyLib、
-  不註冊 Reply callback、不呼叫委託或成交回報功能，也不送單。
-- 真實 SKCOM quote-only smoke 因市場時段延後；此項完成前 Phase 1
-  維持「進行中」，且必須在 Phase 2 最終驗收前完成。
+- 安全邊界固定為 Center/Quote 加 announcement-only Reply：Reply 只註冊
+  登入必要的 `OnReplyMessage`；不建立 SKOrderLib、不呼叫
+  `SKReplyLib_ConnectByID`、不註冊委託／成交 callback，也不送單。
+- 真實 SKCOM quote-only smoke 已於 2026-07-28 通過，Phase 1 標示為
+  「已完成」。
 
 工作內容：
 
@@ -494,9 +499,9 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 
 | 階段 | 狀態 | 開始日期 | 完成日期 | 備註 |
 |---|---|---|---|---|
-| Phase 0 專案基線 | 進行中 | 2026-07-25 |  | 依賴與安全基線完成；待 fresh-env 重建文件及乾淨環境驗證 |
-| Phase 1 穩定行情 | 進行中 | 2026-07-26 |  | 七個 slice 與離線驗證完成；待市場時段 live quote-only smoke |
-| Phase 2 Replay/Paper | 待開始 |  |  | 先 2A Replay Runtime，再 2B PaperBroker |
+| Phase 0 專案基線 | 已完成 | 2026-07-25 | 2026-07-27 | fresh Python 3.13.14 環境、依賴、品質檢查與安全測試已驗證 |
+| Phase 1 穩定行情 | 已完成 | 2026-07-26 | 2026-07-28 | 離線驗證與真實 quote-only live smoke 均完成 |
+| Phase 2 Replay/Paper | 進行中 | 2026-07-28 |  | Phase 2A Replay Runtime 與獨立 CLI 已實作、待整體驗收；Phase 2B 尚未開始 |
 | Phase 3 委託與回報 | 待開始 |  |  |  |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
@@ -554,11 +559,11 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 
 ## 14. 下一個工作項目
 
-下一個且唯一的 implementation slice 是：
+目前 implementation slice 是：
 
-1. 固定 Phase 2A `ReplayRuntime` 的 public contract、狀態機、clock 與
-   cursor semantics；可使用 Phase 1 完整 offline session 作為同一
-   slice 的 deterministic acceptance fixture，但不得藉此擴大實作範圍。
+1. 驗收 Phase 2A `ReplayRuntime` 的 public contract、狀態機、clock、
+   cursor semantics 與 complete SQLite session deterministic replay；
+   不得藉此擴大到 Phase 2B。
 
 Phase 2B 的 broker abstraction、paper fill policy 與費用模型屬後續
 backlog；必須等 Phase 2A contract 通過驗收後才能開始設計。
@@ -582,15 +587,12 @@ backlog；必須等 Phase 2A contract 通過驗收後才能開始設計。
 - repository root 既有未追蹤檔 `phase1_smoke.sqlite3` 是本機 release
   validation artifact，不得加入 commit。
 
-### 15.2 Phase 0 尚待完成
+### 15.2 Phase 0 fresh-environment 完成證據
 
-現有 `venv_tx_trade\pyvenv.cfg` 記錄 Python `3.13.14`，可作為 known
-baseline。本次受限工具宿主因 Windows Store/App Execution Alias 限制
-無法重驗 executable，不能據此判斷既有 venv 是否健康；fresh-env 執行
-證據仍然缺少。除非未來另有正式 pin 決策，Phase 0 的 Python policy 是
-使用 Python 3.13 系列，並記錄實際完整版本，不要求 patch 必須是
-`3.13.14`。接手者須先把下列可重建步驟補入 README，再在全新 venv
-實際執行：
+既有 `venv_tx_trade` 的 Windows Store/App Execution Alias 已失效，未作為
+完成證據。2026-07-27 另行安裝 Python `3.13.14`，依 README 從零建立
+`venv_tx_trade_fresh`；Python policy 仍是 Python 3.13 系列，不將
+`3.13.14` 視為永久 exact patch pin。實際完成的重建步驟為：
 
 ```powershell
 py -3.13 -m venv .\venv_tx_trade_fresh
@@ -598,16 +600,21 @@ py -3.13 -m venv .\venv_tx_trade_fresh
 .\venv_tx_trade_fresh\Scripts\python.exe -m pip install -r .\requirements.txt
 .\venv_tx_trade_fresh\Scripts\python.exe -m pip check
 .\venv_tx_trade_fresh\Scripts\python.exe -c "import comtypes, pytest, win32api, tzdata"
-.\venv_tx_trade_fresh\Scripts\python.exe -m pytest -q
+.\venv_tx_trade_fresh\Scripts\python.exe -m ruff format --check tx_trade tests main.py quote_client.py config.py
+.\venv_tx_trade_fresh\Scripts\python.exe -m ruff check tx_trade tests main.py quote_client.py config.py
+.\venv_tx_trade_fresh\Scripts\python.exe -m mypy tx_trade
+.\venv_tx_trade_fresh\Scripts\python.exe -m pytest -o addopts="" -m "not legacy_com" -q
 ```
 
-若 launcher 無法提供 Python 3.13 系列，先安裝／選定 3.13 再建立 venv。
-不得用既有 venv metadata 代替 fresh-env 執行證據。記錄 Python 的完整
-版本、pip install、`pip check`、imports 及完整 pytest 的實際結果後，
-才可將 Phase 0 標為「已完成」。
+實際結果：`pip check` 無 broken requirements；imports 成功；Ruff
+format/lint 通過；mypy 對 26 個 source files 為 0 errors；完整非交易
+suite 為 `266 passed, 1 skipped, 2 deselected`，其中 skip 是未 opt-in 的
+真實 quote live case，deselected 是 legacy COM tests；獨立 stress gate
+為 `3 passed`。同一 fresh venv 的預設安全 suite 另為
+`263 passed, 6 deselected`。
 
-Phase 0 的 README 待辦也包含安全化目前的 live 明文 assignment 示例：
-不得示範把真實 credential literal 指派在可留存的 shell history。
+README 的 production/test live 範例現以無 history prompt 取得 credential，
+並在 `finally` 還原 process environment；文件及驗證輸出未記錄真值。
 
 ### 15.3 Phase 1 live quote-only smoke
 
@@ -646,7 +653,7 @@ try {
     if (-not $env:TX_TRADE_ACCOUNT -or -not $env:TX_TRADE_PASSWORD) { throw "SKCOM credentials are not configured" }
     if (-not (Test-Path -LiteralPath $env:TX_TRADE_SKCOM_DLL_PATH -PathType Leaf)) { throw "SKCOM DLL path is invalid" }
     $env:TX_TRADE_RUN_LIVE_QUOTE_TEST = "1"
-    .\venv_tx_trade_fresh\Scripts\python.exe -m pytest .\tests\integration\test_skcom_quote_live.py -v
+    .\venv_tx_trade_fresh\Scripts\python.exe -m pytest -o addopts="" .\tests\integration\test_skcom_quote_live.py -v
 } finally {
     foreach ($name in $names) {
         if ($null -eq $saved[$name]) {
@@ -665,18 +672,40 @@ try {
 未設定 `TX_TRADE_RUN_LIVE_QUOTE_TEST=1` 時，真實 live case 預期 skip；整份
 測試檔仍會執行兩個不連線的 safety tests。啟用後的驗收是登入、quote
 monitor ready、`TX00` lookup、quote 與 tick subscription 成功；休市時
-不要求收到 tick。此路徑只建立 Center/Quote，不建立 Order/Reply、不註冊
-Reply callback、不送單。
+不要求收到 tick。此路徑建立 Center/Quote，以及只註冊
+`OnReplyMessage` 的 announcement-only Reply；不建立 Order、不呼叫
+`ConnectByID`、不註冊委託／成交 callback，也不送單。
 
 live smoke 成功後，必須把日期、指令（遮蔽敏感值）、結果與上述四項證據
 補入本 roadmap 及 `WORK_LOG.md`，再把 Phase 1 標為「已完成」。此 smoke
 可與 Phase 2A 設計並行，但必須在 Phase 2 最終驗收前完成。
 
+2026-07-27 首次實際執行結果為兩個 safety tests 通過、真實 case 在 login
+code `2017` 失敗；尚未到達 quote ready、`TX00` lookup 或 subscription，
+故 Phase 1 維持「進行中」。首次 failure rendering 亦發現 fixture tuple
+會顯示 credential，測試已改用固定 redacted repr；當次 credential 必須
+撤銷／更換後才可重試，文件不保存其真值。
+
+2026-07-28 依隨附 SKCOM V2.13.58 文件確認，登入前必須建立 `SKReplyLib`
+並註冊 `OnReplyMessage`，但不需連接回報主機。經使用者明確核准後加入此
+最小安全例外；hard guards 仍禁止 `SKOrderLib`、
+`SKReplyLib_ConnectByID`、`OnNewData`、`OnStrategyData` 與送單。
+受限網路環境曾回傳 `1097`；在核准的正常網路環境執行後，整份 live
+integration test 為 `8 passed`，登入、quote ready、`TX00` lookup、
+quote/tick subscription 與 cleanup 均成功。
+
 ### 15.4 Phase 2 下一個安全切片
 
-Phase 2 的下一個且唯一 slice 僅做 Phase 2A 設計：固定 `ReplayRuntime`
-public contract、狀態機、clock abstraction 與 cursor semantics；offline
-fixtures 僅可作同一 slice 的 acceptance。第一個 slice 不實作或設計
+Phase 2A 第一個 slice 已進入實作與驗收：`ReplayRuntime` 提供
+FASTEST/PACED、可中斷 clock、狀態機、exclusive cursor、pause/resume/stop
+及 sanitized failure；SQLite gate 僅接受 complete、current-schema、
+non-empty、integrity-valid session。第一個 slice 不實作或設計
 PaperBroker；Phase 2B 的 abstraction、fill policy、fees 必須等 Phase 2A
 contract 驗收通過後才設計。Phase 2A 全程不得載入 COM、建立
 SKOrderLib/SKReplyLib、註冊 Order/Reply callback 或送單。
+
+Phase 2A 第二個 slice 提供獨立的 `phase2_replay` 設定 parser、
+composition root 與 `python -m tx_trade.app.phase2` CLI。它只接受既存
+SQLite DB、明確 session UUID、FASTEST/PACED、speed 與 optional exclusive
+cursor；stdout 只輸出 canonical JSON Lines。此入口不沿用 Phase 1
+composition、不讀 live credential、不載入 COM。

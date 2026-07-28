@@ -50,16 +50,27 @@ def test_schema_wal_projection_and_cursor(tmp_path) -> None:
         )
     }
     assert {
-        "schema_meta", "recording_sessions", "event_log", "instruments",
-        "quotes", "ticks", "connection_events",
+        "schema_meta",
+        "recording_sessions",
+        "event_log",
+        "instruments",
+        "quotes",
+        "ticks",
+        "connection_events",
     } <= tables
     assert repository.connection.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 1
     assert repository.connection.execute("SELECT COUNT(*) FROM ticks").fetchone()[0] == 1
-    assert repository.connection.execute("SELECT COUNT(*) FROM connection_events").fetchone()[0] == 1
-    assert [e.ingest_sequence for e in repository.iter_events(
-        events[0].session_id, after_ingest_sequence=2,
-        event_types={EventType.QUOTE, EventType.TICK},
-    )] == [3, 4]
+    assert (
+        repository.connection.execute("SELECT COUNT(*) FROM connection_events").fetchone()[0] == 1
+    )
+    assert [
+        e.ingest_sequence
+        for e in repository.iter_events(
+            events[0].session_id,
+            after_ingest_sequence=2,
+            event_types={EventType.QUOTE, EventType.TICK},
+        )
+    ] == [3, 4]
 
 
 def test_duplicate_dedupe_and_sequence_collision(tmp_path) -> None:
@@ -79,9 +90,7 @@ def test_duplicate_inside_one_batch_is_skipped(tmp_path) -> None:
     events = _begin(repository)
     duplicate = replace(events[0], ingest_sequence=1, sequence=1)
     repository.append_batch([events[0], duplicate])
-    assert repository.connection.execute(
-        "SELECT COUNT(*) FROM event_log"
-    ).fetchone()[0] == 1
+    assert repository.connection.execute("SELECT COUNT(*) FROM event_log").fetchone()[0] == 1
     assert repository.stats().duplicate_events == 1
 
 
@@ -143,12 +152,8 @@ def test_projection_failure_preserves_authoritative_events(tmp_path) -> None:
         dedupe_key=f"{events[3].dedupe_key}:later",
     )
     repository.append_batch([later])
-    assert repository.connection.execute(
-        "SELECT COUNT(*) FROM event_log"
-    ).fetchone()[0] == 7
-    assert repository.connection.execute(
-        "SELECT COUNT(*) FROM quotes"
-    ).fetchone()[0] == 0
+    assert repository.connection.execute("SELECT COUNT(*) FROM event_log").fetchone()[0] == 7
+    assert repository.connection.execute("SELECT COUNT(*) FROM quotes").fetchone()[0] == 0
     assert repository.stats().persisted_events == 7
     repository.end_session(
         events[0].session_id,
@@ -162,14 +167,16 @@ def test_projection_failure_preserves_authoritative_events(tmp_path) -> None:
     assert row["status"] == "incomplete"
     assert row["ended_at"] is not None
     with pytest.raises(StorageError):
-        repository.append_batch([
-            replace(
-                events[3],
-                ingest_sequence=7,
-                sequence=7,
-                dedupe_key=f"{events[3].dedupe_key}:after-finalize",
-            )
-        ])
+        repository.append_batch(
+            [
+                replace(
+                    events[3],
+                    ingest_sequence=7,
+                    sequence=7,
+                    dedupe_key=f"{events[3].dedupe_key}:after-finalize",
+                )
+            ]
+        )
 
 
 def test_non_sqlite_projection_bug_is_fatal_and_rolls_back(tmp_path) -> None:
@@ -182,9 +189,7 @@ def test_non_sqlite_projection_bug_is_fatal_and_rolls_back(tmp_path) -> None:
     with pytest.raises(Exception) as caught:
         repository.append_batch(events[:1])
     assert caught.type.__name__ == "StorageError"
-    assert repository.connection.execute(
-        "SELECT COUNT(*) FROM event_log"
-    ).fetchone()[0] == 0
+    assert repository.connection.execute("SELECT COUNT(*) FROM event_log").fetchone()[0] == 0
     assert repository.stats().projection_failures == 0
 
 
@@ -230,6 +235,7 @@ def test_authoritative_metadata_tamper_is_detected(tmp_path, column, value) -> N
     with pytest.raises(IntegrityError):
         tuple(repository.iter_events(events[0].session_id))
     from tx_trade.storage import SQLiteReplaySource
+
     replay = SQLiteReplaySource(repository)
     replay.open(events[0].session_id)
     assert not replay.verify_integrity().is_valid
@@ -237,6 +243,7 @@ def test_authoritative_metadata_tamper_is_detected(tmp_path, column, value) -> N
 
 def test_checkpoint_tamper_is_reported(tmp_path) -> None:
     from tx_trade.storage import SQLiteReplaySource
+
     repository = SQLiteMarketDataRepository(tmp_path / "events.db")
     events = _begin(repository)
     repository.append_batch(events)
@@ -252,9 +259,7 @@ def test_checkpoint_tamper_is_reported(tmp_path) -> None:
 def test_current_version_but_incomplete_schema_is_rejected(tmp_path) -> None:
     path = tmp_path / "partial.db"
     connection = sqlite3.connect(path)
-    connection.execute(
-        "CREATE TABLE schema_meta(version INTEGER PRIMARY KEY, applied_at TEXT)"
-    )
+    connection.execute("CREATE TABLE schema_meta(version INTEGER PRIMARY KEY, applied_at TEXT)")
     connection.execute("INSERT INTO schema_meta VALUES (1, 'x')")
     connection.commit()
     connection.close()
@@ -276,8 +281,7 @@ def test_same_named_index_with_wrong_column_order_is_rejected(tmp_path) -> None:
     repository = SQLiteMarketDataRepository(path)
     repository.connection.execute("DROP INDEX idx_event_log_readback")
     repository.connection.execute(
-        "CREATE INDEX idx_event_log_readback "
-        "ON event_log(ingest_sequence, session_id)"
+        "CREATE INDEX idx_event_log_readback ON event_log(ingest_sequence, session_id)"
     )
     repository.close()
     with pytest.raises(SchemaMismatchError):
@@ -289,8 +293,7 @@ def test_same_named_lookup_index_cannot_be_unique(tmp_path) -> None:
     repository = SQLiteMarketDataRepository(path)
     repository.connection.execute("DROP INDEX idx_event_log_readback")
     repository.connection.execute(
-        "CREATE UNIQUE INDEX idx_event_log_readback "
-        "ON event_log(session_id, ingest_sequence)"
+        "CREATE UNIQUE INDEX idx_event_log_readback ON event_log(session_id, ingest_sequence)"
     )
     repository.close()
     with pytest.raises(SchemaMismatchError):
@@ -300,9 +303,7 @@ def test_same_named_lookup_index_cannot_be_unique(tmp_path) -> None:
 def test_missing_required_column_is_rejected(tmp_path) -> None:
     path = tmp_path / "missing-column.db"
     repository = SQLiteMarketDataRepository(path)
-    repository.connection.execute(
-        "ALTER TABLE event_log DROP COLUMN record_sha256"
-    )
+    repository.connection.execute("ALTER TABLE event_log DROP COLUMN record_sha256")
     repository.close()
     with pytest.raises(SchemaMismatchError):
         SQLiteMarketDataRepository(path)
@@ -315,11 +316,8 @@ def test_missing_event_log_unique_constraints_is_rejected(tmp_path) -> None:
     create_sql = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='event_log'"
     ).fetchone()["sql"]
-    malformed = create_sql.replace(
-        "CREATE TABLE event_log", "CREATE TABLE event_log_new"
-    ).replace(
-        ",\n    UNIQUE (session_id, ingest_sequence),"
-        "\n    UNIQUE (session_id, dedupe_key)",
+    malformed = create_sql.replace("CREATE TABLE event_log", "CREATE TABLE event_log_new").replace(
+        ",\n    UNIQUE (session_id, ingest_sequence),\n    UNIQUE (session_id, dedupe_key)",
         "",
     )
     connection.execute("PRAGMA foreign_keys=OFF")
@@ -327,13 +325,9 @@ def test_missing_event_log_unique_constraints_is_rejected(tmp_path) -> None:
     connection.execute("DROP TABLE event_log")
     connection.execute("ALTER TABLE event_log_new RENAME TO event_log")
     connection.execute(
-        "CREATE INDEX idx_event_log_readback "
-        "ON event_log(session_id, ingest_sequence)"
+        "CREATE INDEX idx_event_log_readback ON event_log(session_id, ingest_sequence)"
     )
-    connection.execute(
-        "CREATE INDEX idx_event_log_type_day "
-        "ON event_log(event_type, trading_day)"
-    )
+    connection.execute("CREATE INDEX idx_event_log_type_day ON event_log(event_type, trading_day)")
     repository.close()
     with pytest.raises(SchemaMismatchError):
         SQLiteMarketDataRepository(path)
@@ -344,8 +338,7 @@ def test_source_mode_check_with_extra_literal_is_rejected(tmp_path) -> None:
     repository = SQLiteMarketDataRepository(path)
     connection = repository.connection
     create_sql = connection.execute(
-        "SELECT sql FROM sqlite_master "
-        "WHERE type='table' AND name='recording_sessions'"
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='recording_sessions'"
     ).fetchone()["sql"]
     malformed = create_sql.replace(
         "CREATE TABLE recording_sessions",
@@ -357,9 +350,7 @@ def test_source_mode_check_with_extra_literal_is_rejected(tmp_path) -> None:
     connection.execute("PRAGMA foreign_keys=OFF")
     connection.execute(malformed)
     connection.execute("DROP TABLE recording_sessions")
-    connection.execute(
-        "ALTER TABLE recording_sessions_new RENAME TO recording_sessions"
-    )
+    connection.execute("ALTER TABLE recording_sessions_new RENAME TO recording_sessions")
     connection.execute(
         "CREATE INDEX idx_sessions_trading_day_started "
         "ON recording_sessions(trading_day, started_at)"

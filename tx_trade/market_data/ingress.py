@@ -61,12 +61,7 @@ class BoundedIngressSnapshot:
 
     @property
     def total_depth(self) -> int:
-        return (
-            self.diagnostic_depth
-            + self.control_depth
-            + self.quote_depth
-            + self.tick_depth
-        )
+        return self.diagnostic_depth + self.control_depth + self.quote_depth + self.tick_depth
 
 
 class BoundedIngress:
@@ -132,9 +127,9 @@ class BoundedIngress:
                 decision = self._publish_quote(event)
             else:
                 decision = self._publish_fifo(lane, event)
-            if (
-                dedupe_key is not None
-                and decision in (IngressDecision.ACCEPTED, IngressDecision.COALESCED)
+            if dedupe_key is not None and decision in (
+                IngressDecision.ACCEPTED,
+                IngressDecision.COALESCED,
             ):
                 self._remember(dedupe_key)
             depth = self._lane_depth(lane)
@@ -175,9 +170,7 @@ class BoundedIngress:
         while len(self._recent) > self._dedupe_capacity:
             self._recent.popitem(last=False)
 
-    def _publish_fifo(
-        self, lane: IngressLane, event: CapturedMarketDataEvent
-    ) -> IngressDecision:
+    def _publish_fifo(self, lane: IngressLane, event: CapturedMarketDataEvent) -> IngressDecision:
         queue = {
             IngressLane.DIAGNOSTIC: self._diagnostic,
             IngressLane.CONTROL: self._control,
@@ -209,9 +202,7 @@ class BoundedIngress:
         self._quotes[key] = event
         return IngressDecision.ACCEPTED
 
-    def _handle_overflow(
-        self, lane: IngressLane, event: CapturedMarketDataEvent
-    ) -> None:
+    def _handle_overflow(self, lane: IngressLane, event: CapturedMarketDataEvent) -> None:
         reason = f"{lane.value}_ingress_overflow"
         if lane in (IngressLane.DIAGNOSTIC, IngressLane.CONTROL):
             self._health.fail(reason)
@@ -246,13 +237,10 @@ class BoundedIngress:
             critical_waiting = bool(self._diagnostic or self._control)
             market_waiting = bool(self._quotes or self._ticks)
             if critical_waiting and (
-                not market_waiting
-                or self._priority_burst < self._priority_burst_limit
+                not market_waiting or self._priority_burst < self._priority_burst_limit
             ):
                 lane, event = self._pop_critical()
-                self._priority_burst = min(
-                    self._priority_burst + 1, self._priority_burst_limit
-                )
+                self._priority_burst = min(self._priority_burst + 1, self._priority_burst_limit)
             elif market_waiting:
                 lane, event = self._pop_market()
                 self._priority_burst = 0
@@ -269,19 +257,13 @@ class BoundedIngress:
         if self._diagnostic and self._control:
             lane = self._critical_turn
             self._critical_turn = (
-                IngressLane.CONTROL
-                if lane is IngressLane.DIAGNOSTIC
-                else IngressLane.DIAGNOSTIC
+                IngressLane.CONTROL if lane is IngressLane.DIAGNOSTIC else IngressLane.DIAGNOSTIC
             )
         elif self._diagnostic:
             lane = IngressLane.DIAGNOSTIC
         else:
             lane = IngressLane.CONTROL
-        queue = (
-            self._diagnostic
-            if lane is IngressLane.DIAGNOSTIC
-            else self._control
-        )
+        queue = self._diagnostic if lane is IngressLane.DIAGNOSTIC else self._control
         return lane, queue.popleft()
 
     def _pop_market(
@@ -289,11 +271,7 @@ class BoundedIngress:
     ) -> tuple[IngressLane, CapturedMarketDataEvent]:
         if self._quotes and self._ticks:
             lane = self._market_turn
-            self._market_turn = (
-                IngressLane.TICK
-                if lane is IngressLane.QUOTE
-                else IngressLane.QUOTE
-            )
+            self._market_turn = IngressLane.TICK if lane is IngressLane.QUOTE else IngressLane.QUOTE
         elif self._quotes:
             lane = IngressLane.QUOTE
         elif self._ticks:
@@ -387,9 +365,7 @@ class BoundedStaQuoteQueue:
         self._lock = Lock()
         metrics.set_capacity(IngressLane.STA_QUOTE, capacity + 1)
 
-    def try_publish(
-        self, notification: StaLocalQuoteNotification
-    ) -> StaIngressDecision:
+    def try_publish(self, notification: StaLocalQuoteNotification) -> StaIngressDecision:
         if type(notification) is not StaLocalQuoteNotification:
             raise TypeError("notification must be exactly StaLocalQuoteNotification")
         lane = IngressLane.STA_QUOTE
@@ -406,11 +382,7 @@ class BoundedStaQuoteQueue:
             depth = len(self._queue) + (self._overflow is not None)
             self._metrics.record_result(
                 lane,
-                (
-                    IngressDecision.ACCEPTED
-                    if accepted
-                    else IngressDecision.DROPPED
-                ),
+                (IngressDecision.ACCEPTED if accepted else IngressDecision.DROPPED),
                 overflow=not accepted,
                 depth=depth,
             )
@@ -499,9 +471,7 @@ class BoundedIngressProcessor:
         self._metrics = metrics
         self._impact = session_impact
         self._shutdown = shutdown
-        if accepted_event_observer is not None and not callable(
-            accepted_event_observer
-        ):
+        if accepted_event_observer is not None and not callable(accepted_event_observer):
             raise TypeError("accepted_event_observer must be callable")
         self._accepted_event_observer = accepted_event_observer
         self._lock = Lock()
@@ -548,9 +518,7 @@ class BoundedIngressProcessor:
                         self._health.fail("session_impact_capacity_exhausted")
                     if self._shutdown.request_shutdown(reason):
                         self._metrics.record_shutdown_request()
-                    raise AcceptedEventObserverError(
-                        "accepted event observer failed"
-                    ) from None
+                    raise AcceptedEventObserverError("accepted event observer failed") from None
             return True
 
     def drain(self, max_events: int) -> int:
@@ -562,9 +530,7 @@ class BoundedIngressProcessor:
 
     def snapshot(self) -> BoundedIngressProcessorSnapshot:
         with self._lock:
-            return BoundedIngressProcessorSnapshot(
-                self._halted, self._in_flight_failed_event
-            )
+            return BoundedIngressProcessorSnapshot(self._halted, self._in_flight_failed_event)
 
 
 class PipelineStorageFailureNotifier:

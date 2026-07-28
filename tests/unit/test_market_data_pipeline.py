@@ -185,9 +185,7 @@ def _changed_event_at(envelope):
         ("raw_payload", lambda envelope: replace(envelope, raw_payload={"changed": 1})),
         (
             "ingest_sequence",
-            lambda envelope: replace(
-                envelope, ingest_sequence=envelope.ingest_sequence + 1
-            ),
+            lambda envelope: replace(envelope, ingest_sequence=envelope.ingest_sequence + 1),
         ),
     ],
 )
@@ -253,9 +251,7 @@ def test_bounded_processor_only_sequences_after_pop_and_drains_bounded_count():
 def test_bounded_processor_audits_popped_event_failure_and_requests_shutdown():
     sink = Sink()
     sink.error = RuntimeError("writer queue full")
-    processor, ingress, sequencer, health, metrics, impact, shutdown = _processor(
-        sink=sink
-    )
+    processor, ingress, sequencer, health, metrics, impact, shutdown = _processor(sink=sink)
     ingress.try_publish(make_captured())
     ingress.try_publish(replace(make_captured(4), dedupe_candidate="second"))
     with pytest.raises(RuntimeError, match="writer queue full"):

@@ -36,8 +36,7 @@ def test_all_registered_payloads_roundtrip_through_codec() -> None:
             "session_id": str(envelope.session_id),
             "event_at": envelope.event_at.isoformat() if envelope.event_at else None,
             "received_at": envelope.received_at.isoformat(),
-            "trading_day": envelope.trading_day.isoformat()
-            if envelope.trading_day else None,
+            "trading_day": envelope.trading_day.isoformat() if envelope.trading_day else None,
         }
         row["record_sha256"] = record_sha256(row)
         assert serialize_envelope(decode_envelope(row)) == serialize_envelope(envelope)

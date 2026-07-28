@@ -70,9 +70,7 @@ class SQLiteMarketDataWriter:
             or flush_interval_seconds <= 0
         ):
             raise ValueError("flush_interval_seconds must be finite and positive")
-        if notifier is not None and not isinstance(
-            notifier, StorageFailureNotifier
-        ):
+        if notifier is not None and not isinstance(notifier, StorageFailureNotifier):
             raise TypeError("notifier must implement StorageFailureNotifier")
         self._repository = repository
         self._queue: queue.Queue[object] = queue.Queue(maxsize=capacity)
@@ -117,9 +115,7 @@ class SQLiteMarketDataWriter:
             assert self._fatal is not None
             raise self._fatal
         if self._state is not WriterState.RUNNING:
-            raise StorageError(
-                f"storage writer is not running ({self._state.value})"
-            )
+            raise StorageError(f"storage writer is not running ({self._state.value})")
 
     def publish(self, envelope: MarketDataEnvelope) -> None:
         if type(envelope) is not MarketDataEnvelope:
@@ -139,9 +135,7 @@ class SQLiteMarketDataWriter:
             try:
                 self._queue.put_nowait(barrier)
             except queue.Full as exc:
-                raise StorageBackpressureError(
-                    "could not enqueue flush barrier"
-                ) from exc
+                raise StorageBackpressureError("could not enqueue flush barrier") from exc
         if not barrier.done.wait(timeout):
             raise TimeoutError("storage writer flush timed out")
         if barrier.error is not None:
@@ -172,9 +166,7 @@ class SQLiteMarketDataWriter:
                         assert self._fatal is not None
                         raise self._fatal
                     self._state = WriterState.RUNNING
-                raise StorageBackpressureError(
-                    "could not enqueue stop request"
-                ) from exc
+                raise StorageBackpressureError("could not enqueue stop request") from exc
         assert thread is not None
         thread.join(timeout)
         if thread.is_alive():

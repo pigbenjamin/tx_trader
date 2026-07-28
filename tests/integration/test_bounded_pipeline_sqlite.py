@@ -135,9 +135,7 @@ def test_accepted_drain_then_actual_sqlite_writer_persists_only_coalesced(
     tmp_path,
 ):
     template = next(
-        item
-        for item in make_offline_fixture_envelopes()
-        if item.event_type is EventType.QUOTE
+        item for item in make_offline_fixture_envelopes() if item.event_type is EventType.QUOTE
     )
     repository = SQLiteMarketDataRepository(tmp_path / "bounded.db")
     begin(repository, template)
@@ -159,8 +157,7 @@ def test_accepted_drain_then_actual_sqlite_writer_persists_only_coalesced(
         shutdown,
     )
     assert (
-        ingress.try_publish(captured_quote(template, 3, dedupe="first"))
-        is IngressDecision.ACCEPTED
+        ingress.try_publish(captured_quote(template, 3, dedupe="first")) is IngressDecision.ACCEPTED
     )
     assert (
         ingress.try_publish(captured_quote(template, 4, dedupe="newer"))
@@ -216,9 +213,7 @@ def test_actual_background_writer_fatal_notifies_pipeline_and_db_incomplete(
     assert writer._thread is not None
     writer._thread.join(1)
     assert health.snapshot().state is HealthState.FAILED
-    assert impact.effective_terminal_status(
-        template.session_id, "complete"
-    ) == "incomplete"
+    assert impact.effective_terminal_status(template.session_id, "complete") == "incomplete"
     assert shutdown.snapshot().request_count == 1
     assert metrics.snapshot().storage_failures == 1
     repository.end_session(

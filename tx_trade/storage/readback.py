@@ -51,14 +51,13 @@ class SQLiteReplaySource:
                 first = row_sequence
             last = row_sequence
             try:
-                envelope = decode_envelope(row)
+                envelope = decode_envelope(dict(row))
                 if envelope.session_id != session_id:
                     errors.append(f"event {index} has a different session")
                 if envelope.schema_version != SCHEMA_VERSION:
                     errors.append(f"event {index} has wrong schema version")
                 if session and (
-                    envelope.source != session.source
-                    or envelope.source_mode != session.source_mode
+                    envelope.source != session.source or envelope.source_mode != session.source_mode
                 ):
                     errors.append(f"event {index} source metadata mismatch")
                 if previous is not None and envelope.ingest_sequence <= previous:
@@ -68,9 +67,7 @@ class SQLiteReplaySource:
                 errors.append(f"event {index} integrity failure: {exc}")
         expected_checkpoint = -1 if last is None else last
         if session and session.last_ingest_sequence != expected_checkpoint:
-            errors.append(
-                "session checkpoint does not match authoritative event log"
-            )
+            errors.append("session checkpoint does not match authoritative event log")
         return ReadbackIntegrityReport(
             session_id=session_id,
             event_count=count,

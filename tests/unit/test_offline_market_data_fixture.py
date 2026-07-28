@@ -32,10 +32,7 @@ def test_fixture_is_canonical_and_contains_every_event_type():
     assert tuple(map(serialize_envelope, first)) == tuple(map(serialize_envelope, second))
     assert {event.event_type for event in first} == set(EventType)
     assert [event.ingest_sequence for event in first] == list(range(6))
-    assert all(
-        re.fullmatch(r"[a-z_]+:sha256:[0-9a-f]{64}", event.dedupe_key)
-        for event in first
-    )
+    assert all(re.fullmatch(r"[a-z_]+:sha256:[0-9a-f]{64}", event.dedupe_key) for event in first)
 
     diagnostic = first[-1]
     assert diagnostic.dedupe_key == build_adapter_diagnostic_dedupe_key(

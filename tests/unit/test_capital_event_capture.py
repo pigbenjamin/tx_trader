@@ -2,8 +2,6 @@ from datetime import datetime
 from time import monotonic
 from uuid import UUID
 
-import pytest
-
 from tx_trade.broker.capital.contracts import QuoteSnapshotRaw
 from tx_trade.broker.capital.quote_adapter import CapitalQuoteStaAdapter
 from tx_trade.market_data.ingress import BoundedIngress, BoundedStaQuoteQueue
@@ -29,22 +27,50 @@ class Clock:
 
 
 class Backend:
-    def co_initialize(self): pass
-    def initialize(self, dll_path): pass
-    def register_events(self, sink): self.sink = sink
-    def login(self, account, password): return 0
-    def enter_monitor(self): return 0
-    def leave_monitor(self): return 0
-    def request_quotes(self, symbols_csv): return 0
-    def request_ticks(self, symbols_csv): return 0
-    def cancel_quotes(self, symbols_csv): return 0
-    def cancel_ticks(self, symbols_csv): return 0
+    def co_initialize(self):
+        pass
+
+    def initialize(self, dll_path):
+        pass
+
+    def register_events(self, sink):
+        self.sink = sink
+
+    def login(self, account, password):
+        return 0
+
+    def enter_monitor(self):
+        return 0
+
+    def leave_monitor(self):
+        return 0
+
+    def request_quotes(self, symbols_csv):
+        return 0
+
+    def request_ticks(self, symbols_csv):
+        return 0
+
+    def cancel_quotes(self, symbols_csv):
+        return 0
+
+    def cancel_ticks(self, symbols_csv):
+        return 0
+
     def lookup_quote(self, market_no, stock_idx):
         return QuoteSnapshotRaw(100, 102, 101, 3, 4, None, 99, "TX00", "TX")
-    def pump_waiting_messages(self): pass
-    def release_events(self): pass
-    def release_objects(self): pass
-    def co_uninitialize(self): pass
+
+    def pump_waiting_messages(self):
+        pass
+
+    def release_events(self):
+        pass
+
+    def release_objects(self):
+        pass
+
+    def co_uninitialize(self):
+        pass
 
 
 def components(sta_capacity=2):
@@ -92,9 +118,7 @@ def components(sta_capacity=2):
 
 def test_callbacks_copy_complete_raw_values_without_normalization():
     adapter, ingress, *_ = components()
-    adapter.OnNotifyTicksLONG(
-        1, 2, 3, 20260726, 93001, 456, 10001, 10003, 10002, 7, 9
-    )
+    adapter.OnNotifyTicksLONG(1, 2, 3, 20260726, 93001, 456, 10001, 10003, 10002, 7, 9)
     event = ingress.try_pop()
     assert event.captured_kind is CapturedKind.TICK_NOTIFICATION
     assert event.source == "capital_skcom"
@@ -164,8 +188,7 @@ def test_reserved_overflow_becomes_diagnostic_without_lookup():
     adapter._drain_sta_quotes()
     events = [ingress.try_pop(), ingress.try_pop()]
     diagnostic = next(
-        event for event in events
-        if event.captured_kind is CapturedKind.ADAPTER_DIAGNOSTIC
+        event for event in events if event.captured_kind is CapturedKind.ADAPTER_DIAGNOSTIC
     )
     assert diagnostic.payload.message == "sta quote notification overflow"
     assert diagnostic.payload.raw_notification["stock_idx"] == 2

@@ -25,9 +25,7 @@ def test_offline_validation_never_reads_live_secrets_or_constructs_live(tmp_path
     result = run_phase1(
         environment,
         db_path=str(tmp_path / "offline.db"),
-        dependencies=Phase1Dependencies(
-            backend_factory=forbidden, adapter_factory=forbidden
-        ),
+        dependencies=Phase1Dependencies(backend_factory=forbidden, adapter_factory=forbidden),
     )
     assert result.status == "complete"
     assert result.integrity_valid
@@ -38,16 +36,12 @@ def test_offline_validation_never_reads_live_secrets_or_constructs_live(tmp_path
 
 
 def test_live_without_production_opt_in_fails_before_secret_or_factory_reads():
-    environment = TrackingEnvironment(
-        {"TX_TRADE_RUNTIME_PRESET": "phase1_live_quote"}
-    )
+    environment = TrackingEnvironment({"TX_TRADE_RUNTIME_PRESET": "phase1_live_quote"})
     called = []
     with pytest.raises(ConfigError, match="ENABLE_LIVE_QUOTE"):
         run_phase1(
             environment,
-            dependencies=Phase1Dependencies(
-                repository_factory=lambda path: called.append(path)
-            ),
+            dependencies=Phase1Dependencies(repository_factory=lambda path: called.append(path)),
         )
     assert called == []
     assert "TX_TRADE_ACCOUNT" not in environment.reads
@@ -76,9 +70,7 @@ def test_non_phase1_runtime_presets_fail_before_database(preset):
     with pytest.raises(ConfigError):
         run_phase1(
             {"TX_TRADE_RUNTIME_PRESET": preset},
-            dependencies=Phase1Dependencies(
-                repository_factory=lambda path: called.append(path)
-            ),
+            dependencies=Phase1Dependencies(repository_factory=lambda path: called.append(path)),
         )
     assert called == []
 

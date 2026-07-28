@@ -1,0 +1,33 @@
+[tool.pytest.ini_options]
+addopts = "-m 'not legacy_com and not stress and not live'"
+testpaths = ["tests"]
+markers = [
+    "legacy_com: exercises the legacy SKCOM facade and may initialize real COM objects",
+    "live: requires explicit opt-in and connects to the live SKCOM quote service",
+    "stress: resource-intensive concurrency and memory stability tests",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+exclude = [
+    "PythonExampleV2",
+    "ref",
+    "venv_tx_trade",
+    "venv_tx_trade_fresh",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["tx_trade"]
+check_untyped_defs = true
+ignore_missing_imports = true
+show_error_codes = true
+warn_redundant_casts = true
+warn_unused_ignores = true

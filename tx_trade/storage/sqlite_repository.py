@@ -7,9 +7,9 @@ import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from tx_trade.market_data.models import (
@@ -74,28 +74,39 @@ class SQLiteMarketDataRepository:
         *,
         busy_timeout_ms: int = 5000,
         recover_incomplete_sessions: bool = False,
+        read_only: bool = False,
     ) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms < 0:
             raise ValueError("busy_timeout_ms must be a non-negative integer")
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be bool")
+        if read_only and recover_incomplete_sessions:
+            raise ValueError("read-only repositories cannot recover sessions")
         self._path = Path(db_path)
+        self._read_only = read_only
         self._lock = threading.RLock()
         self._closed = False
         self._stats = RepositoryStats(0, 0, 0)
         self._raw_only_sessions: set[UUID] = set()
+        connection_target: str | Path = self._path
+        if read_only:
+            connection_target = f"{self._path.resolve().as_uri()}?mode=ro&immutable=1"
         self._connection = sqlite3.connect(
-            self._path, check_same_thread=False, isolation_level=None
+            connection_target,
+            check_same_thread=False,
+            isolation_level=None,
+            uri=read_only,
         )
         self._connection.row_factory = sqlite3.Row
         try:
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-            if str(self._path) != ":memory:":
+            if not read_only and str(self._path) != ":memory:":
                 self._connection.execute("PRAGMA journal_mode = WAL")
             self._initialize_or_validate()
             if recover_incomplete_sessions:
                 self._connection.execute(
-                    "UPDATE recording_sessions SET status='incomplete' "
-                    "WHERE status='recording'"
+                    "UPDATE recording_sessions SET status='incomplete' WHERE status='recording'"
                 )
         except Exception:
             self._connection.close()
@@ -110,6 +121,8 @@ class SQLiteMarketDataRepository:
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
         ).fetchone()[0]
         if count == 0:
+            if self._read_only:
+                raise SchemaMismatchError("read-only database has no schema")
             schema_path = Path(__file__).with_name("schema.sql")
             self._connection.executescript(schema_path.read_text(encoding="utf-8"))
             applied_at = datetime.now(TAIPEI).isoformat()
@@ -135,62 +148,139 @@ class SQLiteMarketDataRepository:
         required_columns = {
             "schema_meta": {"version", "applied_at"},
             "recording_sessions": {
-                "session_id", "schema_version", "source", "source_mode",
-                "started_at", "ended_at", "trading_day", "status",
-                "config_fingerprint", "last_ingest_sequence", "dropped_tick_count",
+                "session_id",
+                "schema_version",
+                "source",
+                "source_mode",
+                "started_at",
+                "ended_at",
+                "trading_day",
+                "status",
+                "config_fingerprint",
+                "last_ingest_sequence",
+                "dropped_tick_count",
             },
             "event_log": {
-                "event_id", "session_id", "ingest_sequence", "schema_version",
-                "event_type", "source", "source_mode", "connection_generation",
-                "sequence", "broker_sequence", "dedupe_key", "event_at",
-                "trading_day", "received_at", "metadata_version", "payload_json",
-                "raw_json", "payload_sha256", "record_sha256",
+                "event_id",
+                "session_id",
+                "ingest_sequence",
+                "schema_version",
+                "event_type",
+                "source",
+                "source_mode",
+                "connection_generation",
+                "sequence",
+                "broker_sequence",
+                "dedupe_key",
+                "event_at",
+                "trading_day",
+                "received_at",
+                "metadata_version",
+                "payload_json",
+                "raw_json",
+                "payload_sha256",
+                "record_sha256",
             },
             "instruments": {
-                "instrument_id", "metadata_version", "symbol", "venue",
-                "market_no", "stock_idx", "display_name", "asset_class",
-                "currency", "price_scale_text", "quantity_scale_text",
-                "updated_at", "raw_payload_json",
+                "instrument_id",
+                "metadata_version",
+                "symbol",
+                "venue",
+                "market_no",
+                "stock_idx",
+                "display_name",
+                "asset_class",
+                "currency",
+                "price_scale_text",
+                "quantity_scale_text",
+                "updated_at",
+                "raw_payload_json",
             },
             "quotes": {
-                "quote_id", "event_id", "session_id", "ingest_sequence",
-                "schema_version", "connection_generation", "sequence",
-                "dedupe_key", "instrument_id", "metadata_version",
-                "market_no_raw", "stock_idx_raw", "bid_raw", "ask_raw",
-                "last_raw", "bid_qty_raw", "ask_qty_raw", "last_qty_raw",
-                "bid_normalized_text", "ask_normalized_text",
-                "last_normalized_text", "event_at", "trading_day", "received_at",
-                "is_simulated", "is_long_callback",
+                "quote_id",
+                "event_id",
+                "session_id",
+                "ingest_sequence",
+                "schema_version",
+                "connection_generation",
+                "sequence",
+                "dedupe_key",
+                "instrument_id",
+                "metadata_version",
+                "market_no_raw",
+                "stock_idx_raw",
+                "bid_raw",
+                "ask_raw",
+                "last_raw",
+                "bid_qty_raw",
+                "ask_qty_raw",
+                "last_qty_raw",
+                "bid_normalized_text",
+                "ask_normalized_text",
+                "last_normalized_text",
+                "event_at",
+                "trading_day",
+                "received_at",
+                "is_simulated",
+                "is_long_callback",
             },
             "ticks": {
-                "tick_id", "event_id", "session_id", "ingest_sequence",
-                "schema_version", "connection_generation", "sequence",
-                "dedupe_key", "instrument_id", "metadata_version",
-                "market_no_raw", "stock_idx_raw", "source_pointer_raw",
-                "date_raw", "time_hms_raw", "time_subsecond_raw", "bid_raw",
-                "ask_raw", "close_raw", "quantity_raw", "simulate_raw",
-                "bid_normalized_text", "ask_normalized_text",
-                "close_normalized_text", "quantity_normalized_text", "event_at",
-                "trading_day", "received_at", "is_simulated", "is_long_callback",
+                "tick_id",
+                "event_id",
+                "session_id",
+                "ingest_sequence",
+                "schema_version",
+                "connection_generation",
+                "sequence",
+                "dedupe_key",
+                "instrument_id",
+                "metadata_version",
+                "market_no_raw",
+                "stock_idx_raw",
+                "source_pointer_raw",
+                "date_raw",
+                "time_hms_raw",
+                "time_subsecond_raw",
+                "bid_raw",
+                "ask_raw",
+                "close_raw",
+                "quantity_raw",
+                "simulate_raw",
+                "bid_normalized_text",
+                "ask_normalized_text",
+                "close_normalized_text",
+                "quantity_normalized_text",
+                "event_at",
+                "trading_day",
+                "received_at",
+                "is_simulated",
+                "is_long_callback",
             },
             "connection_events": {
-                "connection_event_id", "event_id", "session_id",
-                "ingest_sequence", "schema_version", "connection_generation",
-                "sequence", "dedupe_key", "state", "broker_kind_raw",
-                "broker_code_raw", "message", "is_ready", "changed_at",
-                "received_at", "trading_day",
+                "connection_event_id",
+                "event_id",
+                "session_id",
+                "ingest_sequence",
+                "schema_version",
+                "connection_generation",
+                "sequence",
+                "dedupe_key",
+                "state",
+                "broker_kind_raw",
+                "broker_code_raw",
+                "message",
+                "is_ready",
+                "changed_at",
+                "received_at",
+                "trading_day",
             },
         }
         for table, expected in required_columns.items():
-            table_info = list(
-                self._connection.execute(f"PRAGMA table_info({table})")
-            )
+            table_info = list(self._connection.execute(f"PRAGMA table_info({table})"))
             actual = {row["name"] for row in table_info}
             if not expected <= actual:
                 missing = sorted(expected - actual)
-                raise SchemaMismatchError(
-                    f"table {table} is missing required columns: {missing}"
-                )
+                raise SchemaMismatchError(f"table {table} is missing required columns: {missing}")
         required_primary_keys = {
             "schema_meta": ("version",),
             "recording_sessions": ("session_id",),
@@ -203,87 +293,150 @@ class SQLiteMarketDataRepository:
         required_not_null = {
             "schema_meta": {"applied_at"},
             "recording_sessions": {
-                "schema_version", "source", "source_mode", "started_at", "status",
-                "config_fingerprint", "last_ingest_sequence", "dropped_tick_count",
+                "schema_version",
+                "source",
+                "source_mode",
+                "started_at",
+                "status",
+                "config_fingerprint",
+                "last_ingest_sequence",
+                "dropped_tick_count",
             },
             "event_log": {
-                "session_id", "ingest_sequence", "schema_version", "event_type",
-                "source", "source_mode", "connection_generation", "sequence",
-                "dedupe_key", "received_at", "payload_json", "payload_sha256",
+                "session_id",
+                "ingest_sequence",
+                "schema_version",
+                "event_type",
+                "source",
+                "source_mode",
+                "connection_generation",
+                "sequence",
+                "dedupe_key",
+                "received_at",
+                "payload_json",
+                "payload_sha256",
                 "record_sha256",
             },
             "instruments": {
-                "instrument_id", "metadata_version", "symbol", "venue", "updated_at",
+                "instrument_id",
+                "metadata_version",
+                "symbol",
+                "venue",
+                "updated_at",
             },
             "quotes": {
-                "event_id", "session_id", "ingest_sequence", "schema_version",
-                "connection_generation", "sequence", "dedupe_key", "instrument_id",
-                "market_no_raw", "stock_idx_raw", "bid_raw", "ask_raw", "last_raw",
-                "received_at", "is_long_callback",
+                "event_id",
+                "session_id",
+                "ingest_sequence",
+                "schema_version",
+                "connection_generation",
+                "sequence",
+                "dedupe_key",
+                "instrument_id",
+                "market_no_raw",
+                "stock_idx_raw",
+                "bid_raw",
+                "ask_raw",
+                "last_raw",
+                "received_at",
+                "is_long_callback",
             },
             "ticks": {
-                "event_id", "session_id", "ingest_sequence", "schema_version",
-                "connection_generation", "sequence", "dedupe_key", "instrument_id",
-                "market_no_raw", "stock_idx_raw", "source_pointer_raw", "date_raw",
-                "time_hms_raw", "time_subsecond_raw", "bid_raw", "ask_raw",
-                "close_raw", "quantity_raw", "simulate_raw", "received_at",
+                "event_id",
+                "session_id",
+                "ingest_sequence",
+                "schema_version",
+                "connection_generation",
+                "sequence",
+                "dedupe_key",
+                "instrument_id",
+                "market_no_raw",
+                "stock_idx_raw",
+                "source_pointer_raw",
+                "date_raw",
+                "time_hms_raw",
+                "time_subsecond_raw",
+                "bid_raw",
+                "ask_raw",
+                "close_raw",
+                "quantity_raw",
+                "simulate_raw",
+                "received_at",
                 "is_long_callback",
             },
             "connection_events": {
-                "event_id", "session_id", "ingest_sequence", "schema_version",
-                "connection_generation", "sequence", "dedupe_key", "state",
-                "is_ready", "changed_at", "received_at",
+                "event_id",
+                "session_id",
+                "ingest_sequence",
+                "schema_version",
+                "connection_generation",
+                "sequence",
+                "dedupe_key",
+                "state",
+                "is_ready",
+                "changed_at",
+                "received_at",
             },
         }
         for table, expected_pk in required_primary_keys.items():
             info = list(self._connection.execute(f"PRAGMA table_info({table})"))
             actual_pk = tuple(
-                row["name"] for row in sorted(
-                    (row for row in info if row["pk"]), key=lambda row: row["pk"]
-                )
+                row["name"]
+                for row in sorted((row for row in info if row["pk"]), key=lambda row: row["pk"])
             )
             if actual_pk != expected_pk:
-                raise SchemaMismatchError(
-                    f"table {table} has wrong primary key: {actual_pk}"
-                )
+                raise SchemaMismatchError(f"table {table} has wrong primary key: {actual_pk}")
             actual_not_null = {row["name"] for row in info if row["notnull"]}
-            missing = required_not_null[table] - actual_not_null
-            if missing:
+            missing_not_null = required_not_null[table] - actual_not_null
+            if missing_not_null:
                 raise SchemaMismatchError(
-                    f"table {table} has nullable required columns: {sorted(missing)}"
+                    f"table {table} has nullable required columns: {sorted(missing_not_null)}"
                 )
         required_indices = {
             "idx_sessions_trading_day_started": (
-                "trading_day", "started_at",
+                "trading_day",
+                "started_at",
             ),
             "idx_event_log_readback": ("session_id", "ingest_sequence"),
             "idx_event_log_type_day": ("event_type", "trading_day"),
             "idx_instruments_symbol_version": (
-                "venue", "symbol", "metadata_version",
+                "venue",
+                "symbol",
+                "metadata_version",
             ),
             "idx_instruments_market_stock": (
-                "market_no", "stock_idx", "updated_at",
+                "market_no",
+                "stock_idx",
+                "updated_at",
             ),
             "idx_quotes_instrument_event": (
-                "instrument_id", "trading_day", "event_at", "quote_id",
+                "instrument_id",
+                "trading_day",
+                "event_at",
+                "quote_id",
             ),
             "idx_ticks_readback": ("session_id", "ingest_sequence", "tick_id"),
             "idx_ticks_instrument_day": (
-                "instrument_id", "trading_day", "event_at", "tick_id",
+                "instrument_id",
+                "trading_day",
+                "event_at",
+                "tick_id",
             ),
             "idx_ticks_source_ptr": (
-                "session_id", "connection_generation", "instrument_id",
+                "session_id",
+                "connection_generation",
+                "instrument_id",
                 "source_pointer_raw",
             ),
             "idx_connection_events_session_time": (
-                "session_id", "changed_at", "connection_event_id",
+                "session_id",
+                "changed_at",
+                "connection_event_id",
             ),
         }
         actual_indices = {
             row["name"]
-            for row in self._connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='index'"
-            )
+            for row in self._connection.execute("SELECT name FROM sqlite_master WHERE type='index'")
         }
         if not set(required_indices) <= actual_indices:
             raise SchemaMismatchError(
@@ -292,30 +445,22 @@ class SQLiteMarketDataRepository:
             )
         for name, expected_columns in required_indices.items():
             index_owner = self._connection.execute(
-                "SELECT tbl_name FROM sqlite_master "
-                "WHERE type='index' AND name=?",
+                "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?",
                 (name,),
             ).fetchone()["tbl_name"]
             index_metadata = next(
                 row
-                for row in self._connection.execute(
-                    f"PRAGMA index_list({index_owner})"
-                )
+                for row in self._connection.execute(f"PRAGMA index_list({index_owner})")
                 if row["name"] == name
             )
             if index_metadata["unique"] != 0:
-                raise SchemaMismatchError(
-                    f"lookup index {name} must be non-unique"
-                )
+                raise SchemaMismatchError(f"lookup index {name} must be non-unique")
             actual_columns = tuple(
-                row["name"]
-                for row in self._connection.execute(f"PRAGMA index_info({name})")
+                row["name"] for row in self._connection.execute(f"PRAGMA index_info({name})")
             )
             if actual_columns != expected_columns:
-                raise SchemaMismatchError(
-                    f"index {name} has wrong columns: {actual_columns}"
-                )
-        required_uniques = {
+                raise SchemaMismatchError(f"index {name} has wrong columns: {actual_columns}")
+        required_uniques: dict[str, set[tuple[str, ...]]] = {
             "event_log": {
                 ("session_id", "ingest_sequence"),
                 ("session_id", "dedupe_key"),
@@ -336,20 +481,20 @@ class SQLiteMarketDataRepository:
                 ("session_id", "dedupe_key"),
             },
         }
-        for table, expected in required_uniques.items():
-            actual: set[tuple[str, ...]] = set()
+        for table, expected_unique_columns in required_uniques.items():
+            actual_unique_columns: set[tuple[str, ...]] = set()
             for index in self._connection.execute(f"PRAGMA index_list({table})"):
                 if index["unique"]:
-                    actual.add(tuple(
-                        row["name"]
-                        for row in self._connection.execute(
-                            f"PRAGMA index_info({index['name']})"
+                    actual_unique_columns.add(
+                        tuple(
+                            row["name"]
+                            for row in self._connection.execute(
+                                f"PRAGMA index_info({index['name']})"
+                            )
                         )
-                    ))
-            if not expected <= actual:
-                raise SchemaMismatchError(
-                    f"table {table} is missing required UNIQUE constraints"
-                )
+                    )
+            if not expected_unique_columns <= actual_unique_columns:
+                raise SchemaMismatchError(f"table {table} is missing required UNIQUE constraints")
         expected_foreign_keys = {
             "event_log": {
                 ("recording_sessions", "session_id", "session_id"),
@@ -367,33 +512,50 @@ class SQLiteMarketDataRepository:
                 ("recording_sessions", "session_id", "session_id"),
             },
         }
-        for table, expected in expected_foreign_keys.items():
-            actual = {
+        for table, required_foreign_keys in expected_foreign_keys.items():
+            actual_foreign_keys = {
                 (row["table"], row["from"], row["to"])
-                for row in self._connection.execute(
-                    f"PRAGMA foreign_key_list({table})"
-                )
+                for row in self._connection.execute(f"PRAGMA foreign_key_list({table})")
             }
-            if not expected <= actual:
-                raise SchemaMismatchError(
-                    f"table {table} is missing required foreign keys"
-                )
+            if not required_foreign_keys <= actual_foreign_keys:
+                raise SchemaMismatchError(f"table {table} is missing required foreign keys")
         required_enum_checks = {
             ("recording_sessions", "source_mode"): {
-                "offline", "replay", "live",
+                "offline",
+                "replay",
+                "live",
             },
             ("recording_sessions", "status"): {
-                "recording", "complete", "degraded", "failed", "incomplete",
+                "recording",
+                "complete",
+                "degraded",
+                "failed",
+                "incomplete",
             },
             ("event_log", "source_mode"): {"offline", "replay", "live"},
             ("event_log", "event_type"): {
-                "connection_status", "server_time", "instrument", "quote",
-                "tick", "adapter_diagnostic",
+                "connection_status",
+                "server_time",
+                "instrument",
+                "quote",
+                "tick",
+                "adapter_diagnostic",
             },
             ("connection_events", "state"): {
-                "new", "starting", "com_ready", "logging_in", "logged_in",
-                "entering_monitor", "connected", "stocks_ready", "subscribed",
-                "disconnected", "reconnecting", "stopping", "error", "stopped",
+                "new",
+                "starting",
+                "com_ready",
+                "logging_in",
+                "logged_in",
+                "entering_monitor",
+                "connected",
+                "stocks_ready",
+                "subscribed",
+                "disconnected",
+                "reconnecting",
+                "stopping",
+                "error",
+                "stopped",
             },
         }
         for (table, column), expected_literals in required_enum_checks.items():
@@ -407,14 +569,9 @@ class SQLiteMarketDataRepository:
                 rf"\(\s*([^)]*?)\s*\)\s*\)",
                 normalized,
             )
-            literal_sets = [
-                set(re.findall(r"'([^']*)'", match))
-                for match in matches
-            ]
+            literal_sets = [set(re.findall(r"'([^']*)'", match)) for match in matches]
             if literal_sets != [expected_literals]:
-                raise SchemaMismatchError(
-                    f"table {table} has wrong CHECK set for {column}"
-                )
+                raise SchemaMismatchError(f"table {table} has wrong CHECK set for {column}")
         for table in ("quotes", "ticks"):
             row = self._connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
@@ -429,9 +586,7 @@ class SQLiteMarketDataRepository:
             )
             for pattern in required_boolean_checks:
                 if re.search(pattern, normalized) is None:
-                    raise SchemaMismatchError(
-                        f"table {table} is missing boolean CHECK constraints"
-                    )
+                    raise SchemaMismatchError(f"table {table} is missing boolean CHECK constraints")
 
     def _require_open(self) -> None:
         if self._closed:
@@ -445,9 +600,7 @@ class SQLiteMarketDataRepository:
         if session.source_mode is SourceMode.REPLAY:
             raise ValueError("replay sessions cannot be recorded")
         if session.schema_version != SCHEMA_VERSION:
-            raise SchemaMismatchError(
-                f"session schema version must be {SCHEMA_VERSION}"
-            )
+            raise SchemaMismatchError(f"session schema version must be {SCHEMA_VERSION}")
         with self._lock:
             self._require_open()
             try:
@@ -462,8 +615,7 @@ class SQLiteMarketDataRepository:
                         session.source,
                         session.source_mode.value,
                         session.started_at.isoformat(),
-                        session.trading_day.isoformat()
-                        if session.trading_day else None,
+                        session.trading_day.isoformat() if session.trading_day else None,
                         "recording",
                         session.config_fingerprint,
                     ),
@@ -499,10 +651,7 @@ class SQLiteMarketDataRepository:
         session = self.get_session(session_id)
         if session is None:
             raise StorageError("recording session does not exist")
-        if (
-            session.status != "recording"
-            and session.session_id not in self._raw_only_sessions
-        ):
+        if session.status != "recording" and session.session_id not in self._raw_only_sessions:
             raise StorageError("recording session is not active")
         previous = -1
         new: list[MarketDataEnvelope] = []
@@ -524,8 +673,7 @@ class SQLiteMarketDataRepository:
             existing_dedupe = (
                 event.dedupe_key in seen_dedupe
                 or self._connection.execute(
-                    "SELECT 1 FROM event_log "
-                    "WHERE session_id=? AND dedupe_key=?",
+                    "SELECT 1 FROM event_log WHERE session_id=? AND dedupe_key=?",
                     (str(session_id), event.dedupe_key),
                 ).fetchone()
                 is not None
@@ -534,8 +682,7 @@ class SQLiteMarketDataRepository:
                 duplicates += 1
                 continue
             collision = self._connection.execute(
-                "SELECT dedupe_key FROM event_log "
-                "WHERE session_id=? AND ingest_sequence=?",
+                "SELECT dedupe_key FROM event_log WHERE session_id=? AND ingest_sequence=?",
                 (str(session_id), event.ingest_sequence),
             ).fetchone()
             if collision is not None:
@@ -617,9 +764,7 @@ class SQLiteMarketDataRepository:
             self._stats.projection_failures,
         )
 
-    def _insert_event(
-        self, connection: sqlite3.Connection, event: MarketDataEnvelope
-    ) -> int:
+    def _insert_event(self, connection: sqlite3.Connection, event: MarketDataEnvelope) -> int:
         payload_json, raw_json, checksum = encode_envelope(event)
         values: dict[str, Any] = {
             "session_id": str(event.session_id),
@@ -633,9 +778,7 @@ class SQLiteMarketDataRepository:
             "broker_sequence": event.broker_sequence,
             "dedupe_key": event.dedupe_key,
             "event_at": event.event_at.isoformat() if event.event_at else None,
-            "trading_day": (
-                event.trading_day.isoformat() if event.trading_day else None
-            ),
+            "trading_day": (event.trading_day.isoformat() if event.trading_day else None),
             "received_at": event.received_at.isoformat(),
             "metadata_version": event.metadata_version,
             "payload_json": payload_json,
@@ -652,20 +795,34 @@ class SQLiteMarketDataRepository:
                 payload_json,raw_json,payload_sha256,record_sha256)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    *(values[field] for field in (
-                        "session_id", "ingest_sequence", "schema_version",
-                        "event_type", "source", "source_mode",
-                        "connection_generation", "sequence", "broker_sequence",
-                        "dedupe_key", "event_at", "trading_day", "received_at",
-                        "metadata_version", "payload_json", "raw_json",
-                        "payload_sha256",
-                    )),
+                    *(
+                        values[field]
+                        for field in (
+                            "session_id",
+                            "ingest_sequence",
+                            "schema_version",
+                            "event_type",
+                            "source",
+                            "source_mode",
+                            "connection_generation",
+                            "sequence",
+                            "broker_sequence",
+                            "dedupe_key",
+                            "event_at",
+                            "trading_day",
+                            "received_at",
+                            "metadata_version",
+                            "payload_json",
+                            "raw_json",
+                            "payload_sha256",
+                        )
+                    ),
                     record_checksum,
                 ),
             )
         except sqlite3.Error as exc:
             raise StorageError("authoritative event insert failed") from exc
-        return int(cursor.lastrowid)
+        return int(cast(int, cursor.lastrowid))
 
     def _insert_projection(
         self,
@@ -690,8 +847,15 @@ class SQLiteMarketDataRepository:
                 quantity_scale_text=excluded.quantity_scale_text,
                 updated_at=excluded.updated_at,raw_payload_json=excluded.raw_payload_json""",
                 (
-                    p.instrument_id,p.metadata_version,p.symbol,p.venue,p.market_no,
-                    p.stock_idx,p.display_name,p.asset_class,p.currency,
+                    p.instrument_id,
+                    p.metadata_version,
+                    p.symbol,
+                    p.venue,
+                    p.market_no,
+                    p.stock_idx,
+                    p.display_name,
+                    p.asset_class,
+                    p.currency,
                     str(p.price_scale) if p.price_scale is not None else None,
                     str(p.quantity_scale) if p.quantity_scale is not None else None,
                     p.updated_at.isoformat(),
@@ -709,13 +873,31 @@ class SQLiteMarketDataRepository:
                 received_at,is_simulated,is_long_callback)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    event_id,str(e.session_id),e.ingest_sequence,e.schema_version,
-                    e.connection_generation,e.sequence,e.dedupe_key,p.instrument_id,
-                    e.metadata_version,p.market_no_raw,p.stock_idx_raw,p.bid_raw,
-                    p.ask_raw,p.last_raw,p.bid_qty_raw,p.ask_qty_raw,p.last_qty_raw,
-                    _d(p.bid_normalized),_d(p.ask_normalized),_d(p.last_normalized),
-                    _dt(p.event_at),_date(p.trading_day),p.received_at.isoformat(),
-                    _bool(p.is_simulated),int(p.is_long_callback),
+                    event_id,
+                    str(e.session_id),
+                    e.ingest_sequence,
+                    e.schema_version,
+                    e.connection_generation,
+                    e.sequence,
+                    e.dedupe_key,
+                    p.instrument_id,
+                    e.metadata_version,
+                    p.market_no_raw,
+                    p.stock_idx_raw,
+                    p.bid_raw,
+                    p.ask_raw,
+                    p.last_raw,
+                    p.bid_qty_raw,
+                    p.ask_qty_raw,
+                    p.last_qty_raw,
+                    _d(p.bid_normalized),
+                    _d(p.ask_normalized),
+                    _d(p.last_normalized),
+                    _dt(p.event_at),
+                    _date(p.trading_day),
+                    p.received_at.isoformat(),
+                    _bool(p.is_simulated),
+                    int(p.is_long_callback),
                 ),
             )
         elif isinstance(p, Tick):
@@ -730,15 +912,34 @@ class SQLiteMarketDataRepository:
                 received_at,is_simulated,is_long_callback)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    event_id,str(e.session_id),e.ingest_sequence,e.schema_version,
-                    e.connection_generation,e.sequence,e.dedupe_key,p.instrument_id,
-                    e.metadata_version,p.market_no_raw,p.stock_idx_raw,
-                    p.source_pointer_raw,p.date_raw,p.time_hms_raw,
-                    p.time_subsecond_raw,p.bid_raw,p.ask_raw,p.close_raw,
-                    p.quantity_raw,p.simulate_raw,_d(p.bid_normalized),
-                    _d(p.ask_normalized),_d(p.close_normalized),
-                    _d(p.quantity_normalized),_dt(p.event_at),_date(p.trading_day),
-                    p.received_at.isoformat(),_bool(p.is_simulated),
+                    event_id,
+                    str(e.session_id),
+                    e.ingest_sequence,
+                    e.schema_version,
+                    e.connection_generation,
+                    e.sequence,
+                    e.dedupe_key,
+                    p.instrument_id,
+                    e.metadata_version,
+                    p.market_no_raw,
+                    p.stock_idx_raw,
+                    p.source_pointer_raw,
+                    p.date_raw,
+                    p.time_hms_raw,
+                    p.time_subsecond_raw,
+                    p.bid_raw,
+                    p.ask_raw,
+                    p.close_raw,
+                    p.quantity_raw,
+                    p.simulate_raw,
+                    _d(p.bid_normalized),
+                    _d(p.ask_normalized),
+                    _d(p.close_normalized),
+                    _d(p.quantity_normalized),
+                    _dt(p.event_at),
+                    _date(p.trading_day),
+                    p.received_at.isoformat(),
+                    _bool(p.is_simulated),
                     int(p.is_long_callback),
                 ),
             )
@@ -750,10 +951,20 @@ class SQLiteMarketDataRepository:
                 broker_code_raw,message,is_ready,changed_at,received_at,trading_day)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    event_id,str(e.session_id),e.ingest_sequence,e.schema_version,
-                    e.connection_generation,e.sequence,e.dedupe_key,p.state.value,
-                    p.broker_kind_raw,p.broker_code_raw,p.message,int(p.is_ready),
-                    p.changed_at.isoformat(),e.received_at.isoformat(),
+                    event_id,
+                    str(e.session_id),
+                    e.ingest_sequence,
+                    e.schema_version,
+                    e.connection_generation,
+                    e.sequence,
+                    e.dedupe_key,
+                    p.state.value,
+                    p.broker_kind_raw,
+                    p.broker_code_raw,
+                    p.message,
+                    int(p.is_ready),
+                    p.changed_at.isoformat(),
+                    e.received_at.isoformat(),
                     _date(e.trading_day),
                 ),
             )
@@ -799,9 +1010,7 @@ class SQLiteMarketDataRepository:
             (sequence, str(session_id)),
         )
 
-    def end_session(
-        self, session_id: UUID, ended_at: datetime, status: str
-    ) -> None:
+    def end_session(self, session_id: UUID, ended_at: datetime, status: str) -> None:
         """Finalize a session.
 
         A session degraded into this instance's raw-only recovery mode is
@@ -818,8 +1027,7 @@ class SQLiteMarketDataRepository:
             final_status = "incomplete" if raw_only else status
             expected_current = "incomplete" if raw_only else "recording"
             cursor = self._connection.execute(
-                "UPDATE recording_sessions SET ended_at=?,status=? "
-                "WHERE session_id=? AND status=?",
+                "UPDATE recording_sessions SET ended_at=?,status=? WHERE session_id=? AND status=?",
                 (
                     ended_at.isoformat(),
                     final_status,
@@ -842,16 +1050,10 @@ class SQLiteMarketDataRepository:
         cursor = -1 if after_ingest_sequence is None else after_ingest_sequence
         if type(cursor) is not int or cursor < -1:
             raise ValueError("after_ingest_sequence must be non-negative or None")
-        type_values = (
-            sorted(item.value for item in event_types)
-            if event_types
-            else []
-        )
+        type_values = sorted(item.value for item in event_types) if event_types else []
         type_clause = ""
         if event_types:
-            type_clause = (
-                f" AND event_type IN ({','.join('?' for _ in type_values)})"
-            )
+            type_clause = f" AND event_type IN ({','.join('?' for _ in type_values)})"
 
         def rows() -> Iterator[sqlite3.Row]:
             page_cursor = cursor
@@ -885,12 +1087,14 @@ class SQLiteMarketDataRepository:
             after_ingest_sequence=after_ingest_sequence,
             event_types=event_types,
         )
+
         def decoded() -> Iterator[MarketDataEnvelope]:
             for row in rows:
                 try:
-                    yield decode_envelope(row)
+                    yield decode_envelope(dict(row))
                 except Exception as exc:
                     raise IntegrityError("stored envelope failed validation") from exc
+
         return decoded()
 
     def close(self) -> None:
@@ -918,8 +1122,8 @@ def _dt(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
 
 
-def _date(value: object | None) -> str | None:
-    return None if value is None else value.isoformat()  # type: ignore[union-attr]
+def _date(value: date | None) -> str | None:
+    return None if value is None else value.isoformat()
 
 
 def _bool(value: bool | None) -> int | None:

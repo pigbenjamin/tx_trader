@@ -31,17 +31,25 @@ SESSION = UUID("12345678-1234-5678-1234-567812345678")
 
 
 class Clock:
-    def now(self): return NOW
-    def monotonic(self): return monotonic()
+    def now(self):
+        return NOW
+
+    def monotonic(self):
+        return monotonic()
 
 
 class ManualClock:
     def __init__(self):
         self.value = 0.0
 
-    def now(self): return NOW
-    def monotonic(self): return self.value
-    def advance(self, seconds): self.value += seconds
+    def now(self):
+        return NOW
+
+    def monotonic(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
 
 
 class FakeBackend:
@@ -59,94 +67,135 @@ class FakeBackend:
     def _call(self, name, *args):
         self.calls.append((name, get_ident(), args))
 
-    def co_initialize(self): self._call("co_initialize")
+    def co_initialize(self):
+        self._call("co_initialize")
+
     def initialize(self, path):
         self._call("initialize", path)
         if self.initialize_blocker is not None:
             self.initialize_blocker.wait()
-        if self.init_error: raise self.init_error
+        if self.init_error:
+            raise self.init_error
+
     def register_events(self, sink):
         self._call("register_events")
         self.sink = sink
+
     def login(self, account, password):
         self._call("login", account, password)
-        if isinstance(self.login_result, Exception): raise self.login_result
+        if isinstance(self.login_result, Exception):
+            raise self.login_result
         return self.login_result
+
     def enter_monitor(self):
         self._call("enter_monitor")
         result = self.enter_results.pop(0) if self.enter_results else 0
-        if isinstance(result, Exception): raise result
+        if isinstance(result, Exception):
+            raise result
         return result
+
     def leave_monitor(self):
         self._call("leave_monitor")
         result = self.leave_results.pop(0) if self.leave_results else 0
-        if isinstance(result, Exception): raise result
+        if isinstance(result, Exception):
+            raise result
         return result
-    def request_quotes(self, csv): self._call("request_quotes", csv); return 0
-    def request_ticks(self, csv): self._call("request_ticks", csv); return 0
+
+    def request_quotes(self, csv):
+        self._call("request_quotes", csv)
+        return 0
+
+    def request_ticks(self, csv):
+        self._call("request_ticks", csv)
+        return 0
+
     def _cleanup_result(self, name):
         result = self.cleanup_failures.get(name, 0)
         if isinstance(result, Exception):
             raise result
         return result
+
     def cancel_quotes(self, csv):
         self._call("cancel_quotes", csv)
         return self._cleanup_result("cancel_quotes")
+
     def cancel_ticks(self, csv):
         self._call("cancel_ticks", csv)
         return self._cleanup_result("cancel_ticks")
+
     def lookup_quote(self, market, index):
         self._call("lookup_quote", market, index)
         return QuoteSnapshotRaw(1, 2, 1, 3, 4, None, 5)
+
     def pump_waiting_messages(self):
         self._call("pump")
         if self.actions:
             self.actions.pop(0)(self.sink)
+
     def release_events(self):
         self._call("release_events")
         self._cleanup_result("release_events")
+
     def release_objects(self):
         self._call("release_objects")
         self._cleanup_result("release_objects")
+
     def co_uninitialize(self):
         self._call("co_uninitialize")
         self._cleanup_result("co_uninitialize")
 
 
-def make_adapter(
-    backend, command_capacity=2, command_timeout=1, clock=None, **changes
-):
+def make_adapter(backend, command_capacity=2, command_timeout=1, clock=None, **changes):
     clock = clock or Clock()
     health = PipelineHealth(clock)
     metrics = IngressMetrics()
     impact = SessionImpactTracker(2)
     shutdown = ControlledShutdown()
     ingress = BoundedIngress(
-        control_capacity=20, diagnostic_capacity=20, quote_capacity=20,
-        tick_capacity=20, dedupe_capacity=20, health=health, metrics=metrics,
-        session_impact=impact, shutdown=shutdown,
+        control_capacity=20,
+        diagnostic_capacity=20,
+        quote_capacity=20,
+        tick_capacity=20,
+        dedupe_capacity=20,
+        health=health,
+        metrics=metrics,
+        session_impact=impact,
+        shutdown=shutdown,
     )
     sta = BoundedStaQuoteQueue(
-        4, health=health, metrics=metrics, session_impact=impact,
-        shutdown=shutdown, session_id=SESSION,
+        4,
+        health=health,
+        metrics=metrics,
+        session_impact=impact,
+        shutdown=shutdown,
+        session_id=SESSION,
     )
     values = dict(
-        backend=backend, dll_path="fixture.dll", ingress=ingress,
-        sta_queue=sta, clock=clock, health=health, session_impact=impact,
-        shutdown=shutdown, command_capacity=command_capacity,
-        command_timeout=command_timeout, pump_interval=.001,
+        backend=backend,
+        dll_path="fixture.dll",
+        ingress=ingress,
+        sta_queue=sta,
+        clock=clock,
+        health=health,
+        session_impact=impact,
+        shutdown=shutdown,
+        command_capacity=command_capacity,
+        command_timeout=command_timeout,
+        pump_interval=0.001,
         reconnect_policy=ReconnectPolicy(2, (0.0, 0.0)),
-        quote_lookup_attempts=1, session_id=SESSION,
+        quote_lookup_attempts=1,
+        session_id=SESSION,
     )
     values.update(changes)
     adapter = CapitalQuoteStaAdapter(**values)
     return adapter, ingress
 
 
-def wait_for(predicate, timeout=.5):
+def wait_for(predicate, timeout=0.5):
     deadline = monotonic() + timeout
     while monotonic() < deadline:
-        if predicate(): return
+        if predicate():
+            return
     raise AssertionError("condition was not reached")
 
 
@@ -180,9 +229,7 @@ def test_all_backend_calls_use_one_dedicated_thread_and_cleanup_order():
         ("co_uninitialize", RuntimeError("secret uninitialize")),
     ],
 )
-def test_cleanup_failure_is_aggregated_and_all_release_steps_continue(
-    operation, failure
-):
+def test_cleanup_failure_is_aggregated_and_all_release_steps_continue(operation, failure):
     backend = FakeBackend()
     adapter, _ = make_adapter(backend)
     adapter.start()
@@ -199,9 +246,11 @@ def test_cleanup_failure_is_aggregated_and_all_release_steps_continue(
 
     names = [name for name, *_ in backend.calls]
     cleanup_start = names.index("cancel_ticks")
-    assert names[cleanup_start:] == [
-        "cancel_ticks",
-        "cancel_quotes",
+    cleanup_names = names[cleanup_start:]
+    assert cleanup_names[:2] == ["cancel_ticks", "cancel_quotes"]
+    leave_index = cleanup_names.index("leave_monitor")
+    assert cleanup_names[2:leave_index] == ["pump"] * 25
+    assert cleanup_names[leave_index:] == [
         "leave_monitor",
         "release_events",
         "release_objects",
@@ -257,26 +306,42 @@ def test_stop_drains_pending_sta_quotes_before_monitor_cleanup(notification_coun
         if event is None:
             break
         events.append(event)
-    quotes = [
-        event
-        for event in events
-        if event.captured_kind.value == "quote_snapshot"
-    ]
+    quotes = [event for event in events if event.captured_kind.value == "quote_snapshot"]
     assert len(quotes) == notification_count
-    assert [event.payload.stock_idx_raw for event in quotes] == list(
-        range(notification_count)
-    )
+    assert [event.payload.stock_idx_raw for event in quotes] == list(range(notification_count))
 
     names = [name for name, *_ in backend.calls]
-    last_lookup = max(
-        index for index, name in enumerate(names) if name == "lookup_quote"
-    )
+    last_lookup = max(index for index, name in enumerate(names) if name == "lookup_quote")
     cancel = names.index("cancel_quotes", last_lookup)
     leave = names.index("leave_monitor", cancel)
-    final_release = max(
-        index for index, name in enumerate(names) if name == "release_events"
-    )
+    final_release = max(index for index, name in enumerate(names) if name == "release_events")
     assert last_lookup < cancel < leave < final_release
+
+
+def test_stop_pumps_messages_after_cancel_before_leave_monitor():
+    backend = FakeBackend()
+    adapter, ingress = make_adapter(backend)
+    adapter.start()
+    adapter.login("acct", "secret")
+    adapter.enter_monitor()
+    adapter._actual_ticks.add("TX00")
+    adapter._actual_quotes.add("TX00")
+    backend.actions.append(lambda sink: sink.OnNotifyQuoteLONG(0, 42))
+
+    adapter.stop(1)
+
+    names = [name for name, *_ in backend.calls]
+    cancel_ticks = names.index("cancel_ticks")
+    cancel_quotes = names.index("cancel_quotes")
+    leave_monitor = names.index("leave_monitor")
+    assert cancel_ticks < cancel_quotes < leave_monitor
+    assert names[cancel_quotes + 1 : leave_monitor].count("pump") == 25
+    lookup_quote = names.index("lookup_quote", cancel_quotes)
+    assert cancel_quotes < lookup_quote < leave_monitor
+    event = ingress.try_pop()
+    assert event is not None
+    assert event.payload.stock_idx_raw == 42
+    assert ingress.try_pop() is None
 
 
 def test_incomplete_shutdown_drain_marks_session_and_still_releases_backend():
@@ -310,7 +375,9 @@ def test_incomplete_shutdown_drain_marks_session_and_still_releases_backend():
 
 
 def test_command_is_immutable_and_repr_redacts_values():
-    command = _Command("login", ("account", "secret"), __import__("concurrent.futures").futures.Future())
+    command = _Command(
+        "login", ("account", "secret"), __import__("concurrent.futures").futures.Future()
+    )
     assert "account" not in repr(command) and "secret" not in repr(command)
     with pytest.raises(FrozenInstanceError):
         command.operation = "x"
@@ -375,7 +442,7 @@ def test_start_timeout_returns_before_blocked_backend_then_cleans_up():
     blocker = Event()
     backend = FakeBackend()
     backend.initialize_blocker = blocker
-    adapter, _ = make_adapter(backend, startup_timeout=.02)
+    adapter, _ = make_adapter(backend, startup_timeout=0.02)
     try:
         with pytest.raises(LiveQuoteInitializationError, match="timed out"):
             adapter.start()
@@ -398,7 +465,7 @@ def test_ready_timeout_is_typed_and_terminal():
     adapter.login("acct", "secret")
     adapter.enter_monitor()
     with pytest.raises(ReadyTimeoutError):
-        adapter.wait_until_ready(.02)
+        adapter.wait_until_ready(0.02)
     wait_for(lambda: adapter.snapshot().state is ConnectionState.STOPPED)
     assert adapter._shutdown.snapshot().reason == "quote_ready_timeout"
 
@@ -416,10 +483,12 @@ def test_reconnect_watchdogs_retry_then_exhaust(reach_connected):
     adapter.start()
     adapter.login("acct", "secret")
     adapter.enter_monitor()
-    backend.actions.extend([
-        lambda sink: sink.OnConnection(3001, 0),
-        lambda sink: sink.OnConnection(3003, 0),
-    ])
+    backend.actions.extend(
+        [
+            lambda sink: sink.OnConnection(3001, 0),
+            lambda sink: sink.OnConnection(3003, 0),
+        ]
+    )
     adapter.wait_until_ready(1)
     backend.actions.append(lambda sink: sink.OnConnection(3002, 0))
     wait_for(lambda: adapter.snapshot().generation == 2)
@@ -441,17 +510,17 @@ def test_reconnect_watchdogs_retry_then_exhaust(reach_connected):
 def test_stop_cancels_reconnect_watchdog():
     clock = ManualClock()
     backend = FakeBackend()
-    adapter, _ = make_adapter(
-        backend, clock=clock, reconnect_connected_timeout=1
-    )
+    adapter, _ = make_adapter(backend, clock=clock, reconnect_connected_timeout=1)
     adapter.start()
     adapter.login("acct", "secret")
     adapter.enter_monitor()
-    backend.actions.extend([
-        lambda sink: sink.OnConnection(3001, 0),
-        lambda sink: sink.OnConnection(3003, 0),
-        lambda sink: sink.OnConnection(3002, 0),
-    ])
+    backend.actions.extend(
+        [
+            lambda sink: sink.OnConnection(3001, 0),
+            lambda sink: sink.OnConnection(3003, 0),
+            lambda sink: sink.OnConnection(3002, 0),
+        ]
+    )
     wait_for(lambda: adapter.snapshot().generation == 2)
     adapter.stop(1)
     count = [name for name, *_ in backend.calls].count("enter_monitor")
@@ -467,11 +536,13 @@ def test_reconnect_leave_nonzero_consumes_attempt_before_new_enter():
     adapter.start()
     adapter.login("acct", "secret")
     adapter.enter_monitor()
-    backend.actions.extend([
-        lambda sink: sink.OnConnection(3001, 0),
-        lambda sink: sink.OnConnection(3003, 0),
-        lambda sink: sink.OnConnection(3002, 0),
-    ])
+    backend.actions.extend(
+        [
+            lambda sink: sink.OnConnection(3001, 0),
+            lambda sink: sink.OnConnection(3003, 0),
+            lambda sink: sink.OnConnection(3002, 0),
+        ]
+    )
     wait_for(lambda: adapter.snapshot().generation == 2)
     assert [name for name, *_ in backend.calls].count("leave_monitor") >= 2
     assert adapter._impact.snapshot(SESSION).is_incomplete

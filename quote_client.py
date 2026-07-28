@@ -2,7 +2,7 @@ import os
 import time
 from collections.abc import Mapping
 from copy import deepcopy
-from ctypes import POINTER, c_short, pointer
+from ctypes import c_short, pointer
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
@@ -92,14 +92,16 @@ class QuoteClient:
             candidates.append(self.dll_path)
 
         base_dir = Path(__file__).resolve().parent
-        candidates.extend([
-            str(base_dir / "SKCOM.dll"),
-            str(base_dir.parent / "SKCOM.dll"),
-            str(Path.cwd() / "SKCOM.dll"),
-            r"C:\CapitalAPI\SKCOM.dll",
-            r"C:\Program Files\CapitalAPI\SKCOM.dll",
-            r"C:\Program Files (x86)\CapitalAPI\SKCOM.dll",
-        ])
+        candidates.extend(
+            [
+                str(base_dir / "SKCOM.dll"),
+                str(base_dir.parent / "SKCOM.dll"),
+                str(Path.cwd() / "SKCOM.dll"),
+                r"C:\CapitalAPI\SKCOM.dll",
+                r"C:\Program Files\CapitalAPI\SKCOM.dll",
+                r"C:\Program Files (x86)\CapitalAPI\SKCOM.dll",
+            ]
+        )
         return list(dict.fromkeys(candidates))
 
     def _ensure_adapter_active(self) -> None:
@@ -144,14 +146,16 @@ class QuoteClient:
 
                 self._sk_module = sk
                 self._api_objects = {
-                    "center": comtypes.client.CreateObject(sk.SKCenterLib, interface=sk.ISKCenterLib),
+                    "center": comtypes.client.CreateObject(
+                        sk.SKCenterLib, interface=sk.ISKCenterLib
+                    ),
                     "quote": comtypes.client.CreateObject(sk.SKQuoteLib, interface=sk.ISKQuoteLib),
+                    "reply": comtypes.client.CreateObject(sk.SKReplyLib, interface=sk.ISKReplyLib),
                 }
                 if not self.quote_only:
-                    self._api_objects.update({
-                        "order": comtypes.client.CreateObject(sk.SKOrderLib, interface=sk.ISKOrderLib),
-                        "reply": comtypes.client.CreateObject(sk.SKReplyLib, interface=sk.ISKReplyLib),
-                    })
+                    self._api_objects["order"] = comtypes.client.CreateObject(
+                        sk.SKOrderLib, interface=sk.ISKOrderLib
+                    )
                 self._center_service = self._api_objects.get("center")
                 self._quote_service = self._api_objects.get("quote")
                 self._order_service = self._api_objects.get("order")
@@ -196,19 +200,35 @@ class QuoteClient:
         if self._center_service is None:
             return ""
         try:
-            return self._invoke_method(self._center_service, ["SKCenterLib_GetReturnCodeMessage"], code)
+            return self._invoke_method(
+                self._center_service, ["SKCenterLib_GetReturnCodeMessage"], code
+            )
         except Exception:
             return ""
 
-    def _register_reply_callback(self) -> None:
-        if self._reply_registered or self._reply_service is None:
-            return
-        try:
-            if pythoncom is not None:
-                pythoncom.CoInitialize()
+    def _disconnect_event_connections(self, *, include_reply: bool) -> None:
+        attributes = ["_quote_event_connection"]
+        if include_reply:
+            attributes.append("_event_connection")
+        for attribute in attributes:
+            connection = getattr(self, attribute, None)
+            setattr(self, attribute, None)
+            disconnect = getattr(connection, "disconnect", None)
+            if callable(disconnect):
+                try:
+                    disconnect()
+                except Exception:
+                    pass
+        self._quote_registered = False
+        if include_reply:
+            self._reply_registered = False
 
+    def _register_reply_callback(self) -> bool:
+        if self._reply_registered or self._reply_service is None:
+            return self._reply_registered
+        try:
             if self._sk_module is None:
-                return
+                return False
 
             class SKReplyLibEvent(object):
                 _com_interfaces_ = [self._sk_module._ISKReplyLibEvents]
@@ -220,9 +240,11 @@ class QuoteClient:
             sink = SKReplyLibEvent()
             self._event_connection = comtypes.client.GetEvents(self._reply_service, sink)
             self._reply_registered = True
+            return True
         except Exception as exc:
             self._last_error = f"註冊 reply callback 失敗: {exc}"
             self._reply_registered = False
+            return False
 
     def login(self, account: str, password: str) -> dict:
         """登入 Capital API；離線模式下回傳詳細狀態。"""
@@ -259,17 +281,24 @@ class QuoteClient:
             return {"success": False, "mode": "api", "steps": steps, "message": str(exc)}
 
         try:
-            if self.quote_only:
-                steps.append("skip_reply_quote_only")
-            else:
-                self._register_reply_callback()
-                steps.append("register_reply")
+            reply_registered = self._register_reply_callback()
+            if not reply_registered and self.quote_only:
+                steps.append("register_reply_failed")
+                return {
+                    "success": False,
+                    "mode": "api",
+                    "steps": steps,
+                    "message": "required announcement callback registration failed",
+                }
+            steps.append("register_reply" if reply_registered else "register_reply_skipped")
         except Exception as exc:
             steps.append(f"register_reply_failed:{exc}")
             return {"success": False, "mode": "api", "steps": steps, "message": str(exc)}
 
         try:
-            code = self._invoke_method(self._center_service, ["SKCenterLib_Login", "SKCenterLib_login"], account, password)
+            code = self._invoke_method(
+                self._center_service, ["SKCenterLib_Login", "SKCenterLib_login"], account, password
+            )
             steps.append(f"login_code:{code}")
         except Exception as exc:
             steps.append(f"login_failed:{exc}")
@@ -277,15 +306,23 @@ class QuoteClient:
 
         message = ""
         try:
-            message = self._invoke_method(self._center_service, ["SKCenterLib_GetReturnCodeMessage"], code)
+            message = self._invoke_method(
+                self._center_service, ["SKCenterLib_GetReturnCodeMessage"], code
+            )
         except Exception:
             message = ""
-        return {"success": code == 0, "mode": "api", "code": code, "steps": steps, "message": message}
+        return {
+            "success": code == 0,
+            "mode": "api",
+            "code": code,
+            "steps": steps,
+            "message": message,
+        }
 
     def _register_quote_callback(self) -> None:
         if self._quote_service is None:
             return
-        if hasattr(self, '_quote_registered') and self._quote_registered:
+        if hasattr(self, "_quote_registered") and self._quote_registered:
             return
 
         if self._sk_module is None:
@@ -294,7 +331,7 @@ class QuoteClient:
         class SKQuoteLibEvent(object):
             _com_interfaces_ = [self._sk_module._ISKQuoteLibEvents]
 
-            def __init__(self, parent: 'QuoteClient'):
+            def __init__(self, parent: "QuoteClient"):
                 self._parent = parent
 
             def OnConnection(self, nKind, nCode):
@@ -321,48 +358,82 @@ class QuoteClient:
                 }
 
             def OnNotifyQuote(self, sMarketNo, sStockIdx):
-                self._parent._quote_event_data["quotes"].append({
-                    "market_no": sMarketNo,
-                    "stock_idx": sStockIdx,
-                })
+                self._parent._quote_event_data["quotes"].append(
+                    {
+                        "market_no": sMarketNo,
+                        "stock_idx": sStockIdx,
+                    }
+                )
 
-            def OnNotifyTicks(self, sMarketNo, sStockIdx, nPtr, nDate, nTimehms, nTimemillismicros, nBid, nAsk, nClose, nQty, nSimulate):
-                self._parent._quote_event_data["ticks"].append({
-                    "market_no": sMarketNo,
-                    "stock_idx": sStockIdx,
-                    "ptr": nPtr,
-                    "date": nDate,
-                    "timehms": nTimehms,
-                    "timemillismicros": nTimemillismicros,
-                    "bid": nBid,
-                    "ask": nAsk,
-                    "close": nClose,
-                    "qty": nQty,
-                    "simulate": nSimulate,
-                })
+            def OnNotifyTicks(
+                self,
+                sMarketNo,
+                sStockIdx,
+                nPtr,
+                nDate,
+                nTimehms,
+                nTimemillismicros,
+                nBid,
+                nAsk,
+                nClose,
+                nQty,
+                nSimulate,
+            ):
+                self._parent._quote_event_data["ticks"].append(
+                    {
+                        "market_no": sMarketNo,
+                        "stock_idx": sStockIdx,
+                        "ptr": nPtr,
+                        "date": nDate,
+                        "timehms": nTimehms,
+                        "timemillismicros": nTimemillismicros,
+                        "bid": nBid,
+                        "ask": nAsk,
+                        "close": nClose,
+                        "qty": nQty,
+                        "simulate": nSimulate,
+                    }
+                )
 
             def OnNotifyQuoteLONG(self, sMarketNo, nStockIdx):
-                self._parent._quote_event_data["quotes"].append({
-                    "market_no": sMarketNo,
-                    "stock_idx": nStockIdx,
-                    "long": True,
-                })
+                self._parent._quote_event_data["quotes"].append(
+                    {
+                        "market_no": sMarketNo,
+                        "stock_idx": nStockIdx,
+                        "long": True,
+                    }
+                )
 
-            def OnNotifyTicksLONG(self, sMarketNo, nStockIdx, nPtr, nDate, nTimehms, nTimemillismicros, nBid, nAsk, nClose, nQty, nSimulate):
-                self._parent._quote_event_data["ticks"].append({
-                    "market_no": sMarketNo,
-                    "stock_idx": nStockIdx,
-                    "ptr": nPtr,
-                    "date": nDate,
-                    "timehms": nTimehms,
-                    "timemillismicros": nTimemillismicros,
-                    "bid": nBid,
-                    "ask": nAsk,
-                    "close": nClose,
-                    "qty": nQty,
-                    "simulate": nSimulate,
-                    "long": True,
-                })
+            def OnNotifyTicksLONG(
+                self,
+                sMarketNo,
+                nStockIdx,
+                nPtr,
+                nDate,
+                nTimehms,
+                nTimemillismicros,
+                nBid,
+                nAsk,
+                nClose,
+                nQty,
+                nSimulate,
+            ):
+                self._parent._quote_event_data["ticks"].append(
+                    {
+                        "market_no": sMarketNo,
+                        "stock_idx": nStockIdx,
+                        "ptr": nPtr,
+                        "date": nDate,
+                        "timehms": nTimehms,
+                        "timemillismicros": nTimemillismicros,
+                        "bid": nBid,
+                        "ask": nAsk,
+                        "close": nClose,
+                        "qty": nQty,
+                        "simulate": nSimulate,
+                        "long": True,
+                    }
+                )
 
         self._quote_event_data = {
             "server_time": None,
@@ -379,18 +450,22 @@ class QuoteClient:
         self._quote_event_connection = comtypes.client.GetEvents(self._quote_service, sink)
         self._quote_registered = True
 
-    def _wrap_paging_call(self, method_names: List[str], market_no: Optional[int], symbol_text: str) -> Dict[str, Any]:
+    def _wrap_paging_call(
+        self, method_names: List[str], market_no: Optional[int], symbol_text: str
+    ) -> Dict[str, Any]:
         page_no = c_short(0)
         page_ptr = pointer(page_no)
         if market_no is None:
             result = self._invoke_method(self._quote_service, method_names, page_ptr, symbol_text)
         else:
-            result = self._invoke_method(self._quote_service, method_names, page_ptr, c_short(market_no), symbol_text)
+            result = self._invoke_method(
+                self._quote_service, method_names, page_ptr, c_short(market_no), symbol_text
+            )
 
         def _extract_page_value(value: Any) -> int:
             if isinstance(value, c_short):
                 return int(value.value)
-            if hasattr(value, 'contents') and hasattr(value.contents, 'value'):
+            if hasattr(value, "contents") and hasattr(value.contents, "value"):
                 try:
                     return int(value.contents.value)
                 except Exception:
@@ -427,6 +502,7 @@ class QuoteClient:
 
     def _wrap_object_call(self, method_names: List[str], *args: Any) -> Dict[str, Any]:
         result = self._invoke_method(self._quote_service, method_names, *args)
+
         def _format_object_response(obj: Any, code: int) -> Dict[str, Any]:
             return {
                 "success": int(code) == 0,
@@ -468,7 +544,11 @@ class QuoteClient:
         self._register_quote_callback()
 
         code = self._invoke_method(self._quote_service, ["SKQuoteLib_EnterMonitorLONG"])
-        return {"success": code == 0, "code": int(code), "message": self._get_return_code_message(int(code))}
+        return {
+            "success": code == 0,
+            "code": int(code),
+            "message": self._get_return_code_message(int(code)),
+        }
 
     def leave_monitor(self) -> Dict[str, Any]:
         """Best-effort cancellation and disconnection for quote-only sessions.
@@ -511,7 +591,13 @@ class QuoteClient:
             result["steps"].append("not_connected")
             return result
 
-        if not self._monitor_active and not self._stock_subscriptions and not self._tick_subscriptions:
+        self._disconnect_event_connections(include_reply=self.quote_only)
+
+        if (
+            not self._monitor_active
+            and not self._stock_subscriptions
+            and not self._tick_subscriptions
+        ):
             result["steps"].append("already_left")
             return result
 
@@ -533,14 +619,31 @@ class QuoteClient:
                     subscriptions.clear()
                 else:
                     result["success"] = False
-                    result["errors"].append({
-                        "name": step,
-                        "code": int(code),
-                        "message": self._get_return_code_message(int(code)),
-                    })
+                    result["errors"].append(
+                        {
+                            "name": step,
+                            "code": int(code),
+                            "message": self._get_return_code_message(int(code)),
+                        }
+                    )
             except Exception as exc:
                 result["success"] = False
                 result["errors"].append({"name": step, "message": str(exc)})
+
+        if pythoncom is not None:
+            try:
+                deadline = time.monotonic() + 0.25
+                while time.monotonic() < deadline:
+                    pythoncom.PumpWaitingMessages()
+                    time.sleep(0.01)
+            except Exception:
+                result["success"] = False
+                result["errors"].append(
+                    {
+                        "name": "cleanup_message_pump",
+                        "message": "quote cleanup message pump failed",
+                    }
+                )
 
         if self._monitor_active:
             try:
@@ -553,11 +656,13 @@ class QuoteClient:
                         state["stocks_ready"] = False
                 else:
                     result["success"] = False
-                    result["errors"].append({
-                        "name": "leave_monitor",
-                        "code": int(code),
-                        "message": self._get_return_code_message(int(code)),
-                    })
+                    result["errors"].append(
+                        {
+                            "name": "leave_monitor",
+                            "code": int(code),
+                            "message": self._get_return_code_message(int(code)),
+                        }
+                    )
             except Exception as exc:
                 result["success"] = False
                 result["errors"].append({"name": "leave_monitor", "message": str(exc)})
@@ -586,7 +691,7 @@ class QuoteClient:
         if self._offline_mode:
             return {"success": True, "connected": True, "status": "offline"}
 
-        state = getattr(self, '_quote_connection_state', None) or {}
+        state = getattr(self, "_quote_connection_state", None) or {}
         return {
             "success": True,
             "connected": bool(state.get("stocks_ready")),
@@ -605,9 +710,7 @@ class QuoteClient:
             from tx_trade.market_data.models import ConnectionStatus
 
             if not isinstance(status, ConnectionStatus):
-                raise TypeError(
-                    "adapter wait_until_ready must return ConnectionStatus"
-                )
+                raise TypeError("adapter wait_until_ready must return ConnectionStatus")
             is_ready = status.is_ready
             last_kind = status.broker_kind_raw
             last_code = status.broker_code_raw
@@ -665,7 +768,9 @@ class QuoteClient:
         code = self._invoke_method(self._quote_service, ["SKQuoteLib_RequestServerTime"])
         return {"success": code == 0, "code": int(code)}
 
-    def request_stocks(self, symbols: Optional[List[str]] = None, market_no: Optional[int] = None) -> Dict[str, Any]:
+    def request_stocks(
+        self, symbols: Optional[List[str]] = None, market_no: Optional[int] = None
+    ) -> Dict[str, Any]:
         """請求商品清單或商品查詢。"""
         if self._adapter_mode:
             self._ensure_adapter_active()
@@ -699,13 +804,19 @@ class QuoteClient:
             }
 
         symbol_text = ",".join(target_symbols)
-        method_names = ["SKQuoteLib_RequestStocksWithMarketNo"] if market_no is not None else ["SKQuoteLib_RequestStocks"]
+        method_names = (
+            ["SKQuoteLib_RequestStocksWithMarketNo"]
+            if market_no is not None
+            else ["SKQuoteLib_RequestStocks"]
+        )
         self._stock_subscriptions.update(target_symbols)
         payload = self._wrap_paging_call(method_names, market_no, symbol_text)
         payload["symbols"] = target_symbols
         return payload
 
-    def request_ticks(self, symbols: Optional[List[str]] = None, market_no: Optional[int] = None) -> Dict[str, Any]:
+    def request_ticks(
+        self, symbols: Optional[List[str]] = None, market_no: Optional[int] = None
+    ) -> Dict[str, Any]:
         """請求 Tick 資料。"""
         if self._adapter_mode:
             self._ensure_adapter_active()
@@ -731,7 +842,11 @@ class QuoteClient:
 
         target_symbols = symbols or self._symbols
         symbol_text = ",".join(target_symbols)
-        method_names = ["SKQuoteLib_RequestTicksWithMarketNo"] if market_no is not None else ["SKQuoteLib_RequestTicks"]
+        method_names = (
+            ["SKQuoteLib_RequestTicksWithMarketNo"]
+            if market_no is not None
+            else ["SKQuoteLib_RequestTicks"]
+        )
         self._tick_subscriptions.update(target_symbols)
         payload = self._wrap_paging_call(method_names, market_no, symbol_text)
         payload["symbols"] = target_symbols
@@ -748,7 +863,9 @@ class QuoteClient:
 
         stock_obj = self._sk_module.SKSTOCKLONG()
         if market_no is not None:
-            payload = self._wrap_object_call(["SKQuoteLib_GetStockByMarketAndNo"], market_no, symbol, stock_obj)
+            payload = self._wrap_object_call(
+                ["SKQuoteLib_GetStockByMarketAndNo"], market_no, symbol, stock_obj
+            )
         else:
             payload = self._wrap_object_call(["SKQuoteLib_GetStockByNoLONG"], symbol, stock_obj)
         payload.update({"symbol": symbol, "market_no": market_no})
@@ -764,7 +881,9 @@ class QuoteClient:
             return {"success": True, "ticker": None}
 
         tick_obj = self._sk_module.SKTICK()
-        payload = self._wrap_object_call(["SKQuoteLib_GetTickLONG"], market_no, stock_idx, n_ptr, tick_obj)
+        payload = self._wrap_object_call(
+            ["SKQuoteLib_GetTickLONG"], market_no, stock_idx, n_ptr, tick_obj
+        )
         payload["ticker"] = tick_obj
         return payload
 
@@ -800,65 +919,60 @@ class QuoteClient:
             else:
                 raise TypeError("event snapshot provider is not readable")
             return _defensive_copy(snapshot)
-        return getattr(self, '_quote_event_data', {})
+        return getattr(self, "_quote_event_data", {})
 
     def connect_reply_by_id(self, user_id: str) -> Dict[str, Any]:
-        """連線 ReplyLib，讓回報機制可用。"""
-        if self._adapter_mode:
+        """Connect Reply only outside the Phase 1 quote-only boundary."""
+        if self._adapter_mode or self.quote_only:
             self._unsupported_in_adapter_mode("connect_reply_by_id")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
             return {"success": True, "message": "offline reply connect"}
-
         code = self._invoke_method(self._reply_service, ["SKReplyLib_ConnectByID"], user_id)
         return {"success": code == 0, "code": int(code)}
 
     def order_initialize(self) -> Dict[str, Any]:
-        """初始化下單元件。"""
-        if self._adapter_mode:
+        """Initialize Order only outside the Phase 1 quote-only boundary."""
+        if self._adapter_mode or self.quote_only:
             self._unsupported_in_adapter_mode("order_initialize")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
             return {"success": True, "message": "offline order initialize"}
-
         code = self._invoke_method(self._order_service, ["SKOrderLib_Initialize"])
         return {"success": code == 0, "code": int(code)}
 
     def order_load_commodity_gw(self, login_id: str) -> Dict[str, Any]:
-        """載入 GW 下單商品資訊。"""
-        if self._adapter_mode:
+        """Load Order commodities only outside the Phase 1 quote-only boundary."""
+        if self._adapter_mode or self.quote_only:
             self._unsupported_in_adapter_mode("order_load_commodity_gw")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
             return {"success": True, "message": "offline order load commodity"}
-
         code = self._invoke_method(self._order_service, ["SKOrderLib_LoadOfCommodityGW"], login_id)
         return {"success": code == 0, "code": int(code)}
 
     def order_initial_proxy_by_id(self, login_id: str) -> Dict[str, Any]:
-        """初始化 proxy 下單；適用特定帳號 ID。"""
-        if self._adapter_mode:
+        """Initialize Order proxy only outside the Phase 1 quote-only boundary."""
+        if self._adapter_mode or self.quote_only:
             self._unsupported_in_adapter_mode("order_initial_proxy_by_id")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
             return {"success": True, "message": "offline order proxy init"}
-
         code = self._invoke_method(self._order_service, ["SKOrderLib_InitialProxyByID"], login_id)
         return {"success": code == 0, "code": int(code)}
 
     def get_order_login_type(self, login_id: str) -> Dict[str, Any]:
-        """查詢下單帳號類型。"""
-        if self._adapter_mode:
+        """Inspect Order login only outside the Phase 1 quote-only boundary."""
+        if self._adapter_mode or self.quote_only:
             self._unsupported_in_adapter_mode("get_order_login_type")
         if not self._connected:
             raise RuntimeError("Capital API 服務尚未初始化")
         if self._offline_mode:
             return {"success": True, "login_type": None}
-
         code = self._invoke_method(self._order_service, ["SKOrderLib_GetLoginType"], login_id)
         return {"success": True, "login_type": code}
 

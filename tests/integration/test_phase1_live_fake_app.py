@@ -63,18 +63,14 @@ class FakeAdapter:
     def wait_until_ready(self, timeout):
         self.calls.append("ready")
         self._fail("ready")
-        return ConnectionStatus(
-            ConnectionState.STOCKS_READY, 3003, 0, None, True, NOW, 0
-        )
+        return ConnectionStatus(ConnectionState.STOCKS_READY, 3003, 0, None, True, NOW, 0)
 
     def subscribe_quotes(self, symbols):
         self.calls.append(("quotes", tuple(symbols)))
         self._fail("quotes")
         if self.failure_stage == "no_event":
             return
-        payload = CapturedQuoteSnapshot(
-            0, 7, 100, 102, 101, 1, 2, 3, True, 0, NOW
-        )
+        payload = CapturedQuoteSnapshot(0, 7, 100, 102, 101, 1, 2, 3, True, 0, NOW)
         decision = self.ingress.try_publish(
             CapturedMarketDataEvent(
                 CapturedKind.QUOTE_SNAPSHOT,
@@ -143,19 +139,13 @@ def test_live_fake_is_quote_only_persists_and_finalizes(tmp_path):
     repository.close()
 
 
-@pytest.mark.parametrize(
-    "failure_stage", ["start", "login", "enter", "ready", "quotes", "ticks"]
-)
-def test_live_failure_is_sanitized_stops_and_finalizes_incomplete(
-    tmp_path, failure_stage
-):
+@pytest.mark.parametrize("failure_stage", ["start", "login", "enter", "ready", "quotes", "ticks"])
+def test_live_failure_is_sanitized_stops_and_finalizes_incomplete(tmp_path, failure_stage):
     calls = []
     db_path = tmp_path / f"{failure_stage}.db"
     dependencies = Phase1Dependencies(
         backend_factory=lambda: object(),
-        adapter_factory=lambda **kwargs: FakeAdapter(
-            calls, failure_stage=failure_stage, **kwargs
-        ),
+        adapter_factory=lambda **kwargs: FakeAdapter(calls, failure_stage=failure_stage, **kwargs),
         clock=FakeClock(),
         session_id_factory=lambda: SESSION,
         idle=lambda seconds: None,
@@ -193,9 +183,7 @@ def test_internal_shutdown_interrupt_or_empty_recording_cannot_return_success(
     db_path = tmp_path / f"{terminal_stage}.db"
     dependencies = Phase1Dependencies(
         backend_factory=lambda: object(),
-        adapter_factory=lambda **kwargs: FakeAdapter(
-            calls, failure_stage=terminal_stage, **kwargs
-        ),
+        adapter_factory=lambda **kwargs: FakeAdapter(calls, failure_stage=terminal_stage, **kwargs),
         clock=FakeClock(),
         session_id_factory=lambda: SESSION,
         idle=lambda seconds: None,
@@ -244,9 +232,7 @@ def test_async_sink_failure_after_acceptance_never_republishes_or_completes(
 
     db_path = tmp_path / "async-failure.db"
     dependencies = Phase1Dependencies(
-        writer_factory=lambda repository, settings, notifier: AcceptedThenFailsWriter(
-            notifier
-        ),
+        writer_factory=lambda repository, settings, notifier: AcceptedThenFailsWriter(notifier),
         backend_factory=lambda: object(),
         adapter_factory=lambda **kwargs: FakeAdapter([], **kwargs),
         clock=FakeClock(),

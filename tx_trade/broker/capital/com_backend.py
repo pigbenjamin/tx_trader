@@ -10,14 +10,12 @@ from .contracts import LiveQuoteInitializationError, QuoteSnapshotRaw
 
 def _return_code(value: object, operation: str) -> int:
     if type(value) is not int:
-        raise LiveQuoteInitializationError(
-            f"{operation} returned a non-integer status"
-        )
+        raise LiveQuoteInitializationError(f"{operation} returned a non-integer status")
     return value
 
 
 class ComtypesQuoteBackend:
-    """Minimal actual backend containing only center and quote facilities."""
+    """Quote-only backend with an announcement-only reply event connection."""
 
     def __init__(self) -> None:
         self._runtime: Any = None
@@ -25,7 +23,9 @@ class ComtypesQuoteBackend:
         self._module: Any = None
         self._center: Any = None
         self._quote: Any = None
-        self._event_connection: Any = None
+        self._reply: Any = None
+        self._quote_event_connection: Any = None
+        self._reply_event_connection: Any = None
 
     def co_initialize(self) -> None:
         try:
@@ -47,20 +47,32 @@ class ComtypesQuoteBackend:
             center_interface = getattr(module, "ISKCenterLib")
             quote_class = getattr(module, "SKQuoteLib")
             quote_interface = getattr(module, "ISKQuoteLib")
-            self._center = self._client.CreateObject(
-                center_class, interface=center_interface
-            )
-            self._quote = self._client.CreateObject(
-                quote_class, interface=quote_interface
-            )
+            reply_class = getattr(module, "SKReplyLib")
+            reply_interface = getattr(module, "ISKReplyLib")
+            self._center = self._client.CreateObject(center_class, interface=center_interface)
+            self._quote = self._client.CreateObject(quote_class, interface=quote_interface)
+            self._reply = self._client.CreateObject(reply_class, interface=reply_interface)
         except Exception as exc:
             self.release_objects()
             raise LiveQuoteInitializationError("quote library initialization failed") from exc
 
     def register_events(self, sink: object) -> None:
         try:
-            self._event_connection = self._client.GetEvents(self._quote, sink)
+            module = self._module
+
+            class AnnouncementReplySink:
+                _com_interfaces_ = [module._ISKReplyLibEvents]
+
+                def OnReplyMessage(self, user_id: object, message: object) -> int:
+                    del user_id, message
+                    return -1
+
+            self._quote_event_connection = self._client.GetEvents(self._quote, sink)
+            self._reply_event_connection = self._client.GetEvents(
+                self._reply, AnnouncementReplySink()
+            )
         except Exception as exc:
+            self.release_events()
             raise LiveQuoteInitializationError("quote event registration failed") from exc
 
     def _invoke(self, target: object, names: tuple[str, ...], *args: object) -> Any:
@@ -97,9 +109,7 @@ class ComtypesQuoteBackend:
         result = self._invoke(self._quote, (method_name,), 0, symbols_csv)
         if isinstance(result, (tuple, list)):
             if not result:
-                raise LiveQuoteInitializationError(
-                    "subscription returned an empty result"
-                )
+                raise LiveQuoteInitializationError("subscription returned an empty result")
             result = result[-1]
         return _return_code(result, "subscription")
 
@@ -111,17 +121,13 @@ class ComtypesQuoteBackend:
 
     def cancel_quotes(self, symbols_csv: str) -> int:
         return _return_code(
-            self._invoke(
-                self._quote, ("SKQuoteLib_CancelRequestStocks",), symbols_csv
-            ),
+            self._invoke(self._quote, ("SKQuoteLib_CancelRequestStocks",), symbols_csv),
             "cancel quotes",
         )
 
     def cancel_ticks(self, symbols_csv: str) -> int:
         return _return_code(
-            self._invoke(
-                self._quote, ("SKQuoteLib_CancelRequestTicks",), symbols_csv
-            ),
+            self._invoke(self._quote, ("SKQuoteLib_CancelRequestTicks",), symbols_csv),
             "cancel ticks",
         )
 
@@ -167,9 +173,7 @@ class ComtypesQuoteBackend:
                 last_qty_raw=None,
                 total_qty_raw=int(returned_stock.nTQty),
                 stock_no=self._optional_text(returned_stock, ("bstrStockNo", "strStockNo")),
-                stock_name=self._optional_text(
-                    returned_stock, ("bstrStockName", "strStockName")
-                ),
+                stock_name=self._optional_text(returned_stock, ("bstrStockName", "strStockName")),
             )
         except LiveQuoteInitializationError:
             raise
@@ -190,11 +194,16 @@ class ComtypesQuoteBackend:
         self._runtime.PumpWaitingMessages()
 
     def release_events(self) -> None:
-        connection, self._event_connection = self._event_connection, None
-        if connection is not None:
-            disconnect: Callable[[], object] | None = getattr(
-                connection, "disconnect", None
-            )
+        connections = (
+            self._quote_event_connection,
+            self._reply_event_connection,
+        )
+        self._quote_event_connection = None
+        self._reply_event_connection = None
+        for connection in connections:
+            if connection is None:
+                continue
+            disconnect: Callable[[], object] | None = getattr(connection, "disconnect", None)
             if callable(disconnect):
                 try:
                     disconnect()
@@ -202,6 +211,7 @@ class ComtypesQuoteBackend:
                     pass
 
     def release_objects(self) -> None:
+        self._reply = None
         self._quote = None
         self._center = None
         self._module = None

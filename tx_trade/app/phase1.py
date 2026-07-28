@@ -159,9 +159,7 @@ def _live_runtime(environment: Mapping[str, str], db_override: str | None) -> _L
     symbols = tuple(item.strip() for item in raw_symbols.split(",") if item.strip())
     if not symbols:
         raise Phase1RuntimeError("live runtime configuration is incomplete")
-    db_path = db_override or environment.get(
-        "TX_TRADE_RECORDING_DB_PATH", "phase1_live.sqlite3"
-    )
+    db_path = db_override or environment.get("TX_TRADE_RECORDING_DB_PATH", "phase1_live.sqlite3")
     if type(db_path) is not str or not db_path.strip():
         raise Phase1RuntimeError("live runtime configuration is incomplete")
     return _LiveRuntime(
@@ -170,19 +168,13 @@ def _live_runtime(environment: Mapping[str, str], db_override: str | None) -> _L
         dll_path=dll_path,
         symbols=symbols,
         db_path=db_path,
-        ready_timeout=_positive_float(
-            environment, "TX_TRADE_LIVE_READY_TIMEOUT_SECONDS", 20.0
-        ),
-        stop_timeout=_positive_float(
-            environment, "TX_TRADE_LIVE_STOP_TIMEOUT_SECONDS", 10.0
-        ),
+        ready_timeout=_positive_float(environment, "TX_TRADE_LIVE_READY_TIMEOUT_SECONDS", 20.0),
+        stop_timeout=_positive_float(environment, "TX_TRADE_LIVE_STOP_TIMEOUT_SECONDS", 10.0),
     )
 
 
 def _fingerprint(values: Mapping[str, Any]) -> str:
-    canonical = json.dumps(
-        values, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    canonical = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -392,9 +384,7 @@ def run_live(
             )
         )
         session_started = True
-        notifier = PipelineStorageFailureNotifier(
-            session_id, health, metrics, impact, shutdown
-        )
+        notifier = PipelineStorageFailureNotifier(session_id, health, metrics, impact, shutdown)
         writer = _writer(dependencies, repository, settings, notifier)
         writer.start()
         projector = LegacyQuoteSnapshotProjector()
@@ -525,9 +515,7 @@ def run_live(
             if shutdown_snapshot.is_requested:
                 lifecycle_damaged = True
                 try:
-                    impact.mark_incomplete(
-                        session_id, "controlled_shutdown_requested"
-                    )
+                    impact.mark_incomplete(session_id, "controlled_shutdown_requested")
                 except RuntimeError:
                     health.fail("session_impact_capacity_exhausted")
             if event_count == 0:
@@ -561,12 +549,7 @@ def run_live(
                 if isinstance(exc, KeyboardInterrupt):
                     failure = exc
 
-    if (
-        failure is not None
-        or lifecycle_damaged
-        or status != "complete"
-        or not integrity_valid
-    ):
+    if failure is not None or lifecycle_damaged or status != "complete" or not integrity_valid:
         raise Phase1RuntimeError("live quote recording failed") from None
     return Phase1Result(
         mode="live",
@@ -590,9 +573,7 @@ def run_phase1(
     if settings.quote_source is QuoteSource.OFFLINE:
         return run_offline(
             settings,
-            db_path=db_path or supplied.get(
-                "TX_TRADE_RECORDING_DB_PATH", _DEFAULT_DB_PATH
-            ),
+            db_path=db_path or supplied.get("TX_TRADE_RECORDING_DB_PATH", _DEFAULT_DB_PATH),
             dependencies=dependencies,
         )
     runtime = _live_runtime(supplied, db_path)

@@ -19,21 +19,21 @@ def test_package_import_is_side_effect_free():
     assert "config" not in added
 
 
-def test_production_source_has_no_trade_sdk_symbols():
+def test_production_source_has_no_order_or_reply_stream_sdk_symbols():
     root = Path("tx_trade/broker/capital")
     source = "\n".join(path.read_text("utf-8") for path in root.glob("*.py"))
     forbidden = (
         "SK" + "OrderLib",
         "ISK" + "OrderLib",
-        "SK" + "ReplyLib",
-        "ISK" + "ReplyLib",
-        "On" + "ReplyMessage",
+        "SKReplyLib_" + "ConnectByID",
+        "On" + "NewData",
+        "On" + "StrategyData",
         "Send" + "Order",
     )
     assert not any(token in source for token in forbidden)
 
 
-def test_actual_backend_creates_exact_center_and_quote(monkeypatch):
+def test_actual_backend_creates_exact_center_quote_and_reply(monkeypatch):
     created = []
 
     class Module:
@@ -41,18 +41,19 @@ def test_actual_backend_creates_exact_center_and_quote(monkeypatch):
         ISKCenterLib = object()
         SKQuoteLib = object()
         ISKQuoteLib = object()
+        SKReplyLib = object()
+        ISKReplyLib = object()
+        _ISKReplyLibEvents = object()
 
         def __getattr__(self, name):
-            if "Order" in name or "Reply" in name:
+            if "Order" in name:
                 raise AssertionError("forbidden coclass accessed")
             raise AttributeError(name)
 
     module = Module()
     client = SimpleNamespace(
         GetModule=lambda path: module,
-        CreateObject=lambda coclass, interface: created.append(
-            (coclass, interface)
-        ) or object(),
+        CreateObject=lambda coclass, interface: created.append((coclass, interface)) or object(),
     )
     original = importlib.import_module
     monkeypatch.setattr(
@@ -65,13 +66,63 @@ def test_actual_backend_creates_exact_center_and_quote(monkeypatch):
     assert created == [
         (module.SKCenterLib, module.ISKCenterLib),
         (module.SKQuoteLib, module.ISKQuoteLib),
+        (module.SKReplyLib, module.ISKReplyLib),
     ]
+    assert backend._reply is not None
+
+
+def test_actual_backend_registers_quote_and_announcement_only_reply_events():
+    calls = []
+    disconnected = []
+
+    class Connection:
+        def __init__(self, name, fail=False):
+            self.name = name
+            self.fail = fail
+
+        def disconnect(self):
+            disconnected.append(self.name)
+            if self.fail:
+                raise RuntimeError("ignored cleanup failure")
+
+    class Module:
+        _ISKReplyLibEvents = object()
+
+    quote = object()
+    reply = object()
+    quote_sink = object()
+
+    def get_events(service, sink):
+        calls.append((service, sink))
+        return Connection("quote", fail=True) if service is quote else Connection("reply")
+
+    backend = ComtypesQuoteBackend()
+    backend._client = SimpleNamespace(GetEvents=get_events)
+    backend._module = Module()
+    backend._quote = quote
+    backend._reply = reply
+
+    backend.register_events(quote_sink)
+
+    assert calls[0] == (quote, quote_sink)
+    assert calls[1][0] is reply
+    reply_sink = calls[1][1]
+    assert reply_sink.OnReplyMessage("ignored-user", "announcement") == -1
+    assert {name for name in type(reply_sink).__dict__ if not name.startswith("_")} == {
+        "OnReplyMessage"
+    }
+
+    backend.release_events()
+    assert disconnected == ["quote", "reply"]
+    assert backend._quote_event_connection is None
+    assert backend._reply_event_connection is None
+
+    backend.release_objects()
+    assert backend._reply is None
 
 
 def test_actual_backend_never_falls_back_when_loading_fails(monkeypatch):
-    client = SimpleNamespace(
-        GetModule=lambda path: (_ for _ in ()).throw(OSError("missing"))
-    )
+    client = SimpleNamespace(GetModule=lambda path: (_ for _ in ()).throw(OSError("missing")))
     original = importlib.import_module
     monkeypatch.setattr(
         importlib,

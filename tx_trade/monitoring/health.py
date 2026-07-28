@@ -182,11 +182,7 @@ class SessionImpactTracker:
         with self._lock:
             impact = self._sessions.get(session_id)
             if impact is None:
-                reasons = (
-                    ("session_impact_capacity_exhausted",)
-                    if self._capacity_exhausted
-                    else ()
-                )
+                reasons = ("session_impact_capacity_exhausted",) if self._capacity_exhausted else ()
                 return SessionImpactSnapshot(
                     session_id, self._capacity_exhausted, reasons, 0, None, None
                 )

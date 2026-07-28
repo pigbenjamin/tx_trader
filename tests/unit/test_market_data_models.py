@@ -249,9 +249,7 @@ def test_serialization_is_deterministic_and_json_compatible():
 def test_diagnostic_dedupe_attempt_is_stable_and_distinct():
     args = ("capital", SESSION, 0, "quote_lookup_failure", 8, 1)
     first = build_adapter_diagnostic_dedupe_key(*args)
-    assert first == build_adapter_diagnostic_dedupe_key(
-        *args
-    )
+    assert first == build_adapter_diagnostic_dedupe_key(*args)
     assert first != build_adapter_diagnostic_dedupe_key(
         "capital", SESSION, 0, "quote_lookup_failure", 8, 2
     )
@@ -292,9 +290,7 @@ def test_nullable_metadata_version_is_positive_when_present(version):
 
 
 def test_connection_envelope_allows_unavailable_broker_event_time():
-    status = ConnectionStatus(
-        ConnectionState.CONNECTED, 3001, 0, None, False, NOW, 0
-    )
+    status = ConnectionStatus(ConnectionState.CONNECTED, 3001, 0, None, False, NOW, 0)
     envelope = make_envelope(
         payload=status,
         event_type=EventType.CONNECTION_STATUS,
@@ -308,9 +304,7 @@ def test_connection_envelope_allows_unavailable_broker_event_time():
 
 
 def test_connection_envelope_rejects_different_known_event_time():
-    status = ConnectionStatus(
-        ConnectionState.CONNECTED, 3001, 0, None, False, NOW, 0
-    )
+    status = ConnectionStatus(ConnectionState.CONNECTED, 3001, 0, None, False, NOW, 0)
     with pytest.raises(ValueError, match="None or equal changed_at"):
         make_envelope(
             payload=status,

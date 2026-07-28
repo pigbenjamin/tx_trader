@@ -1,9 +1,13 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from quote_client import QuoteClient
+
+pytestmark = pytest.mark.legacy_com
 
 
 def test_login_and_monitor():

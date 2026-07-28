@@ -9,13 +9,14 @@ from dataclasses import fields, is_dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 from uuid import UUID
 
 from tx_trade.market_data.models import (
     AdapterDiagnostic,
     ConnectionState,
     ConnectionStatus,
+    DomainPayload,
     EventType,
     Instrument,
     MarketDataEnvelope,
@@ -51,10 +52,7 @@ def encode_storage_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         if any(type(key) is not str for key in value):
             raise TypeError("storage mapping keys must be strings")
-        items = [
-            [key, encode_storage_value(value[key])]
-            for key in sorted(value)
-        ]
+        items = [[key, encode_storage_value(value[key])] for key in sorted(value)]
         return {_TYPE_KEY: "map", "items": items}
     if isinstance(value, (tuple, list)):
         return {
@@ -124,9 +122,7 @@ _RECORD_FIELDS = (
 
 def record_sha256(row: Mapping[str, Any]) -> str:
     material = [row[field] for field in _RECORD_FIELDS]
-    canonical = json.dumps(
-        material, ensure_ascii=False, separators=(",", ":")
-    )
+    canonical = json.dumps(material, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -134,9 +130,7 @@ def encode_envelope(
     envelope: MarketDataEnvelope,
 ) -> tuple[str, str | None, str]:
     payload_json = canonical_json(envelope.payload)
-    raw_json = (
-        None if envelope.raw_payload is None else canonical_json(envelope.raw_payload)
-    )
+    raw_json = None if envelope.raw_payload is None else canonical_json(envelope.raw_payload)
     return payload_json, raw_json, payload_sha256(payload_json)
 
 
@@ -159,7 +153,7 @@ def _decimal(value: str | None) -> Decimal | None:
     return None if value is None else Decimal(value)
 
 
-def _payload(event_type: EventType, data: Mapping[str, Any]) -> object:
+def _payload(event_type: EventType, data: Mapping[str, Any]) -> DomainPayload:
     if event_type is EventType.CONNECTION_STATUS:
         return ConnectionStatus(
             state=ConnectionState(data["state"]),
@@ -167,7 +161,7 @@ def _payload(event_type: EventType, data: Mapping[str, Any]) -> object:
             broker_code_raw=data["broker_code_raw"],
             message=data["message"],
             is_ready=data["is_ready"],
-            changed_at=_datetime(data["changed_at"]),
+            changed_at=cast(datetime, _datetime(data["changed_at"])),
             connection_generation=data["connection_generation"],
         )
     if event_type is EventType.SERVER_TIME:
@@ -177,7 +171,7 @@ def _payload(event_type: EventType, data: Mapping[str, Any]) -> object:
             minute_raw=data["minute_raw"],
             second_raw=data["second_raw"],
             total_raw=data["total_raw"],
-            received_at=_datetime(data["received_at"]),
+            received_at=cast(datetime, _datetime(data["received_at"])),
             trading_day=_date(data["trading_day"]),
         )
     if event_type is EventType.INSTRUMENT:
@@ -193,7 +187,7 @@ def _payload(event_type: EventType, data: Mapping[str, Any]) -> object:
             price_scale=_decimal(data["price_scale"]),
             quantity_scale=_decimal(data["quantity_scale"]),
             metadata_version=data["metadata_version"],
-            updated_at=_datetime(data["updated_at"]),
+            updated_at=cast(datetime, _datetime(data["updated_at"])),
             raw_payload=data["raw_payload"],
         )
     if event_type is EventType.QUOTE:
@@ -211,7 +205,7 @@ def _payload(event_type: EventType, data: Mapping[str, Any]) -> object:
             ask_qty_raw=data["ask_qty_raw"],
             last_qty_raw=data["last_qty_raw"],
             event_at=_datetime(data["event_at"]),
-            received_at=_datetime(data["received_at"]),
+            received_at=cast(datetime, _datetime(data["received_at"])),
             trading_day=_date(data["trading_day"]),
             is_simulated=data["is_simulated"],
             is_long_callback=data["is_long_callback"],
@@ -237,7 +231,7 @@ def _payload(event_type: EventType, data: Mapping[str, Any]) -> object:
             simulate_raw=data["simulate_raw"],
             is_simulated=data["is_simulated"],
             event_at=_datetime(data["event_at"]),
-            received_at=_datetime(data["received_at"]),
+            received_at=cast(datetime, _datetime(data["received_at"])),
             trading_day=_date(data["trading_day"]),
             is_long_callback=data["is_long_callback"],
             price_scale=_decimal(data["price_scale"]),
@@ -250,7 +244,7 @@ def _payload(event_type: EventType, data: Mapping[str, Any]) -> object:
             stock_idx_raw=data["stock_idx_raw"],
             error_code_raw=data["error_code_raw"],
             message=data["message"],
-            received_at=_datetime(data["received_at"]),
+            received_at=cast(datetime, _datetime(data["received_at"])),
             attempt=data["attempt"],
             connection_generation=data["connection_generation"],
             callback_sequence=data["callback_sequence"],
@@ -267,11 +261,7 @@ def decode_envelope(row: Mapping[str, Any]) -> MarketDataEnvelope:
         raise ValueError("authoritative record checksum mismatch")
     event_type = EventType(row["event_type"])
     data = decode_storage_value(json.loads(payload_json))
-    raw = (
-        None
-        if row["raw_json"] is None
-        else decode_storage_value(json.loads(row["raw_json"]))
-    )
+    raw = None if row["raw_json"] is None else decode_storage_value(json.loads(row["raw_json"]))
     if not isinstance(data, Mapping):
         raise ValueError("payload must decode to a mapping")
     return MarketDataEnvelope(
@@ -287,7 +277,7 @@ def decode_envelope(row: Mapping[str, Any]) -> MarketDataEnvelope:
         broker_sequence=row["broker_sequence"],
         dedupe_key=row["dedupe_key"],
         event_at=_datetime(row["event_at"]),
-        received_at=_datetime(row["received_at"]),
+        received_at=cast(datetime, _datetime(row["received_at"])),
         trading_day=_date(row["trading_day"]),
         metadata_version=row["metadata_version"],
         raw_payload=raw,

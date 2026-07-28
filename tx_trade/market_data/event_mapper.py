@@ -20,6 +20,7 @@ from .models import (
     CapturedTickNotification,
     ConnectionState,
     ConnectionStatus,
+    DomainPayload,
     EventType,
     MarketDataEnvelope,
     Quote,
@@ -43,9 +44,7 @@ def _instrument_id(event: CapturedMarketDataEvent, market_no: int, stock_idx: in
     return f"synthetic:{event.source}:{market_no}:{stock_idx}"
 
 
-def _dedupe_key(
-    event: CapturedMarketDataEvent, event_type: EventType, identity: Any
-) -> str:
+def _dedupe_key(event: CapturedMarketDataEvent, event_type: EventType, identity: Any) -> str:
     canonical = json.dumps(
         [
             event.source,
@@ -79,6 +78,8 @@ class Phase1CapturedEventMapper:
     ) -> MarketDataEnvelope:
         self.validate(event)
         payload = event.payload
+        domain_payload: DomainPayload
+        identity: object = None
         if type(payload) is CapturedConnectionNotification:
             state, ready = _CONNECTION_STATES.get(
                 payload.broker_kind_raw, (ConnectionState.ERROR, False)
@@ -118,9 +119,7 @@ class Phase1CapturedEventMapper:
             )
         elif type(payload) is CapturedQuoteSnapshot:
             domain_payload = Quote(
-                instrument_id=_instrument_id(
-                    event, payload.market_no_raw, payload.stock_idx_raw
-                ),
+                instrument_id=_instrument_id(event, payload.market_no_raw, payload.stock_idx_raw),
                 market_no_raw=payload.market_no_raw,
                 stock_idx_raw=payload.stock_idx_raw,
                 bid_raw=payload.bid_raw,
@@ -147,9 +146,7 @@ class Phase1CapturedEventMapper:
             )
         elif type(payload) is CapturedTickNotification:
             domain_payload = Tick(
-                instrument_id=_instrument_id(
-                    event, payload.market_no_raw, payload.stock_idx_raw
-                ),
+                instrument_id=_instrument_id(event, payload.market_no_raw, payload.stock_idx_raw),
                 market_no_raw=payload.market_no_raw,
                 stock_idx_raw=payload.stock_idx_raw,
                 source_pointer_raw=payload.source_pointer_raw,
@@ -182,7 +179,7 @@ class Phase1CapturedEventMapper:
             )
         elif type(payload) is CapturedStockListNotification:
             raw_list: str | dict[str, str]
-            if type(payload.stock_list_raw) is bytes:
+            if isinstance(payload.stock_list_raw, bytes):
                 raw_list = {
                     "encoding": "base64",
                     "data": base64.b64encode(payload.stock_list_raw).decode("ascii"),

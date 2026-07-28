@@ -23,19 +23,23 @@ from tx_trade.storage import (
 def _repository(tmp_path):
     repository = SQLiteMarketDataRepository(tmp_path / "events.db")
     events = make_offline_fixture_envelopes()
-    repository.begin_session(RecordingSession(
-        events[0].session_id, SCHEMA_VERSION, events[0].source,
-        SourceMode.OFFLINE, OFFLINE_FIXTURE_TIME,
-        OFFLINE_FIXTURE_TRADING_DAY, "fixture",
-    ))
+    repository.begin_session(
+        RecordingSession(
+            events[0].session_id,
+            SCHEMA_VERSION,
+            events[0].source,
+            SourceMode.OFFLINE,
+            OFFLINE_FIXTURE_TIME,
+            OFFLINE_FIXTURE_TRADING_DAY,
+            "fixture",
+        )
+    )
     return repository, events
 
 
 def test_writer_batches_flushes_and_stops(tmp_path) -> None:
     repository, events = _repository(tmp_path)
-    writer = SQLiteMarketDataWriter(
-        repository, capacity=8, batch_size=2, flush_interval_seconds=10
-    )
+    writer = SQLiteMarketDataWriter(repository, capacity=8, batch_size=2, flush_interval_seconds=10)
     writer.start()
     for event in events:
         writer.publish(event)
@@ -67,6 +71,7 @@ def test_queue_full_is_explicit(tmp_path) -> None:
     class BlockingRepository(SQLiteMarketDataRepository):
         entered = threading.Event()
         release = threading.Event()
+
         def append_batch(self, events):
             self.entered.set()
             self.release.wait(2)
@@ -74,9 +79,7 @@ def test_queue_full_is_explicit(tmp_path) -> None:
 
     repository = BlockingRepository(tmp_path / "events.db")
     events = _begin_for(repository)
-    writer = SQLiteMarketDataWriter(
-        repository, capacity=1, batch_size=1, flush_interval_seconds=10
-    )
+    writer = SQLiteMarketDataWriter(repository, capacity=1, batch_size=1, flush_interval_seconds=10)
     writer.start()
     writer.publish(events[0])
     assert repository.entered.wait(1)
@@ -89,11 +92,17 @@ def test_queue_full_is_explicit(tmp_path) -> None:
 
 def _begin_for(repository):
     events = make_offline_fixture_envelopes()
-    repository.begin_session(RecordingSession(
-        events[0].session_id, SCHEMA_VERSION, events[0].source,
-        SourceMode.OFFLINE, OFFLINE_FIXTURE_TIME,
-        OFFLINE_FIXTURE_TRADING_DAY, "fixture",
-    ))
+    repository.begin_session(
+        RecordingSession(
+            events[0].session_id,
+            SCHEMA_VERSION,
+            events[0].source,
+            SourceMode.OFFLINE,
+            OFFLINE_FIXTURE_TIME,
+            OFFLINE_FIXTURE_TRADING_DAY,
+            "fixture",
+        )
+    )
     return events
 
 
@@ -104,9 +113,7 @@ def test_background_error_is_rethrown(tmp_path) -> None:
 
     repository = FailingRepository(tmp_path / "events.db")
     events = _begin_for(repository)
-    writer = SQLiteMarketDataWriter(
-        repository, capacity=2, batch_size=1, flush_interval_seconds=10
-    )
+    writer = SQLiteMarketDataWriter(repository, capacity=2, batch_size=1, flush_interval_seconds=10)
     writer.start()
     writer.publish(events[0])
     assert writer._thread is not None
@@ -157,6 +164,7 @@ def test_publish_and_flush_are_rejected_after_atomic_stop_cutoff(tmp_path) -> No
     class BlockingRepository(SQLiteMarketDataRepository):
         entered = threading.Event()
         release = threading.Event()
+
         def append_batch(self, events):
             self.entered.set()
             assert self.release.wait(2)
@@ -164,17 +172,13 @@ def test_publish_and_flush_are_rejected_after_atomic_stop_cutoff(tmp_path) -> No
 
     repository = BlockingRepository(tmp_path / "events.db")
     events = _begin_for(repository)
-    writer = SQLiteMarketDataWriter(
-        repository, capacity=4, batch_size=1, flush_interval_seconds=10
-    )
+    writer = SQLiteMarketDataWriter(repository, capacity=4, batch_size=1, flush_interval_seconds=10)
     writer.start()
     writer.publish(events[0])
     assert repository.entered.wait(1)
     writer.publish(events[1])
     stopped: list[BaseException] = []
-    thread = threading.Thread(
-        target=lambda: _capture(lambda: writer.stop(timeout=2), stopped)
-    )
+    thread = threading.Thread(target=lambda: _capture(lambda: writer.stop(timeout=2), stopped))
     thread.start()
     for _ in range(1000):
         if writer.state is WriterState.STOPPING:
@@ -198,6 +202,7 @@ def test_flush_barrier_ordered_before_stop_token(tmp_path) -> None:
     class BlockingRepository(SQLiteMarketDataRepository):
         entered = threading.Event()
         release = threading.Event()
+
         def append_batch(self, events):
             self.entered.set()
             assert self.release.wait(2)
@@ -205,9 +210,7 @@ def test_flush_barrier_ordered_before_stop_token(tmp_path) -> None:
 
     repository = BlockingRepository(tmp_path / "events.db")
     events = _begin_for(repository)
-    writer = SQLiteMarketDataWriter(
-        repository, capacity=4, batch_size=1, flush_interval_seconds=10
-    )
+    writer = SQLiteMarketDataWriter(repository, capacity=4, batch_size=1, flush_interval_seconds=10)
     writer.start()
     writer.publish(events[0])
     assert repository.entered.wait(1)

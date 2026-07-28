@@ -3,7 +3,7 @@
 狀態：Proposed  
 適用範圍：Phase 1  
 時區：`Asia/Taipei`  
-安全邊界：**接收、標準化、紀錄與完整讀回行情，產出 Phase 2 可回放的排序資料；絕不建立 Order/Reply COM object，絕不送出真實委託。**
+安全邊界：**接收、標準化、紀錄與完整讀回行情，產出 Phase 2 可回放的排序資料；不建立 Order。Reply 僅用於登入必要的 `OnReplyMessage` 公告 callback，絕不連接回報主機、接收委託／成交回報或送出真實委託。**
 
 ## 1. 目的、範圍與 non-goals
 
@@ -17,7 +17,7 @@ Phase 1 建立一條可測試、可持久化、可完整讀回且預設不連線
 
 Phase 1 明確排除：
 
-- `SKOrderLib`、`SKReplyLib`、Order/Reply callback、帳務、部位、委託及成交回報。
+- `SKOrderLib`、`SKReplyLib_ConnectByID`、委託／成交 Reply callback、帳務、部位、委託及成交回報。唯一例外是登入必要的 announcement-only `OnReplyMessage`。
 - paper/live execution engine；`execution_mode` 僅作安全驗證，不能驅動下單。
 - 實際 replay runtime、依事件時間等待、speed/pause/resume 控制；這些屬於 Phase 2。
 - `PaperBroker` 與任何 paper execution；這些屬於 Phase 2 或後續階段。
@@ -33,9 +33,9 @@ Phase 1 明確排除：
 | 證據 | 已驗證事實 | Phase 1 約束 |
 |---|---|---|
 | `quote_client.py:28-46`, `QuoteClient.__init__` | 有 `quote_only` flag，且 client 同時持有 quote、order、reply 狀態欄位。 | 保留 façade，但新 live adapter 固定 quote-only；Order/Reply 不屬於其依賴。 |
-| `quote_client.py:64-97`, `QuoteClient._try_load_api` | 載入成功時建立 Center/Quote；只有 `quote_only=False` 才建立 Order/Reply。 | 新 app preset 不可依賴呼叫者記得傳 boolean；由 mode validation 強制安全組合。 |
+| `quote_client.py`, `QuoteClient._try_load_api` | 載入成功時建立 Center/Quote/announcement-only Reply；只有 `quote_only=False` 才建立 Order。 | 新 app preset 不可依賴呼叫者記得傳 boolean；由 mode validation 強制安全組合。 |
 | `quote_client.py:99-109`, `QuoteClient.initialize` | API 載入失敗後設 `_offline_mode=True`、`_connected=True` 並回傳 `True`。 | 現況是 offline fail-open；新 `live` source 必須 fail-closed，不得自動降級。 |
-| `quote_client.py:152-198`, `QuoteClient.login` | `login` 先在 `quote_client.py:154-155` 驗證 account/password 非空，之後 offline 分支才於 `quote_client.py:156-157` 回傳成功；quote-only login 會略過 Reply callback。 | 「新 composition 的 offline 不讀帳密」是目標行為，與舊 façade 有意不同；live 的每一步錯誤都向上傳遞。 |
+| `quote_client.py`, `QuoteClient.login` | `login` 先驗證 account/password 非空，offline 分支不接 COM；live 在登入前註冊 announcement-only `OnReplyMessage`。 | 「新 composition 的 offline 不讀帳密」是目標行為，與舊 façade 有意不同；live 的每一步錯誤都向上傳遞。 |
 | `quote_client.py:200-295`, `QuoteClient._register_quote_callback` | callback 寫入 dict；`quotes`、`ticks` 是 list 且以 `append` 累積。 | 這些 list 無容量限制；新 adapter callback 只能 nonblocking enqueue 到有界 buffer。 |
 | `quote_client.py:244-280`, `OnNotifyTicks` / `OnNotifyTicksLONG` | callback 保留 `nPtr`、日期、時間、bid/ask/close、qty、simulate；LONG 另標記 `long=True`。 | raw 欄位先無損保留；未確認語意的欄位不得臆測轉換。 |
 | `quote_client.py:361-442`, `enter_monitor` / `leave_monitor` | monitor 有 best-effort、可重試 cleanup 與 subscription set。 | 狀態機保留 idempotent stop/cleanup，且由同一 STA thread 執行。 |
@@ -43,7 +43,7 @@ Phase 1 明確排除：
 | `quote_client.py:493-576`, request/get methods | offline 回傳既有 dict；live request 回傳 `success/code/message` 等 keys；event snapshot 含 `server_time/stock_list/quotes/ticks`。 | façade 遷移期間維持既有 keys，domain contract 不直接暴露 COM object。 |
 | `main.py:12-32`, `main` | 使用預設 `QuoteClient()`，登入後呼叫 `order_initialize`、`order_load_commodity_gw`、`connect_reply_by_id`。 | 此 entry point 對 Phase 1 不安全；Phase 1 不執行、不沿用，改用安全 app entry point。 |
 | `config.py:9-12,34-39` | config import 時建立 log directory，帳密由環境變數取得，symbols 有預設值。 | 新純 config/domain import 不產生 filesystem side effect；secret 僅在 live adapter 邊界解析。 |
-| `tests/integration/test_skcom_quote_live.py:25-79` | 測試驗證 quote-only 只建立 Center/Quote，並阻止 Reply callback。 | 此 guard test 必須保留並擴充到 app composition。 |
+| `tests/integration/test_skcom_quote_live.py` | 測試驗證 quote-only 只建立 Center/Quote/announcement-only Reply，且 Reply 只註冊 `OnReplyMessage`。 | guard 必須禁止 Order、`ConnectByID` 與委託／成交 callback。 |
 | `tests/integration/test_skcom_quote_live.py:125-151` | live fixture 需 Windows、環境變數 opt-in、DLL 與帳密，且 monkeypatch Order/Reply 方法。 | 所有 live 測試維持 explicit opt-in；CI/default test 不登入。 |
 | `tests/integration/test_skcom_quote_live.py:154-196` | live 測試驗證登入、ready、商品、quote/tick subscription；不要求市場休市時收到 tick。 | live smoke test 不作 deterministic 資料量斷言。 |
 
@@ -62,7 +62,7 @@ ExecutionMode = Literal["disabled", "paper", "live"]
 |---|---|---|---|
 | `phase1_default` | `offline` | `disabled` | 預設；產生明確的 offline health，不載入 COM，不讀帳密。 |
 | `phase2_replay`（保留） | `replay` | `disabled` | Phase 2 runtime preset；Phase 1 config 可辨識但必須拒絕啟動實際回放。 |
-| `phase1_live_quote` | `live` | `disabled` | 僅在 explicit opt-in 後允許；只建 Center/Quote。 |
+| `phase1_live_quote` | `live` | `disabled` | 僅在 explicit opt-in 後允許；建立 Center/Quote 與 announcement-only Reply。 |
 | `research_paper`（保留） | `replay` 或 `offline` | `paper` | Phase 2 或後續 preset；Phase 1 必須拒絕。 |
 | `live_trade` | 任意 | `live` | **fail-closed：Phase 1 啟動時立即拒絕。** |
 | 非法組合 | `live` | `paper` | Phase 1 拒絕，避免「行情 process」被誤當交易 process。 |
@@ -87,7 +87,7 @@ tx_trade/
 │   └── config.py                 # 純設定解析、preset 與 fail-closed validation
 ├── broker/
 │   └── capital/
-│       ├── quote_adapter.py      # CapitalQuotePort adapter；不含 Order/Reply
+│       ├── quote_adapter.py      # CapitalQuotePort adapter；不含 Order/回報連線
 │       ├── com_runtime.py        # dedicated STA thread、command queue、pump、cleanup
 │       └── event_mapper.py       # SKCOM callback raw payload -> CapturedMarketDataEvent
 ├── market_data/
@@ -634,7 +634,7 @@ RECONNECTING -> CONNECTED -> STOCKS_READY -> SUBSCRIBED
 
 以上名稱逐字對齊唯一 `ConnectionState` enum。`OnConnection.nKind` 只驅動經驗證的 transition 並保存於 `broker_kind_raw`，不直接存成 state。非法 transition 必須拒絕並記 metric；超過 reconnect retry policy 進 `ERROR`。
 
-啟動順序：validate mode → start STA → initialize COM → create Center/Quote → register quote events → login → enter monitor → pump 到 stocks-ready → subscribe。停止順序：停止接收新 command → cancel tick → cancel quote → leave monitor → drain/標記 ingress → flush writer → release events/COM → uninitialize。
+啟動順序：validate mode → start STA → initialize COM → create Center/Quote/announcement-only Reply → register quote events 與 `OnReplyMessage` → login → enter monitor → pump 到 stocks-ready → subscribe。停止順序：停止接收新 command → cancel tick → cancel quote → bounded message drain → leave monitor → drain/標記 ingress → flush writer → release events/COM → uninitialize。
 
 ### 11.3 重連與 resubscribe
 
@@ -661,8 +661,8 @@ Fail-closed 規則：
 
 - `quote_source=live` 任一步失敗均退出 live 啟動；禁止回傳 offline success，禁止換來源。
 - Phase 1 的 `execution_mode=live` 一律 `ConfigurationError`，而且發生在 import/load COM 前。
-- production composition 中不存在 Order/Reply factory；即使 SKCOM module 暴露相關 coclass 也不得呼叫。
-- 保留/擴充 guard test，對 `CreateObject(SKOrderLib/SKReplyLib)`、Reply event registration 與所有 order/reply façade method 設 hard failure。
+- production composition 不存在 Order factory。Reply factory 只允許建立 announcement-only object。
+- guard test 對 `CreateObject(SKOrderLib)`、`SKReplyLib_ConnectByID`、`OnNewData`、`OnStrategyData` 與所有 order façade method 設 hard failure；Reply sink 只允許 `OnReplyMessage`。
 
 Security：
 
@@ -691,7 +691,7 @@ Security：
 2. **Ports + offline fixture/readback contract**：建立 pipeline、fake clock、session-global ingest sequencer 與 `ReplaySource` readback interface；不做 replay timing runtime。
 3. **SQLite event log/repository/writer**：authoritative `event_log`、typed projections、WAL、batch、全部 registered event types 的 round-trip/ordering tests；不接 live。
 4. **Bounded pipeline + health/metrics**：quote coalesce、tick drop degraded、stress tests。
-5. **Capital quote-only STA adapter**：把 Center/Quote、events、pump/commands 集中；guard tests 先行。
+5. **Capital quote-only STA adapter**：把 Center/Quote、announcement-only Reply、events、pump/commands 集中；guard tests 先行。
 6. **QuoteClient façade adapter**：維持既有 dict keys，舊 unit/contract tests 全過。
 7. **安全 Phase 1 entry point**：預設 offline；live quote opt-in；文件化並隔離現有不安全 `main.py`。
 
@@ -708,14 +708,14 @@ Security：
 - Replay-ready readback：相同 recording 每次讀回都依 `ingest_sequence` 產生相同 envelope ordering/content；不測 timing/speed/pause。
 - Storage：WAL/batch transaction、duplicate insert、crash/incomplete session、schema mismatch、timezone/Decimal round-trip。
 - Property/stress：隨機 raw integer/scale、session-global ingest sequence/dedupe invariant、queue saturation、長時間事件量保持 bounded memory。
-- Live：只在 Windows + DLL + credentials + explicit env opt-in 執行；quote-only，永不測 Order/Reply。
+- Live：只在 Windows + DLL + credentials + explicit env opt-in 執行；quote-only，只測 announcement callback，不連接或測試委託／成交 Reply。
 
 ### 14.2 必須通過的 acceptance tests
 
 1. 未提供設定時解析為 `quote_source=offline`, `execution_mode=disabled`，且未 import `comtypes`。
 2. 任意 `execution_mode=live` 在 COM factory 被呼叫前失敗。
 3. live quote 未 opt-in、DLL load 失敗、login 失敗、monitor timeout 各自 fail-closed，沒有 offline event。
-4. factory spy 證明只建立 Center/Quote，Order/Reply 建立與 Reply event registration 為零次。
+4. factory spy 證明只建立 Center/Quote/announcement-only Reply；Order 建立為零次，Reply sink 只有 `OnReplyMessage`。
 5. 每個 model 拒絕 naive datetime；SQLite round-trip 保留 envelope 自有 `received_at/event_at/trading_day`（含 `None`）及 `+08:00`。
 6. 對多種 metadata scale（如 `1`、`0.1`、`0.01`）驗證 `Decimal(raw) * scale`；scale 未知保留 raw、normalized `None`、health degraded。
 7. 同一 recording 讀回兩次得到相同 `(event_type, ingest_sequence, generation, sequence, dedupe_key, payload, raw_payload)`；全部 registered event types（包含 adapter diagnostic）皆不可漏。
@@ -802,7 +802,7 @@ ADR 未決不阻止無損紀錄 raw 欄位，但會阻止宣稱 normalized/compl
 - [ ] 預設 preset 是 offline/disabled，import 與啟動均不建立 COM、不讀帳密。
 - [ ] offline fixture 與 opt-in live quote 走相同 domain/pipeline/storage contract；`ReplaySource` 可完整讀回，但 Phase 1 不提供 replay runtime。
 - [ ] live quote 的 DLL、COM、login、monitor、ready、subscription 全部 fail-closed。
-- [ ] production 與 tests 有硬護欄證明不建立 Order/Reply、不註冊 Reply、不下單。
+- [x] production 與 tests 有硬護欄證明不建立 Order、不呼叫 `ConnectByID`、不註冊委託／成交 Reply callback、不下單；唯一 Reply callback 為登入必要的 `OnReplyMessage`。
 - [ ] 全部 domain contracts（包含 `AdapterDiagnostic`）、raw captured union、`CapturedMarketDataEvent` transport contract、唯一 `ConnectionState` enum 與 schema version 已實作且一致。
 - [ ] 價格保留 raw integer，以 metadata `Decimal` scale 正規化，沒有硬編碼 `/100`。
 - [ ] 所有時間 aware Asia/Taipei，received/event/trading day 分離。

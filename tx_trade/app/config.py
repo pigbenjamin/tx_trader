@@ -27,6 +27,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TypeVar
 
 
 class ConfigError(ValueError):
@@ -110,9 +111,7 @@ class Phase1Settings:
             + self.ingress_tick_capacity
         )
         if lane_capacity > self.ingress_queue_capacity:
-            raise ConfigError(
-                "ingress lane capacities must not exceed ingress_queue_capacity"
-            )
+            raise ConfigError("ingress lane capacities must not exceed ingress_queue_capacity")
 
         if (self.quote_source, self.execution_mode) != _PRESET_MODES[self.preset]:
             raise ConfigError("quote_source/execution_mode must match preset")
@@ -127,12 +126,13 @@ class Phase1Settings:
                 f"execution mode {self.execution_mode.value!r} is forbidden in Phase 1"
             )
         if self.quote_source is QuoteSource.LIVE and not self.live_quote_opt_in:
-            raise ConfigError(
-                "live quote requires TX_TRADE_ENABLE_LIVE_QUOTE=1"
-            )
+            raise ConfigError("live quote requires TX_TRADE_ENABLE_LIVE_QUOTE=1")
 
 
-def _enum_value(enum_type: type[StrEnum], raw: str, key: str) -> StrEnum:
+_StrEnumT = TypeVar("_StrEnumT", bound=StrEnum)
+
+
+def _enum_value(enum_type: type[_StrEnumT], raw: str, key: str) -> _StrEnumT:
     try:
         return enum_type(raw)
     except (TypeError, ValueError) as exc:
@@ -167,15 +167,12 @@ def _ingress_capacities(values: Mapping[str, str]) -> tuple[int, int, int, int, 
     aggregate_override = "TX_TRADE_INGRESS_QUEUE_CAPACITY" in values
     if aggregate_override and not lane_override:
         if aggregate < 4:
-            raise ConfigError(
-                "TX_TRADE_INGRESS_QUEUE_CAPACITY must be at least 4"
-            )
+            raise ConfigError("TX_TRADE_INGRESS_QUEUE_CAPACITY must be at least 4")
         remaining = aggregate - 4
         weighted = [remaining * weight // 4096 for weight in _LANE_DEFAULTS]
         remainder = remaining - sum(weighted)
         fractions = [
-            (remaining * weight % 4096, index)
-            for index, weight in enumerate(_LANE_DEFAULTS)
+            (remaining * weight % 4096, index) for index, weight in enumerate(_LANE_DEFAULTS)
         ]
         for _, index in sorted(fractions, reverse=True)[:remainder]:
             weighted[index] += 1
@@ -185,7 +182,7 @@ def _ingress_capacities(values: Mapping[str, str]) -> tuple[int, int, int, int, 
             _positive_int(values, key, default)
             for key, default in zip(_LANE_KEYS, _LANE_DEFAULTS, strict=True)
         )
-    return (aggregate, *lanes)
+    return (aggregate, lanes[0], lanes[1], lanes[2], lanes[3])
 
 
 def parse_phase1_settings(
@@ -223,10 +220,7 @@ def parse_phase1_settings(
     )
     if "TX_TRADE_QUOTE_SOURCE" in supplied and quote_source is not preset_quote:
         raise ConfigError("TX_TRADE_QUOTE_SOURCE conflicts with runtime preset")
-    if (
-        "TX_TRADE_EXECUTION_MODE" in supplied
-        and execution_mode is not preset_execution
-    ):
+    if "TX_TRADE_EXECUTION_MODE" in supplied and execution_mode is not preset_execution:
         raise ConfigError("TX_TRADE_EXECUTION_MODE conflicts with runtime preset")
 
     opt_in_raw = supplied.get("TX_TRADE_ENABLE_LIVE_QUOTE", "0")
@@ -250,18 +244,14 @@ def parse_phase1_settings(
         ingress_diagnostic_capacity=diagnostic_capacity,
         ingress_quote_capacity=quote_capacity,
         ingress_tick_capacity=tick_capacity,
-        ingress_dedupe_capacity=_positive_int(
-            supplied, "TX_TRADE_INGRESS_DEDUPE_CAPACITY", 4096
-        ),
+        ingress_dedupe_capacity=_positive_int(supplied, "TX_TRADE_INGRESS_DEDUPE_CAPACITY", 4096),
         sta_quote_enrichment_capacity=_positive_int(
             supplied, "TX_TRADE_STA_QUOTE_ENRICHMENT_CAPACITY", 1024
         ),
         storage_writer_queue_capacity=_positive_int(
             supplied, "TX_TRADE_STORAGE_WRITER_QUEUE_CAPACITY", 4096
         ),
-        storage_batch_size=_positive_int(
-            supplied, "TX_TRADE_STORAGE_BATCH_SIZE", 128
-        ),
+        storage_batch_size=_positive_int(supplied, "TX_TRADE_STORAGE_BATCH_SIZE", 128),
         storage_flush_interval_ms=_positive_int(
             supplied, "TX_TRADE_STORAGE_FLUSH_INTERVAL_MS", 250
         ),

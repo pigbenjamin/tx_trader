@@ -16,6 +16,7 @@ from .models import (
     AdapterDiagnostic,
     ConnectionState,
     ConnectionStatus,
+    DomainPayload,
     EventType,
     Instrument,
     MarketDataEnvelope,
@@ -82,9 +83,7 @@ def _require_finite_number(value: object, name: str) -> float:
 class FakeClock:
     """A deterministic clock advanced explicitly by tests."""
 
-    def __init__(
-        self, initial_now: datetime, *, initial_monotonic: float = 0.0
-    ) -> None:
+    def __init__(self, initial_now: datetime, *, initial_monotonic: float = 0.0) -> None:
         _require_taipei(initial_now)
         monotonic = _require_finite_number(initial_monotonic, "initial_monotonic")
         self._now = initial_now
@@ -141,11 +140,7 @@ class InMemoryReplaySource:
                 raise ValueError("after_ingest_sequence must be non-negative")
         cursor = -1 if after_ingest_sequence is None else after_ingest_sequence
         ordered = sorted(self._envelopes, key=lambda envelope: envelope.ingest_sequence)
-        return (
-            envelope
-            for envelope in ordered
-            if envelope.ingest_sequence > cursor
-        )
+        return (envelope for envelope in ordered if envelope.ingest_sequence > cursor)
 
     def verify_integrity(self) -> ReadbackIntegrityReport:
         self._require_open()
@@ -166,9 +161,7 @@ class InMemoryReplaySource:
             if first_serialization != second_serialization:
                 errors.append(f"event {index} serialization is not deterministic")
 
-        sequence_values = [
-            envelope.ingest_sequence for envelope in self._envelopes
-        ]
+        sequence_values = [envelope.ingest_sequence for envelope in self._envelopes]
         return ReadbackIntegrityReport(
             session_id=self._session_id,
             event_count=len(self._envelopes),
@@ -273,7 +266,10 @@ def make_offline_fixture_envelopes() -> tuple[MarketDataEnvelope, ...]:
         callback_sequence=5,
         raw_notification={"fixture": True},
     )
-    payloads = (
+    payloads: tuple[
+        tuple[EventType, DomainPayload, datetime | None, date | None, int | None, object],
+        ...,
+    ] = (
         (
             EventType.CONNECTION_STATUS,
             connection,

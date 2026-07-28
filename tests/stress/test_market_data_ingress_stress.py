@@ -6,6 +6,8 @@ from threading import Event, Lock, Thread
 import tracemalloc
 from uuid import UUID
 
+import pytest
+
 from tx_trade.market_data.fixtures import make_offline_fixture_envelopes
 from tx_trade.market_data.ingress import BoundedIngress, BoundedIngressProcessor
 from tx_trade.market_data.models import (
@@ -26,6 +28,8 @@ from tx_trade.monitoring.metrics import IngressLane, IngressMetrics
 
 NOW = datetime(2026, 7, 26, 9, 30, tzinfo=TAIPEI)
 SESSION = UUID("12345678-1234-5678-1234-567812345678")
+
+pytestmark = pytest.mark.stress
 
 
 class Clock:
@@ -153,8 +157,7 @@ def test_one_million_distinct_publishes_have_bounded_retained_memory():
     assert retained_delta < 4 * 1024 * 1024
     assert peak >= retained_current
     print(
-        f"retained_delta_bytes={retained_delta} "
-        f"traced_peak_bytes={peak} traced_events={measured}"
+        f"retained_delta_bytes={retained_delta} traced_peak_bytes={peak} traced_events={measured}"
     )
 
 

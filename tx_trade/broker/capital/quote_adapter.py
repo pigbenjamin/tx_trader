@@ -9,6 +9,7 @@ from datetime import datetime
 import math
 from queue import Empty, Full, Queue
 from threading import Condition, Event, Lock, Thread, get_ident
+from time import sleep
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -28,6 +29,7 @@ from tx_trade.market_data.models import (
     CapturedTickNotification,
     ConnectionState,
     ConnectionStatus,
+    IngressCapturedPayload,
     SourceMode,
     StaLocalQuoteNotification,
     TAIPEI,
@@ -75,9 +77,7 @@ class _GenerationEventSink:
 
     __slots__ = ("_adapter", "_generation", "_lock", "_sequence")
 
-    def __init__(
-        self, adapter: "CapitalQuoteStaAdapter", generation: int
-    ) -> None:
+    def __init__(self, adapter: "CapitalQuoteStaAdapter", generation: int) -> None:
         self._adapter = adapter
         self._generation = generation
         self._sequence = 0
@@ -96,9 +96,7 @@ class _GenerationEventSink:
             handler(self._generation, sequence, *values)
         except Exception:
             try:
-                self._adapter._callback_failure(
-                    self._generation, callback_name
-                )
+                self._adapter._callback_failure(self._generation, callback_name)
             except Exception:
                 pass
         return None
@@ -106,16 +104,10 @@ class _GenerationEventSink:
     def OnConnection(self, nKind: int, nCode: int) -> None:
         return self._invoke("connection", nKind, nCode)
 
-    def OnNotifyServerTime(
-        self, sHour: int, sMinute: int, sSecond: int, nTotal: int
-    ) -> None:
-        return self._invoke(
-            "server_time", sHour, sMinute, sSecond, nTotal
-        )
+    def OnNotifyServerTime(self, sHour: int, sMinute: int, sSecond: int, nTotal: int) -> None:
+        return self._invoke("server_time", sHour, sMinute, sSecond, nTotal)
 
-    def OnNotifyStockList(
-        self, sMarketNo: int, bstrStockData: str | bytes
-    ) -> None:
+    def OnNotifyStockList(self, sMarketNo: int, bstrStockData: str | bytes) -> None:
         return self._invoke("stock_list", sMarketNo, bstrStockData)
 
     def OnNotifyQuote(self, sMarketNo: int, sStockIdx: int) -> None:
@@ -305,16 +297,16 @@ class CapitalQuoteStaAdapter:
         ):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        for name, value in (
+        for timeout_name, timeout_value in (
             ("command_timeout", command_timeout),
             ("pump_interval", pump_interval),
         ):
             if (
-                type(value) not in (int, float)
-                or not math.isfinite(value)
-                or value <= 0
+                type(timeout_value) not in (int, float)
+                or not math.isfinite(timeout_value)
+                or timeout_value <= 0
             ):
-                raise ValueError(f"{name} must be positive")
+                raise ValueError(f"{timeout_name} must be positive")
         if startup_timeout is None:
             startup_timeout = float(command_timeout)
         if (
@@ -327,7 +319,7 @@ class CapitalQuoteStaAdapter:
             reconnect_connected_timeout = float(command_timeout)
         if reconnect_stocks_ready_timeout is None:
             reconnect_stocks_ready_timeout = float(command_timeout)
-        for name, value in (
+        for reconnect_name, reconnect_value in (
             ("reconnect_connected_timeout", reconnect_connected_timeout),
             (
                 "reconnect_stocks_ready_timeout",
@@ -335,11 +327,11 @@ class CapitalQuoteStaAdapter:
             ),
         ):
             if (
-                type(value) not in (int, float)
-                or not math.isfinite(value)
-                or value <= 0
+                type(reconnect_value) not in (int, float)
+                or not math.isfinite(reconnect_value)
+                or reconnect_value <= 0
             ):
-                raise ValueError(f"{name} must be positive and finite")
+                raise ValueError(f"{reconnect_name} must be positive and finite")
         if session_id is None:
             session_id = uuid4()
         if type(session_id) is not UUID:
@@ -357,12 +349,8 @@ class CapitalQuoteStaAdapter:
         self._command_timeout = float(command_timeout)
         self._startup_timeout = float(startup_timeout)
         self._command_batch_size = command_batch_size
-        self._reconnect_connected_timeout = float(
-            reconnect_connected_timeout
-        )
-        self._reconnect_stocks_ready_timeout = float(
-            reconnect_stocks_ready_timeout
-        )
+        self._reconnect_connected_timeout = float(reconnect_connected_timeout)
+        self._reconnect_stocks_ready_timeout = float(reconnect_stocks_ready_timeout)
         self._pump_interval = float(pump_interval)
         self._reconnect_policy = reconnect_policy
         self._quote_lookup_attempts = quote_lookup_attempts
@@ -409,9 +397,7 @@ class CapitalQuoteStaAdapter:
                 raise CapitalAdapterError("adapter can only be started once")
             self._transition_locked(ConnectionState.STARTING)
             self._accepting_commands = True
-            self._thread = Thread(
-                target=self._run, name="capital-quote-sta", daemon=True
-            )
+            self._thread = Thread(target=self._run, name="capital-quote-sta", daemon=True)
             self._thread.start()
         if not self._started_event.wait(self._startup_timeout):
             self._fatal("quote_startup_timeout")
@@ -563,10 +549,7 @@ class CapitalQuoteStaAdapter:
         finally:
             self._started_event.set()
         try:
-            while (
-                self._initialization_error is None
-                and not self._stop_event.is_set()
-            ):
+            while self._initialization_error is None and not self._stop_event.is_set():
                 self._process_commands()
                 if self._stop_event.is_set():
                     break
@@ -585,10 +568,7 @@ class CapitalQuoteStaAdapter:
 
     def _process_commands(self) -> None:
         processed = 0
-        while (
-            not self._stop_event.is_set()
-            and processed < self._command_batch_size
-        ):
+        while not self._stop_event.is_set() and processed < self._command_batch_size:
             try:
                 command = self._commands.get_nowait()
             except Empty:
@@ -639,11 +619,7 @@ class CapitalQuoteStaAdapter:
 
     def _enter_monitor(self, reconnect: bool) -> None:
         with self._state_condition:
-            expected = (
-                ConnectionState.RECONNECTING
-                if reconnect
-                else ConnectionState.LOGGED_IN
-            )
+            expected = ConnectionState.RECONNECTING if reconnect else ConnectionState.LOGGED_IN
             if self._state is not expected:
                 raise CapitalAdapterError("adapter is not ready to enter monitor")
             if not reconnect:
@@ -689,9 +665,7 @@ class CapitalQuoteStaAdapter:
 
     def _subscribe(self, kind: str, symbols: tuple[str, ...]) -> None:
         with self._state_condition:
-            desired = (
-                self._desired_quotes if kind == "quotes" else self._desired_ticks
-            )
+            desired = self._desired_quotes if kind == "quotes" else self._desired_ticks
             actual = self._actual_quotes if kind == "quotes" else self._actual_ticks
             desired.update(symbols)
             ready = self._state in _READY_STATES
@@ -710,11 +684,7 @@ class CapitalQuoteStaAdapter:
                 raise
 
     def _request_batch(self, kind: str, symbols: tuple[str, ...]) -> None:
-        method = (
-            self._backend.request_quotes
-            if kind == "quotes"
-            else self._backend.request_ticks
-        )
+        method = self._backend.request_quotes if kind == "quotes" else self._backend.request_ticks
         try:
             code = self._code(method(",".join(symbols)), "subscription")
         except Exception as exc:
@@ -730,20 +700,14 @@ class CapitalQuoteStaAdapter:
 
     def _unsubscribe(self, kind: str, symbols: tuple[str, ...]) -> None:
         with self._state_condition:
-            desired = (
-                self._desired_quotes if kind == "quotes" else self._desired_ticks
-            )
+            desired = self._desired_quotes if kind == "quotes" else self._desired_ticks
             actual = self._actual_quotes if kind == "quotes" else self._actual_ticks
             requested = tuple(sorted(set(symbols) & actual))
             desired_only = set(symbols) - actual
             if not requested:
                 desired.difference_update(desired_only)
                 return
-        method = (
-            self._backend.cancel_quotes
-            if kind == "quotes"
-            else self._backend.cancel_ticks
-        )
+        method = self._backend.cancel_quotes if kind == "quotes" else self._backend.cancel_ticks
         try:
             code = self._code(method(",".join(requested)), "cancellation")
         except Exception as exc:
@@ -751,9 +715,7 @@ class CapitalQuoteStaAdapter:
             raise SubscriptionError("subscription cancellation failed") from exc
         if code != 0:
             self._health.degrade("subscription_cancellation_failure")
-            raise SubscriptionError(
-                f"subscription cancellation failed with code {code}"
-            )
+            raise SubscriptionError(f"subscription cancellation failed with code {code}")
         with self._state_condition:
             desired.difference_update(symbols)
             actual.difference_update(symbols)
@@ -772,19 +734,11 @@ class CapitalQuoteStaAdapter:
     def OnConnection(self, nKind: int, nCode: int) -> None:
         return self._current_sink.OnConnection(nKind, nCode)
 
-    def OnNotifyServerTime(
-        self, sHour: int, sMinute: int, sSecond: int, nTotal: int
-    ) -> None:
-        return self._current_sink.OnNotifyServerTime(
-            sHour, sMinute, sSecond, nTotal
-        )
+    def OnNotifyServerTime(self, sHour: int, sMinute: int, sSecond: int, nTotal: int) -> None:
+        return self._current_sink.OnNotifyServerTime(sHour, sMinute, sSecond, nTotal)
 
-    def OnNotifyStockList(
-        self, sMarketNo: int, bstrStockData: str | bytes
-    ) -> None:
-        return self._current_sink.OnNotifyStockList(
-            sMarketNo, bstrStockData
-        )
+    def OnNotifyStockList(self, sMarketNo: int, bstrStockData: str | bytes) -> None:
+        return self._current_sink.OnNotifyStockList(sMarketNo, bstrStockData)
 
     def OnNotifyQuote(self, sMarketNo: int, sStockIdx: int) -> None:
         return self._current_sink.OnNotifyQuote(sMarketNo, sStockIdx)
@@ -798,9 +752,7 @@ class CapitalQuoteStaAdapter:
     def OnNotifyTicksLONG(self, *values: int) -> None:
         return self._current_sink.OnNotifyTicksLONG(*values)
 
-    def _handle_connection(
-        self, generation: int, sequence: int, nKind: int, nCode: int
-    ) -> None:
+    def _handle_connection(self, generation: int, sequence: int, nKind: int, nCode: int) -> None:
         self._strict_callback_ints((nKind, nCode))
         received_at = self._handler_time(generation, sequence)
         with self._state_condition:
@@ -821,8 +773,7 @@ class CapitalQuoteStaAdapter:
                     self._connected_deadline = None
                     if current is ConnectionState.RECONNECTING:
                         self._stocks_ready_deadline = (
-                            self._clock.monotonic()
-                            + self._reconnect_stocks_ready_timeout
+                            self._clock.monotonic() + self._reconnect_stocks_ready_timeout
                         )
             elif nKind == _STOCKS_READY:
                 if current is ConnectionState.CONNECTED:
@@ -840,9 +791,7 @@ class CapitalQuoteStaAdapter:
                     ConnectionState.SUBSCRIBED,
                 ):
                     target = ConnectionState.DISCONNECTED
-                    in_reconnect_attempt = (
-                        self._stocks_ready_deadline is not None
-                    )
+                    in_reconnect_attempt = self._stocks_ready_deadline is not None
                     self._connected_deadline = None
                     self._stocks_ready_deadline = None
             if target is not None:
@@ -854,8 +803,7 @@ class CapitalQuoteStaAdapter:
                     if not in_reconnect_attempt:
                         self._reconnect_attempts = 0
                     self._reconnect_due = (
-                        self._clock.monotonic()
-                        + self._reconnect_policy.backoff_seconds[0]
+                        self._clock.monotonic() + self._reconnect_policy.backoff_seconds[0]
                     )
             elif is_current and nKind in (
                 _CONNECTED,
@@ -872,9 +820,7 @@ class CapitalQuoteStaAdapter:
                     raw={"kind": nKind, "code": nCode},
                 )
                 self._health.degrade("invalid_connection_transition")
-        payload = CapturedConnectionNotification(
-            nKind, nCode, sequence, received_at
-        )
+        payload = CapturedConnectionNotification(nKind, nCode, sequence, received_at)
         self._publish(
             CapturedKind.CONNECTION_NOTIFICATION,
             payload,
@@ -923,9 +869,7 @@ class CapitalQuoteStaAdapter:
         if type(bstrStockData) not in (str, bytes):
             raise TypeError("stock list callback data must be str or bytes")
         received_at = self._handler_time(generation, sequence)
-        payload = CapturedStockListNotification(
-            sMarketNo, bstrStockData, sequence, received_at
-        )
+        payload = CapturedStockListNotification(sMarketNo, bstrStockData, sequence, received_at)
         self._publish(
             CapturedKind.STOCK_LIST_NOTIFICATION,
             payload,
@@ -934,9 +878,7 @@ class CapitalQuoteStaAdapter:
             generation,
             {
                 "market_no": sMarketNo,
-                "stock_list": (
-                    bstrStockData if type(bstrStockData) is str else None
-                ),
+                "stock_list": (bstrStockData if type(bstrStockData) is str else None),
                 "stock_list_is_bytes": type(bstrStockData) is bytes,
             },
         )
@@ -1001,16 +943,27 @@ class CapitalQuoteStaAdapter:
             is_long,
         )
 
-    def _capture_tick_bound(
-        self, generation: int, sequence: int, *values: Any
-    ) -> None:
+    def _capture_tick_bound(self, generation: int, sequence: int, *values: Any) -> None:
         raw, is_long = values[:-1], values[-1]
         self._strict_callback_ints(raw)
         if type(is_long) is not bool:
             raise TypeError("is_long must be bool")
         received_at = self._handler_time(generation, sequence)
         payload = CapturedTickNotification(
-            *raw, is_long, sequence, received_at
+            market_no_raw=raw[0],
+            stock_idx_raw=raw[1],
+            source_pointer_raw=raw[2],
+            date_raw=raw[3],
+            time_hms_raw=raw[4],
+            time_subsecond_raw=raw[5],
+            bid_raw=raw[6],
+            ask_raw=raw[7],
+            close_raw=raw[8],
+            quantity_raw=raw[9],
+            simulate_raw=raw[10],
+            is_long_callback=is_long,
+            callback_sequence=sequence,
+            received_at=received_at,
         )
         names = (
             "market_no",
@@ -1081,17 +1034,13 @@ class CapitalQuoteStaAdapter:
                 processed += 1
         return processed
 
-    def _pop_quote_generation(
-        self, notification: StaLocalQuoteNotification
-    ) -> int | None:
+    def _pop_quote_generation(self, notification: StaLocalQuoteNotification) -> int | None:
         generation = self._quote_generations.pop(id(notification), None)
         if generation is None:
             self._fatal("quote_generation_token_missing")
         return generation
 
-    def _enrich_quote(
-        self, notification: StaLocalQuoteNotification, generation: int
-    ) -> None:
+    def _enrich_quote(self, notification: StaLocalQuoteNotification, generation: int) -> None:
         with self._state_condition:
             is_current = generation == self._generation
         if not is_current:
@@ -1169,9 +1118,7 @@ class CapitalQuoteStaAdapter:
                 or self._clock.monotonic() < self._resubscribe_due
             ):
                 return
-            quote_symbols = tuple(
-                sorted(self._desired_quotes - self._actual_quotes)
-            )
+            quote_symbols = tuple(sorted(self._desired_quotes - self._actual_quotes))
             tick_symbols = tuple(sorted(self._desired_ticks - self._actual_ticks))
             if not quote_symbols and not tick_symbols:
                 self._resubscribe_generation = None
@@ -1198,40 +1145,26 @@ class CapitalQuoteStaAdapter:
         self._mark_incomplete(reason)
         with self._state_condition:
             self._resubscribe_attempts += 1
-            if (
-                self._resubscribe_attempts
-                >= self._reconnect_policy.max_attempts
-            ):
+            if self._resubscribe_attempts >= self._reconnect_policy.max_attempts:
                 exhausted = True
             else:
-                delay = self._reconnect_policy.backoff_seconds[
-                    self._resubscribe_attempts
-                ]
+                delay = self._reconnect_policy.backoff_seconds[self._resubscribe_attempts]
                 self._resubscribe_due = self._clock.monotonic() + delay
                 exhausted = False
         if exhausted:
             self._fatal("resubscription_exhausted")
 
     def _subscriptions_fulfilled_locked(self) -> bool:
-        return (
-            self._desired_quotes.issubset(self._actual_quotes)
-            and self._desired_ticks.issubset(self._actual_ticks)
+        return self._desired_quotes.issubset(self._actual_quotes) and self._desired_ticks.issubset(
+            self._actual_ticks
         )
 
     def _refresh_subscription_state_locked(self) -> None:
         has_desired = bool(self._desired_quotes or self._desired_ticks)
         fulfilled = self._subscriptions_fulfilled_locked()
-        if (
-            has_desired
-            and fulfilled
-            and self._state is ConnectionState.STOCKS_READY
-        ):
+        if has_desired and fulfilled and self._state is ConnectionState.STOCKS_READY:
             self._transition_locked(ConnectionState.SUBSCRIBED)
-        elif (
-            has_desired
-            and not fulfilled
-            and self._state is ConnectionState.SUBSCRIBED
-        ):
+        elif has_desired and not fulfilled and self._state is ConnectionState.SUBSCRIBED:
             self._transition_locked(ConnectionState.STOCKS_READY)
 
     def _run_reconnect(self) -> None:
@@ -1246,9 +1179,7 @@ class CapitalQuoteStaAdapter:
             attempt = self._reconnect_attempts
         if self._monitor_active:
             try:
-                leave_code = self._code(
-                    self._backend.leave_monitor(), "leave monitor"
-                )
+                leave_code = self._code(self._backend.leave_monitor(), "leave monitor")
             except Exception:
                 leave_code = -1
             if leave_code != 0:
@@ -1265,8 +1196,7 @@ class CapitalQuoteStaAdapter:
                 self._reconnect_due = None
                 if self._state is ConnectionState.RECONNECTING:
                     self._connected_deadline = (
-                        self._clock.monotonic()
-                        + self._reconnect_connected_timeout
+                        self._clock.monotonic() + self._reconnect_connected_timeout
                     )
 
     def _run_reconnect_watchdog(self) -> None:
@@ -1294,9 +1224,7 @@ class CapitalQuoteStaAdapter:
             if not exhausted:
                 self._reconnect_due = now
         reason = (
-            "reconnect_connected_timeout"
-            if connected_expired
-            else "reconnect_stocks_ready_timeout"
+            "reconnect_connected_timeout" if connected_expired else "reconnect_stocks_ready_timeout"
         )
         self._health.degrade(reason)
         self._mark_incomplete(reason)
@@ -1312,9 +1240,7 @@ class CapitalQuoteStaAdapter:
             if self._reconnect_attempts >= self._reconnect_policy.max_attempts:
                 exhausted = True
             else:
-                delay = self._reconnect_policy.backoff_seconds[
-                    self._reconnect_attempts
-                ]
+                delay = self._reconnect_policy.backoff_seconds[self._reconnect_attempts]
                 self._reconnect_due = self._clock.monotonic() + delay
                 exhausted = False
         if exhausted:
@@ -1347,20 +1273,40 @@ class CapitalQuoteStaAdapter:
             else:
                 self._fatal("sta_shutdown_drain_unavailable")
         self._fail_pending()
+        had_active_subscriptions = bool(self._actual_ticks or self._actual_quotes)
         for actual, method in (
             (self._actual_ticks, self._backend.cancel_ticks),
             (self._actual_quotes, self._backend.cancel_quotes),
         ):
             if actual:
                 try:
-                    code = self._code(
-                        method(",".join(sorted(actual))), "cleanup"
-                    )
+                    code = self._code(method(",".join(sorted(actual))), "cleanup")
                     if code != 0:
                         cleanup_failed = True
                 except Exception:
                     cleanup_failed = True
                 actual.clear()
+        if had_active_subscriptions and self._monitor_active:
+            try:
+                for _ in range(25):
+                    self._backend.pump_waiting_messages()
+                    sleep(0.01)
+            except Exception:
+                cleanup_failed = True
+            pending_quotes = self._sta_queue.depth
+            if pending_quotes:
+                if self._objects_initialized:
+                    try:
+                        drained = self._drain_sta_quotes(
+                            max_items=pending_quotes,
+                            enrich_overflow=True,
+                        )
+                        if drained != pending_quotes or self._sta_queue.depth:
+                            self._fatal("sta_shutdown_drain_incomplete")
+                    except Exception:
+                        self._fatal("sta_shutdown_drain_failure")
+                else:
+                    self._fatal("sta_shutdown_drain_unavailable")
         if self._monitor_active:
             try:
                 code = self._code(self._backend.leave_monitor(), "cleanup")
@@ -1430,14 +1376,10 @@ class CapitalQuoteStaAdapter:
         received_at = self._now()
         with self._state_condition:
             if generation == self._generation:
-                self._callback_sequence = max(
-                    self._callback_sequence, sequence + 1
-                )
+                self._callback_sequence = max(self._callback_sequence, sequence + 1)
         return received_at
 
-    def _callback_failure(
-        self, generation: int, callback_name: str
-    ) -> None:
+    def _callback_failure(self, generation: int, callback_name: str) -> None:
         del generation, callback_name
         self._fatal("capital_callback_failure")
 
@@ -1456,7 +1398,7 @@ class CapitalQuoteStaAdapter:
     def _publish(
         self,
         kind: CapturedKind,
-        payload: object,
+        payload: IngressCapturedPayload,
         sequence: int,
         received_at: datetime,
         generation: int,
@@ -1494,10 +1436,12 @@ class CapitalQuoteStaAdapter:
         error_code: int | None = None,
         raw: dict[str, object],
     ) -> None:
+        market_no = raw.get("market_no")
+        stock_idx = raw.get("stock_idx")
         payload = CapturedAdapterDiagnostic(
             kind,
-            raw.get("market_no") if type(raw.get("market_no")) is int else None,
-            raw.get("stock_idx") if type(raw.get("stock_idx")) is int else None,
+            market_no if type(market_no) is int else None,
+            stock_idx if type(stock_idx) is int else None,
             error_code,
             message,
             received_at,
@@ -1551,7 +1495,5 @@ class CapitalQuoteStaAdapter:
     @staticmethod
     def _code(value: object, operation: str) -> int:
         if type(value) is not int:
-            raise CapitalAdapterError(
-                f"{operation} returned a non-integer status"
-            )
+            raise CapitalAdapterError(f"{operation} returned a non-integer status")
         return value

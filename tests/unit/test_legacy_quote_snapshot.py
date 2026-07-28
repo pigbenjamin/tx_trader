@@ -165,9 +165,7 @@ def test_diagnostic_is_additive_and_does_not_create_market_data():
     snapshot = projector.snapshot()
     assert snapshot["quotes"] == []
     assert snapshot["ticks"] == []
-    assert snapshot["diagnostics"][0]["raw_notification"] == {
-        "nested": {"value": 1}
-    }
+    assert snapshot["diagnostics"][0]["raw_notification"] == {"nested": {"value": 1}}
 
 
 def test_project_and_snapshot_are_thread_safe():

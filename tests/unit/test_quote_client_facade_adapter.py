@@ -153,9 +153,7 @@ def test_market_number_is_unsupported_without_adapter_call():
 
 def test_event_snapshot_is_defensive():
     original = {"server_time": None, "stock_list": None, "quotes": [{"x": 1}], "ticks": []}
-    client = QuoteClient(
-        quote_adapter=_Adapter(), event_snapshot_provider=lambda: original
-    )
+    client = QuoteClient(quote_adapter=_Adapter(), event_snapshot_provider=lambda: original)
     first = client.get_latest_event_data()
     first["quotes"][0]["x"] = 99
     assert original["quotes"][0]["x"] == 1
@@ -175,9 +173,7 @@ def test_stop_failure_is_redacted_terminal_and_idempotent():
     assert first == {
         "success": False,
         "steps": ["stop_failed"],
-        "errors": [
-            {"name": "stop", "message": "quote adapter stop failed"}
-        ],
+        "errors": [{"name": "stop", "message": "quote adapter stop failed"}],
     }
     assert secret not in repr(first)
     assert client.leave_monitor() == {

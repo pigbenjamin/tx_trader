@@ -15,9 +15,13 @@ def test_six_event_offline_fixture_sqlite_roundtrip(tmp_path) -> None:
     repository = SQLiteMarketDataRepository(tmp_path / "recording.db")
     repository.begin_session(
         RecordingSession(
-            expected[0].session_id, SCHEMA_VERSION, expected[0].source,
-            SourceMode.OFFLINE, OFFLINE_FIXTURE_TIME,
-            OFFLINE_FIXTURE_TRADING_DAY, "fixture",
+            expected[0].session_id,
+            SCHEMA_VERSION,
+            expected[0].source,
+            SourceMode.OFFLINE,
+            OFFLINE_FIXTURE_TIME,
+            OFFLINE_FIXTURE_TRADING_DAY,
+            "fixture",
         )
     )
     repository.append_batch(expected)
