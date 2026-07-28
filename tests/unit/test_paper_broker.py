@@ -25,6 +25,7 @@ from tx_trade.orders.contracts import (
     OrderStatus,
     OrderType,
     PaperBrokerLimits,
+    PaperDecision,
     PaperExecutionConfig,
     PaperEventType,
     PaperFeeRule,
@@ -144,6 +145,17 @@ def _prime(broker: PaperBroker) -> tuple[MarketDataEnvelope, MarketDataEnvelope]
     return instrument, quote
 
 
+def _decision(
+    envelope: MarketDataEnvelope,
+    *commands: OrderIntent | CancelIntent,
+) -> PaperDecision:
+    return PaperDecision(
+        source_session_id=envelope.session_id,
+        source_ingest_sequence=envelope.ingest_sequence,
+        commands=commands,
+    )
+
+
 def _execution_config(
     *,
     slippage_mode: SlippageMode = SlippageMode.NONE,
@@ -203,6 +215,9 @@ def test_submit_idempotency_conflict_cancel_and_query_ordering() -> None:
     )
     cancelled = broker.cancel(request)
     assert cancelled.status is OrderStatus.CANCELLED
+    cancellation_event = broker.snapshot().events[-1]
+    assert cancellation_event.source_session_id is None
+    assert cancellation_event.source_ingest_sequence is None
     event_count = len(broker.snapshot().events)
     assert broker.cancel(request) == cancelled
     assert len(broker.snapshot().events) == event_count
@@ -243,6 +258,92 @@ def test_exact_submit_retry_returns_current_order_without_side_effects() -> None
     cancelled_snapshot = broker.snapshot()
     assert broker.submit(cancel_intent) == cancelled
     assert broker.snapshot() == cancelled_snapshot
+
+
+def test_direct_cancel_event_preserves_request_source_causation() -> None:
+    broker = _broker()
+    intent = _intent("direct-causal-cancel", source_sequence=3)
+    order = broker.submit(intent)
+    assert not isinstance(order, PaperRejection)
+    request = CancelIntent(
+        strategy_id=intent.strategy_id,
+        client_order_id=intent.client_order_id,
+        paper_order_id=order.paper_order_id,
+        requested_at=intent.created_at,
+        source_session_id=OFFLINE_FIXTURE_SESSION_ID,
+        source_ingest_sequence=4,
+    )
+
+    cancelled = broker.cancel(request)
+
+    assert not isinstance(cancelled, PaperRejection)
+    event = broker.snapshot().events[-1]
+    assert event.event_type is PaperEventType.ORDER_CANCELLED
+    assert event.source_session_id == request.source_session_id
+    assert event.source_ingest_sequence == request.source_ingest_sequence
+
+
+@pytest.mark.parametrize("bind_with_market_data", [False, True])
+def test_direct_cancel_wrong_source_session_fails_without_state_change(
+    bind_with_market_data: bool,
+) -> None:
+    broker = _unbound_broker() if bind_with_market_data else _broker()
+    if bind_with_market_data:
+        _prime(broker)
+    intent = _intent("wrong-session-cancel")
+    order = broker.submit(intent)
+    assert not isinstance(order, PaperRejection)
+    wrong_session = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    request = CancelIntent(
+        strategy_id=intent.strategy_id,
+        client_order_id=intent.client_order_id,
+        paper_order_id=order.paper_order_id,
+        requested_at=intent.created_at,
+        source_session_id=wrong_session,
+        source_ingest_sequence=4,
+    )
+    before = canonical_json(broker.snapshot()).encode()
+
+    for _ in range(2):
+        with pytest.raises(
+            PaperBrokerInputError,
+            match="^paper cancel source session mismatch$",
+        ):
+            broker.cancel(request)
+        assert canonical_json(broker.snapshot()).encode() == before
+
+
+def test_first_sourced_cancel_establishes_unbound_effective_session_fence() -> None:
+    broker = _unbound_broker()
+    first_intent = _intent("first-sourced-cancel")
+    second_intent = _intent("second-sourced-cancel")
+    first = broker.submit(first_intent)
+    second = broker.submit(second_intent)
+    assert not isinstance(first, PaperRejection)
+    assert not isinstance(second, PaperRejection)
+    first_request = CancelIntent(
+        strategy_id=first_intent.strategy_id,
+        client_order_id=first_intent.client_order_id,
+        paper_order_id=first.paper_order_id,
+        requested_at=first_intent.created_at,
+        source_session_id=OFFLINE_FIXTURE_SESSION_ID,
+        source_ingest_sequence=3,
+    )
+    assert not isinstance(broker.cancel(first_request), PaperRejection)
+    before = broker.snapshot()
+    wrong_request = CancelIntent(
+        strategy_id=second_intent.strategy_id,
+        client_order_id=second_intent.client_order_id,
+        paper_order_id=second.paper_order_id,
+        requested_at=second_intent.created_at,
+        source_session_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        source_ingest_sequence=4,
+    )
+
+    with pytest.raises(PaperBrokerInputError, match="paper cancel source session mismatch"):
+        broker.cancel(wrong_request)
+
+    assert broker.snapshot() == before
 
 
 def test_rejected_commands_and_conflicts_are_idempotent() -> None:
@@ -1026,3 +1127,182 @@ def test_zero_incremental_fee_updates_large_fee_position_normally() -> None:
     assert position.cumulative_fees == Decimal("1e34")
     assert position.fee_currency == "TWD"
     assert broker.get_position("strategy", "paper", instrument.instrument_id) == position
+
+
+def test_decision_batch_matches_before_commands_and_new_order_waits_for_next_quote() -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    existing = broker.submit(_intent("existing", source_sequence=2))
+    assert not isinstance(existing, PaperRejection)
+    submitted = _intent("from-decision", source_sequence=quote.ingest_sequence)
+
+    batch = broker.process_decision_batch(quote, _decision(quote, submitted))
+
+    assert tuple(fill.paper_order_id for fill in batch.match_result.fills) == (
+        existing.paper_order_id,
+    )
+    assert len(batch.command_results) == 1
+    accepted = batch.command_results[0]
+    assert not isinstance(accepted, PaperRejection)
+    assert accepted.status is OrderStatus.ACCEPTED
+    assert accepted.remaining_quantity == Decimal("1")
+    assert tuple(event.event_type for event in batch.match_result.events) == (
+        PaperEventType.FILL_RECORDED,
+        PaperEventType.ORDER_FILLED,
+        PaperEventType.POSITION_CHANGED,
+    )
+    assert tuple(event.event_type for event in batch.events) == (
+        PaperEventType.FILL_RECORDED,
+        PaperEventType.ORDER_FILLED,
+        PaperEventType.POSITION_CHANGED,
+        PaperEventType.ORDER_ACCEPTED,
+    )
+    assert broker.get_order(accepted.paper_order_id) == accepted
+
+    following = broker.process_market_data(_shift_quote(quote, 4, seconds=1))
+    assert tuple(fill.paper_order_id for fill in following.fills) == (accepted.paper_order_id,)
+
+
+def test_decision_batch_applies_cancel_and_submit_in_command_order() -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    open_order = broker.submit(
+        _intent(
+            "cancel-me",
+            order_type=OrderType.LIMIT,
+            limit_price="1",
+        )
+    )
+    assert not isinstance(open_order, PaperRejection)
+    causal_time = quote.event_at or quote.received_at
+    cancel = CancelIntent(
+        strategy_id=open_order.intent.strategy_id,
+        client_order_id=open_order.intent.client_order_id,
+        paper_order_id=open_order.paper_order_id,
+        requested_at=causal_time,
+        source_session_id=quote.session_id,
+        source_ingest_sequence=quote.ingest_sequence,
+    )
+    submit = replace(
+        _intent("ordered-submit", source_sequence=quote.ingest_sequence),
+        created_at=causal_time,
+    )
+
+    batch = broker.process_decision_batch(quote, _decision(quote, cancel, submit))
+
+    cancelled, accepted = batch.command_results
+    assert not isinstance(cancelled, PaperRejection)
+    assert cancelled.status is OrderStatus.CANCELLED
+    assert not isinstance(accepted, PaperRejection)
+    assert accepted.status is OrderStatus.ACCEPTED
+    assert tuple(event.event_type for event in batch.events) == (
+        PaperEventType.ORDER_CANCELLED,
+        PaperEventType.ORDER_ACCEPTED,
+    )
+    assert tuple(event.event_type for event in broker.snapshot().events[-2:]) == (
+        PaperEventType.ORDER_CANCELLED,
+        PaperEventType.ORDER_ACCEPTED,
+    )
+    assert all(
+        event.source_session_id == quote.session_id
+        and event.source_ingest_sequence == quote.ingest_sequence
+        for event in broker.snapshot().events[-2:]
+    )
+
+
+def test_decision_batch_retry_is_duplicate_and_conflicting_decision_fails_closed() -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    decision = _decision(
+        quote,
+        _intent("once", source_sequence=quote.ingest_sequence),
+    )
+    first = broker.process_decision_batch(quote, decision)
+    before = broker.snapshot()
+
+    duplicate = broker.process_decision_batch(quote, decision)
+
+    assert duplicate.match_result.disposition is MatchDisposition.DUPLICATE
+    assert duplicate.command_results == ()
+    assert duplicate.events == ()
+    assert duplicate.decision_fingerprint == first.decision_fingerprint
+    assert broker.snapshot() == before
+
+    conflicting = _decision(
+        quote,
+        _intent("different", source_sequence=quote.ingest_sequence),
+    )
+    with pytest.raises(PaperBrokerInputError, match="paper decision content conflict"):
+        broker.process_decision_batch(quote, conflicting)
+    assert broker.snapshot() == before
+
+
+def test_direct_empty_decision_prevents_later_nonempty_batch_for_same_envelope() -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    broker.process_market_data(quote)
+    before = broker.snapshot()
+    nonempty = _decision(
+        quote,
+        _intent("too-late", source_sequence=quote.ingest_sequence),
+    )
+
+    with pytest.raises(PaperBrokerInputError, match="paper decision content conflict"):
+        broker.process_decision_batch(quote, nonempty)
+
+    assert broker.snapshot() == before
+
+
+def test_decision_batch_second_command_base_exception_rolls_back_everything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    broker.submit(_intent("will-match", source_sequence=2))
+    before = broker.snapshot()
+    first = _intent("first-staged", source_sequence=quote.ingest_sequence)
+    second = _intent("explode", source_sequence=quote.ingest_sequence)
+    original = PaperBroker._stage_batch_submit
+
+    class InjectedFailure(BaseException):
+        pass
+
+    def injected(
+        self: PaperBroker,
+        state: object,
+        intent: OrderIntent,
+        envelope: MarketDataEnvelope,
+    ) -> object:
+        if intent.client_order_id == "explode":
+            raise InjectedFailure
+        return original(self, state, intent, envelope)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(PaperBroker, "_stage_batch_submit", injected)
+    with pytest.raises(InjectedFailure):
+        broker.process_decision_batch(quote, _decision(quote, first, second))
+
+    assert broker.snapshot() == before
+
+
+def test_decision_batch_commit_base_exception_keeps_authoritative_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    before = canonical_json(broker.snapshot()).encode()
+    decision = _decision(
+        quote,
+        _intent("commit-explode", source_sequence=quote.ingest_sequence),
+    )
+
+    class CommitFailure(BaseException):
+        pass
+
+    def reject_commit(_state: object) -> None:
+        raise CommitFailure
+
+    monkeypatch.setattr(broker, "_commit", reject_commit)
+    with pytest.raises(CommitFailure):
+        broker.process_decision_batch(quote, decision)
+
+    assert canonical_json(broker.snapshot()).encode() == before

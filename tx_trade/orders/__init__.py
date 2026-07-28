@@ -24,6 +24,9 @@ from .contracts import (
     PaperFeeSchedule,
     PaperBrokerLimits,
     PaperBrokerSnapshot,
+    PaperCommand,
+    PaperDecision,
+    PaperDecisionBatchResult,
     PaperOrder,
     PaperPosition,
     PaperRejection,
@@ -34,7 +37,12 @@ from .contracts import (
     canonical_json,
     to_canonical_primitive,
 )
-from .ports import OrderCommandResult, PaperBrokerPort, PaperEventSink
+from .ports import (
+    OrderCommandResult,
+    PaperBrokerPort,
+    PaperEventSink,
+    TransactionalPaperBrokerPort,
+)
 from .state_machine import InvalidOrderTransition, can_transition, validate_order_transition
 
 __all__ = [
@@ -61,6 +69,9 @@ __all__ = [
     "PaperBrokerPort",
     "PaperBrokerLimits",
     "PaperBrokerSnapshot",
+    "PaperCommand",
+    "PaperDecision",
+    "PaperDecisionBatchResult",
     "PaperFill",
     "PaperExecutionConfig",
     "PaperFeeRule",
@@ -72,6 +83,7 @@ __all__ = [
     "SlippageConfig",
     "SlippageMode",
     "TimeInForce",
+    "TransactionalPaperBrokerPort",
     "can_transition",
     "canonical_json",
     "to_canonical_primitive",

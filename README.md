@@ -215,3 +215,36 @@ corrupt, or unsupported-schema sessions fail closed without creating a
 database. Standard output contains JSON Lines only; fixed success or failure
 summaries go to standard error. This entry point reads only the six replay
 settings above and does not read live credentials.
+
+## Phase 2B deterministic research paper replay
+
+Phase 2B-1 through 2B-4 provide immutable paper-order contracts, a
+deterministic broker and matching/fee policies, transactional strategy
+decision batches, and a standalone research-paper replay CLI. A market
+envelope and its ordered strategy commands commit to the in-memory paper
+broker as one transaction. Orders created from envelope `N` are first
+eligible on a later envelope, preventing look-ahead.
+
+The research CLI is deliberately separate from the Phase 2A replay CLI:
+
+```powershell
+.\venv_tx_trade_fresh\Scripts\python.exe -B -m tx_trade.app.research_paper `
+    > .\research-paper.jsonl
+```
+
+It requires the explicit `research_paper` preset and the strict
+`TX_TRADE_RESEARCH_PAPER_*` setting set defined by
+`tx_trade.app.research_paper_config`. All limits, execution policies, the
+paper run UUID, and the built-in instrument-triggered order template must be
+provided explicitly. Any replay cursor is rejected because a fresh in-memory
+broker cannot safely resume partway through a session.
+
+Output is buffered until replay and broker processing complete. Standard
+output then contains versioned deterministic JSON Lines in `market`, `paper`,
+and terminal `summary` records. The broker's internal event journal is the
+authoritative paper event source. Durable broker checkpoints and a durable
+output outbox are not implemented yet.
+
+This mode does not import SKCOM, create Center/Quote/Reply/Order objects, read
+live credentials or `TX_TRADE_SKCOM_DLL_PATH`, connect Reply, or submit a live
+order.

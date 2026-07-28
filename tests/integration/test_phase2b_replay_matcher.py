@@ -20,6 +20,7 @@ from tx_trade.orders.contracts import (
     OrderStatus,
     OrderType,
     PaperBrokerLimits,
+    PaperDecision,
     PaperEventType,
     PaperExecutionConfig,
     PaperFeeRule,
@@ -35,6 +36,7 @@ from tx_trade.orders.execution_policies import (
     assess_fee,
 )
 from tx_trade.orders.paper_broker import PaperBroker
+from tx_trade.orders.paper_broker import PaperBrokerInputError
 from tx_trade.replay.contracts import (
     ReplayFailureCode,
     ReplayMode,
@@ -43,6 +45,13 @@ from tx_trade.replay.contracts import (
     ReplayState,
 )
 from tx_trade.replay.runtime import ReplayRuntime
+from tx_trade.strategy import (
+    PaperReplayCoordinator,
+    StrategyContext,
+    StrategyDecision,
+    StrategyExecutionMode,
+    StrategyRegistration,
+)
 
 RUN_ID = UUID("22222222-2222-2222-2222-222222222222")
 LIMITS = PaperBrokerLimits(
@@ -451,3 +460,151 @@ def test_pre_delivery_sink_failure_keeps_cursor_and_broker_state_for_retry() -> 
     assert retried.state is ReplayState.COMPLETED
     assert retried.cursor == events[-1].ingest_sequence
     assert len(broker.snapshot().fills) == 1
+
+
+class _CountingOrderStrategy:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def decide(
+        self,
+        envelope,
+        context: StrategyContext,
+    ) -> StrategyDecision:
+        self.calls += 1
+        intent = replace(
+            _intent("coordinated-retry"),
+            created_at=context.decision_at,
+            source_session_id=envelope.session_id,
+            source_ingest_sequence=envelope.ingest_sequence,
+        )
+        return StrategyDecision(commands=(intent,))
+
+
+class _FailingStrategy:
+    def decide(self, envelope, context: StrategyContext) -> StrategyDecision:
+        raise RuntimeError("injected strategy failure")
+
+
+def test_strategy_failure_keeps_replay_cursor_and_broker_unadvanced() -> None:
+    events = make_offline_fixture_envelopes()
+    broker = _broker()
+    coordinator = PaperReplayCoordinator(
+        broker=broker,
+        registrations=(StrategyRegistration("integration-strategy", _FailingStrategy()),),
+        mode=StrategyExecutionMode.PAPER,
+        max_decision_records=len(events),
+    )
+
+    failed = _runtime(events, coordinator).run()
+
+    assert failed.state is ReplayState.FAILED
+    assert failed.failure_code is ReplayFailureCode.SINK_FAILED
+    assert failed.cursor is None
+    assert broker.snapshot().last_committed_ingest_sequence is None
+    assert coordinator.decision_count == 0
+
+
+def test_post_commit_wrapper_failure_retries_cached_decision_without_double_booking() -> None:
+    events = make_offline_fixture_envelopes()
+    broker = _broker()
+    strategy = _CountingOrderStrategy()
+
+    class FailOnceAfterCommitBroker:
+        def __init__(self) -> None:
+            self.failed = False
+
+        def submit(self, intent):
+            return broker.submit(intent)
+
+        def cancel(self, request):
+            return broker.cancel(request)
+
+        def get_order(self, paper_order_id):
+            return broker.get_order(paper_order_id)
+
+        def list_orders(self):
+            return broker.list_orders()
+
+        def list_positions(self):
+            return broker.list_positions()
+
+        def get_position(self, strategy_id, account_id, instrument_id):
+            return broker.get_position(strategy_id, account_id, instrument_id)
+
+        def snapshot(self):
+            return broker.snapshot()
+
+        def process_decision_batch(self, envelope, decision):
+            result = broker.process_decision_batch(envelope, decision)
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("injected wrapper failure after commit")
+            return result
+
+    coordinator = PaperReplayCoordinator(
+        broker=FailOnceAfterCommitBroker(),
+        registrations=(StrategyRegistration("integration-strategy", strategy),),
+        mode=StrategyExecutionMode.PAPER,
+        max_decision_records=len(events),
+    )
+    failed = _runtime(events, coordinator).run()
+    after_commit = canonical_json(broker.snapshot())
+
+    assert failed.state is ReplayState.FAILED
+    assert failed.cursor is None
+    assert broker.snapshot().last_committed_ingest_sequence == events[0].ingest_sequence
+    assert strategy.calls == 1
+
+    retried = _runtime(events, coordinator, after_ingest_sequence=failed.cursor).run()
+
+    assert retried.state is ReplayState.COMPLETED
+    assert strategy.calls == len(events)
+    assert coordinator.decision_count == len(events)
+    assert canonical_json(broker.snapshot()) != after_commit
+    assert (
+        len(
+            [
+                order
+                for order in broker.snapshot().orders
+                if order.intent.client_order_id == "coordinated-retry"
+            ]
+        )
+        == 1
+    )
+
+
+def test_decision_conflict_after_commit_is_atomic_and_journal_remains_authoritative() -> None:
+    envelope = make_offline_fixture_envelopes()[0]
+    broker = _broker()
+    intent = replace(
+        _intent("authoritative-journal"),
+        created_at=envelope.received_at,
+        source_session_id=envelope.session_id,
+        source_ingest_sequence=envelope.ingest_sequence,
+    )
+    committed_decision = PaperDecision(
+        source_session_id=envelope.session_id,
+        source_ingest_sequence=envelope.ingest_sequence,
+        commands=(intent,),
+    )
+    committed = broker.process_decision_batch(envelope, committed_decision)
+    after_commit = canonical_json(broker.snapshot()).encode()
+
+    duplicate = broker.process_decision_batch(envelope, committed_decision)
+
+    assert committed.events
+    assert duplicate.match_result.disposition is MatchDisposition.DUPLICATE
+    assert duplicate.events == ()
+    assert canonical_json(broker.snapshot()).encode() == after_commit
+    assert broker.snapshot().events[-len(committed.events) :] == committed.events
+
+    conflicting_decision = PaperDecision(
+        source_session_id=envelope.session_id,
+        source_ingest_sequence=envelope.ingest_sequence,
+        commands=(),
+    )
+    with pytest.raises(PaperBrokerInputError, match="decision content conflict"):
+        broker.process_decision_batch(envelope, conflicting_decision)
+
+    assert canonical_json(broker.snapshot()).encode() == after_commit

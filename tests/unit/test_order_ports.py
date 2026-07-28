@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from tx_trade.market_data.models import MarketDataEnvelope
 from tx_trade.orders import (
     CancelIntent,
     OrderCommandResult,
@@ -11,6 +12,9 @@ from tx_trade.orders import (
     PaperEventSink,
     PaperOrder,
     PaperPosition,
+    PaperDecision,
+    PaperDecisionBatchResult,
+    TransactionalPaperBrokerPort,
 )
 
 
@@ -47,8 +51,19 @@ class FakeEventSink:
         self.events.append(event)
 
 
+class FakeTransactionalBroker(FakeBroker):
+    def process_decision_batch(
+        self,
+        envelope: MarketDataEnvelope,
+        decision: PaperDecision,
+    ) -> PaperDecisionBatchResult:
+        raise NotImplementedError
+
+
 def test_fake_objects_structurally_satisfy_runtime_protocols() -> None:
     assert isinstance(FakeBroker(), PaperBrokerPort)
+    assert not isinstance(FakeBroker(), TransactionalPaperBrokerPort)
+    assert isinstance(FakeTransactionalBroker(), TransactionalPaperBrokerPort)
     assert isinstance(FakeEventSink(), PaperEventSink)
 
 

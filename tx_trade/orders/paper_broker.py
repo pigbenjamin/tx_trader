@@ -31,6 +31,8 @@ from .contracts import (
     OrderStatus,
     PaperBrokerLimits,
     PaperBrokerSnapshot,
+    PaperDecision,
+    PaperDecisionBatchResult,
     PaperExecutionConfig,
     PaperEvent,
     PaperEventType,
@@ -117,6 +119,7 @@ class _BrokerState:
     events: tuple[PaperEvent, ...]
     instruments: Mapping[tuple[str, int], InstrumentMetadataSnapshot]
     envelope_fingerprints: Mapping[int, str]
+    decision_fingerprints: Mapping[int, str]
     dedupe_sequences: Mapping[str, int]
 
 
@@ -170,6 +173,7 @@ class PaperBroker:
             events=(),
             instruments=_mapping(),
             envelope_fingerprints=_mapping(),
+            decision_fingerprints=_mapping(),
             dedupe_sequences=_mapping(),
         )
 
@@ -273,6 +277,8 @@ class PaperBroker:
                 PaperEventType.ORDER_ACCEPTED,
                 order,
                 intent.created_at,
+                source_session_id=intent.source_session_id,
+                source_ingest_sequence=intent.source_ingest_sequence,
             )
             orders = dict(state.orders)
             orders[order_id] = order
@@ -312,6 +318,20 @@ class PaperBroker:
         )
         with self._lock:
             state = self._state
+            if request.source_session_id is not None:
+                if (
+                    state.effective_session is not None
+                    and request.source_session_id != state.effective_session
+                ) or (
+                    state.bound_session is not None
+                    and request.source_session_id != state.bound_session
+                ):
+                    raise PaperBrokerInputError("paper cancel source session mismatch")
+                if state.effective_session is None:
+                    state = replace(
+                        state,
+                        effective_session=request.source_session_id,
+                    )
             record = state.cancel_outcomes.get(key)
             if record is not None:
                 cached = record.find(digest)
@@ -347,6 +367,8 @@ class PaperBroker:
                     event_type,
                     outcome,
                     request.requested_at,
+                    source_session_id=request.source_session_id,
+                    source_ingest_sequence=request.source_ingest_sequence,
                 )
                 orders = dict(state.orders)
                 orders[outcome.paper_order_id] = outcome
@@ -426,6 +448,27 @@ class PaperBroker:
     def process_market_data(self, envelope: MarketDataEnvelope) -> MatchResult:
         if type(envelope) is not MarketDataEnvelope:
             raise TypeError("envelope must be MarketDataEnvelope")
+        decision = PaperDecision(
+            source_session_id=envelope.session_id,
+            source_ingest_sequence=envelope.ingest_sequence,
+            commands=(),
+        )
+        return self.process_decision_batch(envelope, decision).match_result
+
+    def process_decision_batch(
+        self,
+        envelope: MarketDataEnvelope,
+        decision: PaperDecision,
+    ) -> PaperDecisionBatchResult:
+        if type(envelope) is not MarketDataEnvelope:
+            raise TypeError("envelope must be MarketDataEnvelope")
+        if type(decision) is not PaperDecision:
+            raise TypeError("decision must be PaperDecision")
+        if (
+            decision.source_session_id != envelope.session_id
+            or decision.source_ingest_sequence != envelope.ingest_sequence
+        ):
+            raise PaperBrokerInputError("paper decision source causation mismatch")
         fingerprint = sha256(serialize_envelope(envelope).encode("utf-8")).hexdigest()
         dedupe_digest = sha256(envelope.dedupe_key.encode("utf-8")).hexdigest()
         with self._lock:
@@ -437,7 +480,10 @@ class PaperBroker:
                 dedupe_digest,
             )
             if duplicate:
-                return MatchResult(
+                prior_decision = state.decision_fingerprints.get(envelope.ingest_sequence)
+                if prior_decision != decision.decision_fingerprint:
+                    raise PaperBrokerInputError("paper decision content conflict")
+                match_result = MatchResult(
                     paper_run_id=self._paper_run_id,
                     disposition=MatchDisposition.DUPLICATE,
                     source_session_id=envelope.session_id,
@@ -446,6 +492,15 @@ class PaperBroker:
                     events=(),
                     skip_reasons=(),
                     snapshot_version=state.snapshot_version,
+                )
+                return PaperDecisionBatchResult(
+                    paper_run_id=self._paper_run_id,
+                    source_session_id=envelope.session_id,
+                    source_ingest_sequence=envelope.ingest_sequence,
+                    decision_fingerprint=decision.decision_fingerprint,
+                    match_result=match_result,
+                    command_results=(),
+                    events=(),
                 )
             if len(state.envelope_fingerprints) >= self._limits.max_market_data_records:
                 raise PaperBrokerCapacityError("market-data record capacity was exceeded")
@@ -517,10 +572,6 @@ class PaperBroker:
                 or len(positions) > self._limits.max_positions
             ):
                 raise PaperBrokerCapacityError("market-data batch exceeds paper broker capacity")
-            fingerprints = dict(state.envelope_fingerprints)
-            fingerprints[envelope.ingest_sequence] = fingerprint
-            dedupe_sequences = dict(state.dedupe_sequences)
-            dedupe_sequences[dedupe_digest] = envelope.ingest_sequence
             staged = replace(
                 state,
                 effective_session=envelope.session_id,
@@ -528,16 +579,38 @@ class PaperBroker:
                 bound_source=envelope.source,
                 last_sequence=envelope.ingest_sequence,
                 next_paper_sequence=next_sequence,
-                snapshot_version=state.snapshot_version + 1,
                 orders=_mapping(orders),
                 positions=_mapping(positions),
                 fills=tuple(fills),
                 events=tuple(events),
                 instruments=_mapping(instruments),
+            )
+            command_event_start = len(staged.events)
+            command_results: list[OrderCommandResult] = []
+            for command in decision.commands:
+                staged, outcome = self._stage_batch_command(staged, command, envelope)
+                command_results.append(outcome)
+
+            if (
+                len(staged.fills) > self._limits.max_fills
+                or len(staged.events) > self._limits.max_events
+                or len(staged.positions) > self._limits.max_positions
+            ):
+                raise PaperBrokerCapacityError("paper decision batch exceeds paper broker capacity")
+            fingerprints = dict(state.envelope_fingerprints)
+            fingerprints[envelope.ingest_sequence] = fingerprint
+            decision_fingerprints = dict(state.decision_fingerprints)
+            decision_fingerprints[envelope.ingest_sequence] = decision.decision_fingerprint
+            dedupe_sequences = dict(state.dedupe_sequences)
+            dedupe_sequences[dedupe_digest] = envelope.ingest_sequence
+            staged = replace(
+                staged,
+                snapshot_version=state.snapshot_version + 1,
                 envelope_fingerprints=_mapping(fingerprints),
+                decision_fingerprints=_mapping(decision_fingerprints),
                 dedupe_sequences=_mapping(dedupe_sequences),
             )
-            result = MatchResult(
+            match_result = MatchResult(
                 paper_run_id=self._paper_run_id,
                 disposition=MatchDisposition.PROCESSED,
                 source_session_id=envelope.session_id,
@@ -548,8 +621,212 @@ class PaperBroker:
                 snapshot_version=staged.snapshot_version,
                 positions=tuple(result_positions),
             )
+            result = PaperDecisionBatchResult(
+                paper_run_id=self._paper_run_id,
+                source_session_id=envelope.session_id,
+                source_ingest_sequence=envelope.ingest_sequence,
+                decision_fingerprint=decision.decision_fingerprint,
+                match_result=match_result,
+                command_results=tuple(command_results),
+                events=tuple(result_events) + staged.events[command_event_start:],
+            )
             self._commit(staged)
             return result
+
+    def _stage_batch_command(
+        self,
+        state: _BrokerState,
+        command: OrderIntent | CancelIntent,
+        envelope: MarketDataEnvelope,
+    ) -> tuple[_BrokerState, OrderCommandResult]:
+        if isinstance(command, OrderIntent):
+            return self._stage_batch_submit(state, command, envelope)
+        return self._stage_batch_cancel(state, command, envelope)
+
+    def _stage_batch_submit(
+        self,
+        state: _BrokerState,
+        intent: OrderIntent,
+        envelope: MarketDataEnvelope,
+    ) -> tuple[_BrokerState, OrderCommandResult]:
+        digest = _command_digest(intent)
+        key = (intent.strategy_id, intent.client_order_id)
+        record = state.submit_outcomes.get(key)
+        if record is not None:
+            cached = record.find(digest)
+            if cached is not None:
+                return state, self._resolve_cached_outcome(state, cached)
+            conflict = self._rejection_value(
+                intent.strategy_id,
+                intent.client_order_id,
+                RejectionCode.IDEMPOTENCY_CONFLICT,
+                intent.created_at,
+                self._order_id(*key),
+            )
+            if record.has_alternate:
+                return state, conflict
+            outcomes = dict(state.submit_outcomes)
+            outcomes[key] = replace(
+                record,
+                alternate_digest=digest,
+                alternate_outcome=conflict,
+            )
+            staged = replace(state, submit_outcomes=_mapping(outcomes))
+            return self._stage_batch_rejection(staged, conflict, envelope), conflict
+
+        if len(state.submit_outcomes) >= self._limits.max_orders:
+            rejection = self._rejection_value(
+                intent.strategy_id,
+                intent.client_order_id,
+                RejectionCode.CAPACITY_EXCEEDED,
+                intent.created_at,
+                self._order_id(*key),
+            )
+            return state, rejection
+
+        if (
+            len(state.orders) >= self._limits.max_orders
+            or self._open_order_count(state) >= self._limits.max_open_orders
+            or len(state.events) >= self._limits.max_events
+        ):
+            rejection = self._rejection_value(
+                intent.strategy_id,
+                intent.client_order_id,
+                RejectionCode.CAPACITY_EXCEEDED,
+                intent.created_at,
+                self._order_id(*key),
+            )
+            outcomes = dict(state.submit_outcomes)
+            outcomes[key] = _OutcomeRecord(digest, rejection)
+            staged = replace(state, submit_outcomes=_mapping(outcomes))
+            return self._stage_batch_rejection(staged, rejection, envelope), rejection
+
+        order_id = self._order_id(*key)
+        with localcontext(MATCHING_CONTEXT):
+            order = PaperOrder(
+                paper_run_id=self._paper_run_id,
+                paper_order_id=order_id,
+                intent=intent,
+                status=OrderStatus.ACCEPTED,
+                filled_quantity=Decimal(0),
+                remaining_quantity=intent.quantity,
+                average_fill_price=None,
+                accepted_at=intent.created_at,
+                updated_at=intent.created_at,
+            )
+        event = self._make_event(
+            state.next_paper_sequence,
+            PaperEventType.ORDER_ACCEPTED,
+            order,
+            intent.created_at,
+            envelope,
+        )
+        orders = dict(state.orders)
+        orders[order_id] = order
+        outcomes = dict(state.submit_outcomes)
+        outcomes[key] = _OutcomeRecord(digest, order)
+        ordinals = dict(state.acceptance_ordinal)
+        ordinals[order_id] = state.next_acceptance_ordinal
+        eligibility = dict(state.eligibility_sequence)
+        eligibility[order_id] = envelope.ingest_sequence
+        return (
+            replace(
+                state,
+                orders=_mapping(orders),
+                submit_outcomes=_mapping(outcomes),
+                acceptance_ordinal=_mapping(ordinals),
+                eligibility_sequence=_mapping(eligibility),
+                next_acceptance_ordinal=state.next_acceptance_ordinal + 1,
+                events=state.events + (event,),
+                next_paper_sequence=state.next_paper_sequence + 1,
+            ),
+            order,
+        )
+
+    def _stage_batch_cancel(
+        self,
+        state: _BrokerState,
+        request: CancelIntent,
+        envelope: MarketDataEnvelope,
+    ) -> tuple[_BrokerState, OrderCommandResult]:
+        digest = _command_digest(request)
+        key = (
+            request.paper_order_id,
+            request.strategy_id,
+            request.client_order_id,
+        )
+        record = state.cancel_outcomes.get(key)
+        if record is not None:
+            cached = record.find(digest)
+            if cached is not None:
+                return state, self._resolve_cached_outcome(state, cached)
+
+        outcome, event_type = self._evaluate_cancel(state, request)
+        if isinstance(outcome, PaperOrder) and event_type is None:
+            return state, outcome
+
+        can_cache = (record is None and len(state.cancel_outcomes) < self._limits.max_orders) or (
+            record is not None and not record.has_alternate
+        )
+        staged = state
+        if can_cache:
+            outcomes = dict(state.cancel_outcomes)
+            if record is None:
+                outcomes[key] = _OutcomeRecord(digest, outcome)
+            else:
+                outcomes[key] = replace(
+                    record,
+                    alternate_digest=digest,
+                    alternate_outcome=outcome,
+                )
+            staged = replace(state, cancel_outcomes=_mapping(outcomes))
+
+        if event_type is not None:
+            assert isinstance(outcome, PaperOrder)
+            event = self._make_event(
+                staged.next_paper_sequence,
+                event_type,
+                outcome,
+                request.requested_at,
+                envelope,
+            )
+            orders = dict(staged.orders)
+            orders[outcome.paper_order_id] = outcome
+            return (
+                replace(
+                    staged,
+                    orders=_mapping(orders),
+                    events=staged.events + (event,),
+                    next_paper_sequence=staged.next_paper_sequence + 1,
+                ),
+                outcome,
+            )
+
+        assert isinstance(outcome, PaperRejection)
+        if not can_cache:
+            return staged, outcome
+        return self._stage_batch_rejection(staged, outcome, envelope), outcome
+
+    def _stage_batch_rejection(
+        self,
+        state: _BrokerState,
+        rejection: PaperRejection,
+        envelope: MarketDataEnvelope,
+    ) -> _BrokerState:
+        if len(state.events) >= self._limits.max_events:
+            return state
+        event = self._make_event(
+            state.next_paper_sequence,
+            PaperEventType.ORDER_REJECTED,
+            rejection,
+            rejection.rejected_at,
+            envelope,
+        )
+        return replace(
+            state,
+            events=state.events + (event,),
+            next_paper_sequence=state.next_paper_sequence + 1,
+        )
 
     def _stage_matches(
         self,
@@ -908,7 +1185,13 @@ class PaperBroker:
         payload: PaperOrder | PaperFill | PaperPosition | PaperRejection,
         occurred_at: datetime,
         envelope: MarketDataEnvelope | None = None,
+        *,
+        source_session_id: UUID | None = None,
+        source_ingest_sequence: int | None = None,
     ) -> PaperEvent:
+        if envelope is not None:
+            source_session_id = envelope.session_id
+            source_ingest_sequence = envelope.ingest_sequence
         return PaperEvent(
             paper_run_id=self._paper_run_id,
             paper_event_id=self._uuid("event", str(sequence), event_type.value),
@@ -916,8 +1199,8 @@ class PaperBroker:
             event_type=event_type,
             payload=payload,
             occurred_at=occurred_at,
-            source_session_id=None if envelope is None else envelope.session_id,
-            source_ingest_sequence=(None if envelope is None else envelope.ingest_sequence),
+            source_session_id=source_session_id,
+            source_ingest_sequence=source_ingest_sequence,
         )
 
     def _commit(self, staged_state: _BrokerState) -> None:

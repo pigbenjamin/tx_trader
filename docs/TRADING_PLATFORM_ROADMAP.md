@@ -709,3 +709,16 @@ composition root 與 `python -m tx_trade.app.phase2` CLI。它只接受既存
 SQLite DB、明確 session UUID、FASTEST/PACED、speed 與 optional exclusive
 cursor；stdout 只輸出 canonical JSON Lines。此入口不沿用 Phase 1
 composition、不讀 live credential、不載入 COM。
+# Phase 2B-4 status update (2026-07-28)
+
+- Phase 2B-1 through 2B-3 are complete: paper order/state contracts,
+  deterministic matching and execution policies, and paper positions.
+- Phase 2B-4 now adds transactional market-plus-strategy decision batches, a
+  declarative strategy coordinator, a strict `research_paper` configuration,
+  a read-only SQLite composition root, and buffered versioned JSONL output.
+- The paper broker's bounded in-memory event journal is the authoritative
+  event source. A replay cursor is rejected for paper runs because durable
+  broker checkpoint restoration does not exist yet.
+- Durable paper checkpoints and a durable output outbox remain future work.
+- Research paper mode remains isolated from SKCOM, live credentials,
+  Center/Quote/Reply/Order creation, Reply connections, and live orders.

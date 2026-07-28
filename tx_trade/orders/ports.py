@@ -5,9 +5,13 @@ from __future__ import annotations
 from typing import Protocol, TypeAlias, runtime_checkable
 from uuid import UUID
 
+from tx_trade.market_data.models import MarketDataEnvelope
+
 from .contracts import (
     CancelIntent,
     OrderIntent,
+    PaperDecision,
+    PaperDecisionBatchResult,
     PaperEvent,
     PaperOrder,
     PaperPosition,
@@ -35,6 +39,15 @@ class PaperBrokerPort(Protocol):
         account_id: str,
         instrument_id: str,
     ) -> PaperPosition | None: ...
+
+
+@runtime_checkable
+class TransactionalPaperBrokerPort(PaperBrokerPort, Protocol):
+    def process_decision_batch(
+        self,
+        envelope: MarketDataEnvelope,
+        decision: PaperDecision,
+    ) -> PaperDecisionBatchResult: ...
 
 
 @runtime_checkable

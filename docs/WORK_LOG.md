@@ -377,3 +377,34 @@
 - 第一版 CLI 不接受任意命令列參數，所有設定經 replay-only whitelist
   parser；未知 argv fail closed。
 - Phase 2B PaperBroker 仍未開始。
+# 2026-07-28: Phase 2B-4 transactional research paper replay
+
+Scope:
+
+- Complete the next Phase 2B slice without changing the existing Phase 2A
+  replay CLI or enabling live execution.
+
+Delivered:
+
+- Immutable ordered `PaperDecision` batches with decision fingerprints and
+  retry/conflict fences.
+- Atomic PaperBroker processing: existing-order matching and the current
+  envelope's ordered strategy commands commit together.
+- Declarative strategy contracts, deterministic coordinator caching, and an
+  instrument-triggered built-in research strategy.
+- Strict, explicit `TX_TRADE_RESEARCH_PAPER_*` settings; any replay cursor is
+  rejected.
+- A synchronous read-only SQLite composition and standalone
+  `python -m tx_trade.app.research_paper` CLI.
+- Buffered deterministic `market`, authoritative `paper`, and terminal
+  `summary` JSONL records.
+- Import/security and failure-injection coverage for COM isolation,
+  transaction rollback, retry idempotency, and byte-identical reruns.
+
+Boundaries:
+
+- No SKCOM/Capital import, credentials, DLL path, Reply connection, Order
+  object, callback, or live order path.
+- The internal bounded broker journal is authoritative. Durable broker
+  checkpoints and a durable output outbox are intentionally deferred.
+- `phase1_smoke.sqlite3` is unrelated local data and remains untouched.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from hashlib import sha256
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum, StrEnum
@@ -394,12 +394,49 @@ class CancelIntent:
     client_order_id: str
     paper_order_id: UUID
     requested_at: datetime
+    source_session_id: UUID | None = None
+    source_ingest_sequence: int | None = None
 
     def __post_init__(self) -> None:
         _strict_string(self.strategy_id, "strategy_id")
         _strict_string(self.client_order_id, "client_order_id")
         _strict_uuid(self.paper_order_id, "paper_order_id")
         _taipei_datetime(self.requested_at, "requested_at")
+        _source_pair(self.source_session_id, self.source_ingest_sequence)
+
+
+PaperCommand: TypeAlias = OrderIntent | CancelIntent
+
+
+@dataclass(frozen=True, slots=True)
+class PaperDecision:
+    source_session_id: UUID
+    source_ingest_sequence: int
+    commands: tuple[PaperCommand, ...]
+    decision_fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        _strict_uuid(self.source_session_id, "source_session_id")
+        _nonnegative_int(self.source_ingest_sequence, "source_ingest_sequence")
+        if type(self.commands) is not tuple:
+            raise TypeError("commands must be a tuple")
+        if any(type(command) not in {OrderIntent, CancelIntent} for command in self.commands):
+            raise TypeError("commands must contain only OrderIntent or CancelIntent")
+        for command in self.commands:
+            if (
+                command.source_session_id != self.source_session_id
+                or command.source_ingest_sequence != self.source_ingest_sequence
+            ):
+                raise ValueError("command source causation must match decision")
+        object.__setattr__(
+            self,
+            "decision_fingerprint",
+            _paper_decision_fingerprint(
+                self.source_session_id,
+                self.source_ingest_sequence,
+                self.commands,
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -742,6 +779,59 @@ class MatchResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PaperDecisionBatchResult:
+    paper_run_id: UUID
+    source_session_id: UUID
+    source_ingest_sequence: int
+    decision_fingerprint: str
+    match_result: MatchResult
+    command_results: tuple[PaperOrder | PaperRejection, ...]
+    events: tuple[PaperEvent, ...]
+
+    def __post_init__(self) -> None:
+        _strict_uuid(self.paper_run_id, "paper_run_id")
+        _strict_uuid(self.source_session_id, "source_session_id")
+        _nonnegative_int(self.source_ingest_sequence, "source_ingest_sequence")
+        _fingerprint(self.decision_fingerprint, "decision_fingerprint")
+        if type(self.match_result) is not MatchResult:
+            raise TypeError("match_result must be MatchResult")
+        if type(self.command_results) is not tuple:
+            raise TypeError("command_results must be a tuple")
+        if any(type(result) not in {PaperOrder, PaperRejection} for result in self.command_results):
+            raise TypeError("command_results must contain only PaperOrder or PaperRejection")
+        _strict_contract_tuple(self.events, PaperEvent, "events")
+        if self.match_result.paper_run_id != self.paper_run_id:
+            raise ValueError("match_result paper_run_id must match batch result")
+        if (
+            self.match_result.source_session_id != self.source_session_id
+            or self.match_result.source_ingest_sequence != self.source_ingest_sequence
+        ):
+            raise ValueError("match_result source causation must match batch result")
+        for result in self.command_results:
+            if result.paper_run_id != self.paper_run_id:
+                raise ValueError("command result paper_run_id must match batch result")
+        if self.events[: len(self.match_result.events)] != self.match_result.events:
+            raise ValueError("batch events must start with match_result events")
+        for event in self.events:
+            if event.paper_run_id != self.paper_run_id:
+                raise ValueError("event paper_run_id must match batch result")
+            if (
+                event.source_session_id != self.source_session_id
+                or event.source_ingest_sequence != self.source_ingest_sequence
+            ):
+                raise ValueError("event source causation must match batch result")
+        if any(
+            left.paper_sequence >= right.paper_sequence
+            for left, right in zip(self.events, self.events[1:], strict=False)
+        ):
+            raise ValueError("events must have strictly increasing paper_sequence")
+        if self.match_result.disposition is MatchDisposition.DUPLICATE and (
+            self.command_results or self.events
+        ):
+            raise ValueError("duplicate batch results must not contain command results or events")
+
+
+@dataclass(frozen=True, slots=True)
 class PaperBrokerSnapshot:
     paper_run_id: UUID
     bound_source_session_id: UUID | None
@@ -807,6 +897,26 @@ def _strict_contract_tuple(value: Any, item_type: type[Enum] | type[Any], name: 
         raise TypeError(f"{name} must be a tuple")
     if any(type(item) is not item_type for item in value):
         raise TypeError(f"{name} must contain only {item_type.__name__}")
+
+
+def _paper_decision_fingerprint(
+    source_session_id: UUID,
+    source_ingest_sequence: int,
+    commands: tuple[PaperCommand, ...],
+) -> str:
+    payload = {
+        "commands": to_canonical_primitive(commands),
+        "source_ingest_sequence": source_ingest_sequence,
+        "source_session_id": str(source_session_id),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    digest = sha256(b"tx_trade.paper.decision.v1:" + encoded).hexdigest()
+    return f"sha256:{digest}"
 
 
 def to_canonical_primitive(value: Any) -> Any:
@@ -890,9 +1000,11 @@ def canonical_json(
         | PaperEvent
         | OrderIntent
         | CancelIntent
+        | PaperDecision
         | InstrumentMetadataSnapshot
         | PaperBrokerLimits
         | MatchResult
+        | PaperDecisionBatchResult
         | PaperBrokerSnapshot
     ),
 ) -> str:

@@ -10,6 +10,12 @@ from pathlib import Path
 import pytest
 
 ORDER_ROOT = Path("tx_trade/orders")
+RESEARCH_PAPER_PATHS = (
+    *sorted(Path("tx_trade/strategy").rglob("*.py")),
+    Path("tx_trade/app/research_paper_config.py"),
+    Path("tx_trade/app/research_output.py"),
+    Path("tx_trade/app/research_paper.py"),
+)
 SENSITIVE_ENV_NAMES = (
     "TX_TRADE_ACCOUNT",
     "TX_TRADE_PASSWORD",
@@ -131,6 +137,12 @@ def test_order_sources_have_no_live_execution_or_credential_symbols() -> None:
 
 def test_order_sources_have_no_random_or_wall_clock_dependencies() -> None:
     for path in sorted(ORDER_ROOT.rglob("*.py")):
+        findings = _nondeterministic_dependencies(path.read_text(encoding="utf-8"))
+        assert findings == set(), f"{path}: {sorted(findings)}"
+
+
+def test_research_paper_sources_have_no_random_or_wall_clock_dependencies() -> None:
+    for path in RESEARCH_PAPER_PATHS:
         findings = _nondeterministic_dependencies(path.read_text(encoding="utf-8"))
         assert findings == set(), f"{path}: {sorted(findings)}"
 

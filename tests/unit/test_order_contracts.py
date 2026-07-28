@@ -161,6 +161,31 @@ def test_cancel_intent_is_strict_immutable_and_canonical() -> None:
         replace(request, requested_at=NOW.replace(tzinfo=None))
 
 
+def test_cancel_intent_source_causation_is_optional_but_must_be_a_complete_pair() -> None:
+    request = CancelIntent(
+        strategy_id="strategy-a",
+        client_order_id="client-1",
+        paper_order_id=ORDER_ID,
+        requested_at=NOW,
+    )
+    caused = replace(
+        request,
+        source_session_id=SESSION_ID,
+        source_ingest_sequence=7,
+    )
+
+    assert request.source_session_id is None
+    assert caused.source_ingest_sequence == 7
+    with pytest.raises(ValueError, match="provided together"):
+        replace(request, source_session_id=SESSION_ID)
+    with pytest.raises(TypeError, match="source_ingest_sequence must be an integer"):
+        replace(
+            request,
+            source_session_id=SESSION_ID,
+            source_ingest_sequence=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
