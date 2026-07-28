@@ -4,20 +4,35 @@ from dataclasses import replace
 from decimal import Decimal
 from uuid import UUID
 
+import pytest
+
 from tx_trade.market_data.fixtures import (
     InMemoryReplaySource,
     make_offline_fixture_envelopes,
 )
-from tx_trade.market_data.models import SCHEMA_VERSION, EventType, Quote
+from tx_trade.market_data.models import SCHEMA_VERSION, EventType, Instrument, Quote
 from tx_trade.orders.contracts import (
+    FeePolicyKind,
+    FeeRoundingMode,
     MatchDisposition,
     OrderIntent,
     OrderSide,
     OrderStatus,
     OrderType,
     PaperBrokerLimits,
+    PaperEventType,
+    PaperExecutionConfig,
+    PaperFeeRule,
+    PaperFeeSchedule,
+    SlippageConfig,
+    SlippageMode,
     TimeInForce,
     canonical_json,
+)
+from tx_trade.orders.execution_policies import (
+    ExecutionPolicyError,
+    ExecutionPolicyErrorCode,
+    assess_fee,
 )
 from tx_trade.orders.paper_broker import PaperBroker
 from tx_trade.replay.contracts import (
@@ -40,12 +55,17 @@ LIMITS = PaperBrokerLimits(
 )
 
 
-def _broker() -> PaperBroker:
+def _broker(
+    *,
+    limits: PaperBrokerLimits = LIMITS,
+    execution_config: PaperExecutionConfig | None = None,
+) -> PaperBroker:
     events = make_offline_fixture_envelopes()
     return PaperBroker(
         paper_run_id=RUN_ID,
         expected_source_session_id=events[0].session_id,
-        limits=LIMITS,
+        limits=limits,
+        execution_config=execution_config,
     )
 
 
@@ -101,6 +121,31 @@ def _canonical_journal(broker: PaperBroker) -> bytes:
     return ("[" + ",".join(canonical_json(event) for event in events) + "]").encode()
 
 
+def _execution_config() -> PaperExecutionConfig:
+    instrument = make_offline_fixture_envelopes()[2].payload
+    assert isinstance(instrument, Instrument)
+    return PaperExecutionConfig(
+        slippage=SlippageConfig(
+            mode=SlippageMode.BASIS_POINTS,
+            value=Decimal("10"),
+        ),
+        fee_schedule=PaperFeeSchedule(
+            kind=FeePolicyKind.PER_UNIT,
+            rules=(
+                PaperFeeRule(
+                    instrument_id=instrument.instrument_id,
+                    currency="TWD",
+                    amount_per_unit=Decimal("0.6"),
+                    quantum=Decimal("0.01"),
+                    rounding_mode=FeeRoundingMode.ROUND_HALF_UP,
+                    policy_id="phase2b3-integration",
+                    policy_version="1",
+                ),
+            ),
+        ),
+    )
+
+
 def test_complete_replay_is_byte_deterministic_with_direct_broker_sink() -> None:
     events = make_offline_fixture_envelopes()
     journals: list[bytes] = []
@@ -116,6 +161,48 @@ def test_complete_replay_is_byte_deterministic_with_direct_broker_sink() -> None
         journals.append(_canonical_journal(broker))
 
     assert journals[0] == journals[1]
+
+
+def test_nonzero_execution_replay_is_byte_deterministic_and_auditable() -> None:
+    events = make_offline_fixture_envelopes()
+    config = _execution_config()
+    journals: list[bytes] = []
+    snapshots: list[bytes] = []
+
+    for _ in range(2):
+        broker = _broker(execution_config=config)
+        broker.submit(_intent("priced-replay"))
+        result = _runtime(events, broker).run()
+        snapshot = broker.snapshot()
+
+        assert result.state is ReplayState.COMPLETED
+        assert result.cursor == events[-1].ingest_sequence
+        assert snapshot.execution_config_fingerprint == config.fingerprint
+        assert len(snapshot.fills) == len(snapshot.positions) == 1
+        fill = snapshot.fills[0]
+        position = snapshot.positions[0]
+        assert fill.reference_price == Decimal("20002.00")
+        assert fill.execution_price == Decimal("20022.002")
+        assert fill.slippage_amount == Decimal("20.002")
+        assert fill.execution_config_fingerprint == config.fingerprint
+        assert fill.fee == Decimal("1.20")
+        assert fill.fee_currency == "TWD"
+        assert position.net_quantity == Decimal("2")
+        assert position.average_open_price == fill.execution_price
+        assert position.cumulative_fees == fill.fee
+        assert position.fee_currency == fill.fee_currency
+        assert position.version == 1
+        assert [event.event_type for event in snapshot.events[-3:]] == [
+            PaperEventType.FILL_RECORDED,
+            PaperEventType.ORDER_FILLED,
+            PaperEventType.POSITION_CHANGED,
+        ]
+        assert snapshot.events[-1].payload == position
+        journals.append(_canonical_journal(broker))
+        snapshots.append(canonical_json(snapshot).encode())
+
+    assert journals[0] == journals[1]
+    assert snapshots[0] == snapshots[1]
 
 
 def test_sequence_gaps_and_non_quotes_preserve_matching_causality() -> None:
@@ -172,6 +259,166 @@ def test_exact_duplicate_direct_delivery_does_not_duplicate_fill() -> None:
     assert duplicate.disposition is MatchDisposition.DUPLICATE
     assert duplicate.fills == ()
     assert broker.snapshot() == before
+
+
+def test_post_commit_sink_failure_retries_quote_as_duplicate_without_double_booking() -> None:
+    events = make_offline_fixture_envelopes()
+    broker = _broker(execution_config=_execution_config())
+    broker.submit(_intent("post-commit-retry"))
+    failed_envelope = events[3]
+
+    class FailAfterQuoteCommitSink:
+        def publish(self, envelope) -> None:
+            broker.process_market_data(envelope)
+            if envelope is failed_envelope:
+                raise RuntimeError("injected after broker commit")
+
+    failed = _runtime(events, FailAfterQuoteCommitSink()).run()
+    after_failure = broker.snapshot()
+
+    assert failed.state is ReplayState.FAILED
+    assert failed.failure_code is ReplayFailureCode.SINK_FAILED
+    assert failed.cursor == events[2].ingest_sequence
+    assert after_failure.last_committed_ingest_sequence == failed_envelope.ingest_sequence
+    assert len(after_failure.fills) == len(after_failure.positions) == 1
+    fill_count = len(after_failure.fills)
+    event_count = len(after_failure.events)
+    position = after_failure.positions[0]
+
+    dispositions: list[MatchDisposition] = []
+
+    class ObservingRetrySink:
+        def publish(self, envelope) -> None:
+            dispositions.append(broker.process_market_data(envelope).disposition)
+
+    retried = _runtime(
+        events,
+        ObservingRetrySink(),
+        after_ingest_sequence=failed.cursor,
+    ).run()
+    final = broker.snapshot()
+
+    assert retried.state is ReplayState.COMPLETED
+    assert retried.cursor == events[-1].ingest_sequence
+    assert dispositions[0] is MatchDisposition.DUPLICATE
+    assert len(final.fills) == fill_count
+    assert len(final.events) == event_count
+    assert len(final.positions) == 1
+    assert final.positions[0] == position
+
+
+def test_policy_failure_rolls_back_quote_and_keeps_replay_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = make_offline_fixture_envelopes()
+    broker = _broker(execution_config=_execution_config())
+    broker.submit(_intent("policy-rollback"))
+    before_quote: list[bytes] = []
+
+    def fail_fee(*args: object, **kwargs: object) -> object:
+        raise ArithmeticError("injected fee arithmetic failure")
+
+    monkeypatch.setattr("tx_trade.orders.paper_broker.assess_fee", fail_fee)
+
+    class SnapshotBeforeDeliverySink:
+        def publish(self, envelope) -> None:
+            if envelope is events[3]:
+                before_quote.append(canonical_json(broker.snapshot()).encode())
+            broker.process_market_data(envelope)
+
+    failed = _runtime(events, SnapshotBeforeDeliverySink()).run()
+
+    assert failed.state is ReplayState.FAILED
+    assert failed.failure_code is ReplayFailureCode.SINK_FAILED
+    assert failed.cursor == events[2].ingest_sequence
+    assert canonical_json(broker.snapshot()).encode() == before_quote[0]
+    assert broker.snapshot().fills == broker.snapshot().positions == ()
+
+
+def test_second_fifo_fee_arithmetic_failure_rolls_back_staged_fill_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = make_offline_fixture_envelopes()
+    config = _execution_config()
+    broker = _broker(execution_config=config)
+    intents = (_intent("fifo-first"), _intent("fifo-second"))
+    for intent in intents:
+        broker.submit(intent)
+    before_quote: list[bytes] = []
+    fee_calls = 0
+
+    def fail_second_fee(*args: object, **kwargs: object) -> object:
+        nonlocal fee_calls
+        fee_calls += 1
+        if fee_calls == 2:
+            raise ExecutionPolicyError(ExecutionPolicyErrorCode.ARITHMETIC_FAILURE)
+        return assess_fee(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "tx_trade.orders.paper_broker.assess_fee",
+        fail_second_fee,
+    )
+
+    class SnapshotBeforeDeliverySink:
+        def publish(self, envelope) -> None:
+            if envelope is events[3]:
+                before_quote.append(canonical_json(broker.snapshot()).encode())
+            broker.process_market_data(envelope)
+
+    failed = _runtime(events, SnapshotBeforeDeliverySink()).run()
+
+    assert failed.state is ReplayState.FAILED
+    assert failed.failure_code is ReplayFailureCode.SINK_FAILED
+    assert failed.cursor == events[2].ingest_sequence
+    assert fee_calls == 2
+    assert canonical_json(broker.snapshot()).encode() == before_quote[0]
+    assert broker.snapshot().fills == broker.snapshot().positions == ()
+
+    monkeypatch.setattr("tx_trade.orders.paper_broker.assess_fee", assess_fee)
+    retried = _runtime(
+        events,
+        broker,
+        after_ingest_sequence=failed.cursor,
+    ).run()
+
+    clean = _broker(execution_config=config)
+    for intent in intents:
+        clean.submit(intent)
+    clean_result = _runtime(events, clean).run()
+
+    assert retried.state is ReplayState.COMPLETED
+    assert retried.cursor == events[-1].ingest_sequence
+    assert clean_result.state is ReplayState.COMPLETED
+    assert len(broker.snapshot().fills) == 2
+    assert broker.snapshot().positions[0].version == 2
+    assert canonical_json(broker.snapshot()) == canonical_json(clean.snapshot())
+
+
+def test_position_capacity_failure_rolls_back_whole_quote_batch_and_cursor() -> None:
+    events = make_offline_fixture_envelopes()
+    limits = replace(LIMITS, max_positions=1)
+    broker = _broker(limits=limits)
+    broker.submit(_intent("position-one"))
+    second = replace(
+        _intent("position-two"),
+        strategy_id="second-integration-strategy",
+    )
+    broker.submit(second)
+    before_quote: list[bytes] = []
+
+    class SnapshotBeforeDeliverySink:
+        def publish(self, envelope) -> None:
+            if envelope is events[3]:
+                before_quote.append(canonical_json(broker.snapshot()).encode())
+            broker.process_market_data(envelope)
+
+    failed = _runtime(events, SnapshotBeforeDeliverySink()).run()
+
+    assert failed.state is ReplayState.FAILED
+    assert failed.failure_code is ReplayFailureCode.SINK_FAILED
+    assert failed.cursor == events[2].ingest_sequence
+    assert canonical_json(broker.snapshot()).encode() == before_quote[0]
+    assert broker.snapshot().fills == broker.snapshot().positions == ()
 
 
 def test_pre_delivery_sink_failure_keeps_cursor_and_broker_state_for_retry() -> None:

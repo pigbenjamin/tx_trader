@@ -31,6 +31,7 @@ RUN_ID = UUID("11111111-1111-4111-8111-111111111111")
 ORDER_ID = UUID("22222222-2222-4222-8222-222222222222")
 FILL_ID = UUID("33333333-3333-4333-8333-333333333333")
 EVENT_ID = UUID("44444444-4444-4444-8444-444444444444")
+POSITION_ID = UUID("66666666-6666-4666-8666-666666666666")
 SESSION_ID = UUID("55555555-5555-4555-8555-555555555555")
 NOW = datetime(2026, 7, 28, 9, 0, tzinfo=TAIPEI)
 
@@ -89,6 +90,7 @@ def fill() -> PaperFill:
         quantity=Decimal("1"),
         execution_price=Decimal("22100.5"),
         fee=Decimal("15"),
+        fee_currency="TWD",
         source_session_id=SESSION_ID,
         source_ingest_sequence=7,
         occurred_at=NOW,
@@ -227,12 +229,14 @@ def test_fill_requires_finite_values_and_source_pair() -> None:
 def test_position_enforces_flat_and_open_average_invariant() -> None:
     flat = PaperPosition(
         paper_run_id=RUN_ID,
+        paper_position_id=POSITION_ID,
         strategy_id="strategy-a",
         account_id="paper-account",
         instrument_id="TXF-202608",
         net_quantity=Decimal("0"),
         average_open_price=None,
         cumulative_fees=Decimal("15"),
+        fee_currency="TWD",
         version=1,
         updated_at=NOW,
     )
@@ -324,12 +328,14 @@ def test_fill_event_requires_matching_source_causation() -> None:
 def test_position_change_event_requires_source_causation() -> None:
     position = PaperPosition(
         paper_run_id=RUN_ID,
+        paper_position_id=POSITION_ID,
         strategy_id="strategy-a",
         account_id="paper-account",
         instrument_id="TXF-202608",
         net_quantity=Decimal("1"),
         average_open_price=Decimal("22100.5"),
         cumulative_fees=Decimal("15"),
+        fee_currency="TWD",
         version=1,
         updated_at=NOW,
     )
@@ -386,12 +392,14 @@ def test_canonical_json_normalizes_decimal_representation_without_float(
 def test_canonical_json_normalizes_positive_and_negative_zero() -> None:
     position = PaperPosition(
         paper_run_id=RUN_ID,
+        paper_position_id=POSITION_ID,
         strategy_id="strategy-a",
         account_id="paper-account",
         instrument_id="TXF-202608",
         net_quantity=Decimal("0"),
         average_open_price=None,
         cumulative_fees=Decimal("0"),
+        fee_currency=None,
         version=1,
         updated_at=NOW,
     )

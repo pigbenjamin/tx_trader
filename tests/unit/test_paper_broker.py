@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal, getcontext
 from concurrent.futures import ThreadPoolExecutor
+from types import MappingProxyType
 from uuid import UUID
 
 import pytest
@@ -15,15 +16,23 @@ from tx_trade.market_data.fixtures import (
 from tx_trade.market_data.models import Instrument, MarketDataEnvelope, Quote
 from tx_trade.orders.contracts import (
     CancelIntent,
+    FeePolicyKind,
+    FeeRoundingMode,
     MatchDisposition,
+    MatchSkipReason,
     OrderIntent,
     OrderSide,
     OrderStatus,
     OrderType,
     PaperBrokerLimits,
+    PaperExecutionConfig,
     PaperEventType,
+    PaperFeeRule,
+    PaperFeeSchedule,
     PaperRejection,
     RejectionCode,
+    SlippageConfig,
+    SlippageMode,
     TimeInForce,
     canonical_json,
 )
@@ -31,6 +40,11 @@ from tx_trade.orders.paper_broker import (
     PaperBroker,
     PaperBrokerCapacityError,
     PaperBrokerInputError,
+)
+from tx_trade.orders.execution_policies import (
+    ExecutionPolicyError,
+    ExecutionPolicyErrorCode,
+    assess_fee,
 )
 
 RUN_ID = UUID("11111111-1111-1111-1111-111111111111")
@@ -44,11 +58,15 @@ LIMITS = PaperBrokerLimits(
 )
 
 
-def _broker(limits: PaperBrokerLimits = LIMITS) -> PaperBroker:
+def _broker(
+    limits: PaperBrokerLimits = LIMITS,
+    execution_config: PaperExecutionConfig | None = None,
+) -> PaperBroker:
     return PaperBroker(
         paper_run_id=RUN_ID,
         expected_source_session_id=OFFLINE_FIXTURE_SESSION_ID,
         limits=limits,
+        execution_config=execution_config,
     )
 
 
@@ -67,13 +85,15 @@ def _intent(
     order_type: OrderType = OrderType.MARKET,
     limit_price: str | None = None,
     source_sequence: int | None = None,
+    strategy_id: str = "strategy",
+    account_id: str = "paper",
 ) -> OrderIntent:
     quote = make_offline_fixture_envelopes()[3].payload
     assert isinstance(quote, Quote)
     return OrderIntent(
-        strategy_id="strategy",
+        strategy_id=strategy_id,
         client_order_id=client_order_id,
-        account_id="paper",
+        account_id=account_id,
         instrument_id=quote.instrument_id,
         side=side,
         quantity=Decimal(quantity),
@@ -122,6 +142,42 @@ def _prime(broker: PaperBroker) -> tuple[MarketDataEnvelope, MarketDataEnvelope]
     quote = envelopes[3]
     broker.process_market_data(instrument)
     return instrument, quote
+
+
+def _execution_config(
+    *,
+    slippage_mode: SlippageMode = SlippageMode.NONE,
+    slippage_value: str = "0",
+    fee_instrument_id: str | None = None,
+    fee_currency: str = "TWD",
+    fee_per_unit: str = "0.6",
+    fee_quantum: str = "0.01",
+) -> PaperExecutionConfig:
+    schedule = (
+        PaperFeeSchedule()
+        if fee_instrument_id is None
+        else PaperFeeSchedule(
+            kind=FeePolicyKind.PER_UNIT,
+            rules=(
+                PaperFeeRule(
+                    instrument_id=fee_instrument_id,
+                    currency=fee_currency,
+                    amount_per_unit=Decimal(fee_per_unit),
+                    quantum=Decimal(fee_quantum),
+                    rounding_mode=FeeRoundingMode.ROUND_HALF_UP,
+                    policy_id="unit-test",
+                    policy_version="1",
+                ),
+            ),
+        )
+    )
+    return PaperExecutionConfig(
+        slippage=SlippageConfig(
+            mode=slippage_mode,
+            value=Decimal(slippage_value),
+        ),
+        fee_schedule=schedule,
+    )
 
 
 def test_submit_idempotency_conflict_cancel_and_query_ordering() -> None:
@@ -656,4 +712,317 @@ def test_event_order_and_fee_are_fixed() -> None:
     assert [event.event_type for event in result.events] == [
         PaperEventType.FILL_RECORDED,
         PaperEventType.ORDER_FILLED,
+        PaperEventType.POSITION_CHANGED,
     ]
+    assert result.positions == broker.list_positions()
+    position = result.positions[0]
+    assert position.net_quantity == Decimal("1")
+    assert position.average_open_price == result.fills[0].execution_price
+    assert broker.get_position("strategy", "paper", position.instrument_id) == position
+    assert result.events[2].payload == position
+    assert all(
+        event.source_session_id == result.source_session_id
+        and event.source_ingest_sequence == result.source_ingest_sequence
+        for event in result.events
+    )
+    assert (
+        result.fills[0].execution_config_fingerprint
+        == broker.snapshot().execution_config_fingerprint
+    )
+
+
+def test_slippage_fee_audit_and_duplicate_are_deterministic() -> None:
+    instrument = make_offline_fixture_envelopes()[2].payload
+    assert isinstance(instrument, Instrument)
+    config = _execution_config(
+        slippage_mode=SlippageMode.BASIS_POINTS,
+        slippage_value="10",
+        fee_instrument_id=instrument.instrument_id,
+    )
+    broker = _broker(execution_config=config)
+    _, quote = _prime(broker)
+    broker.submit(_intent("priced", quantity="2"))
+
+    result = broker.process_market_data(quote)
+    fill = result.fills[0]
+    assert fill.reference_price == Decimal("20002.00")
+    assert fill.execution_price == Decimal("20022.002")
+    assert fill.slippage_amount == Decimal("20.002")
+    assert fill.fee == Decimal("1.20")
+    assert fill.fee_currency == "TWD"
+    assert result.positions[0].cumulative_fees == Decimal("1.20")
+    before_duplicate = broker.snapshot()
+    duplicate = broker.process_market_data(quote)
+    assert duplicate.disposition is MatchDisposition.DUPLICATE
+    assert duplicate.fills == duplicate.events == duplicate.positions == ()
+    assert broker.snapshot() == before_duplicate
+
+    repeat = _broker(execution_config=config)
+    _, repeat_quote = _prime(repeat)
+    repeat.submit(_intent("priced", quantity="2"))
+    repeat.process_market_data(repeat_quote)
+    assert canonical_json(repeat.snapshot()) == canonical_json(broker.snapshot())
+
+    different = _broker(
+        execution_config=_execution_config(
+            slippage_mode=SlippageMode.BASIS_POINTS,
+            slippage_value="11",
+        )
+    )
+    _, different_quote = _prime(different)
+    different.submit(_intent("priced", quantity="2"))
+    different_fill = different.process_market_data(different_quote).fills[0]
+    assert different_fill.paper_fill_id != fill.paper_fill_id
+    assert different_fill.execution_config_fingerprint != fill.execution_config_fingerprint
+
+
+def test_post_slippage_limit_rejection_does_not_debit_fifo_liquidity() -> None:
+    broker = _broker(
+        execution_config=_execution_config(
+            slippage_mode=SlippageMode.ABSOLUTE,
+            slippage_value="2",
+        )
+    )
+    _, quote = _prime(broker)
+    skipped = broker.submit(
+        _intent(
+            "slipped-limit",
+            order_type=OrderType.LIMIT,
+            limit_price="20003",
+        )
+    )
+    filled = broker.submit(_intent("next-market"))
+
+    result = broker.process_market_data(_shift_quote(quote, 3, ask_qty=1))
+
+    assert result.skip_reasons == (MatchSkipReason.SLIPPAGE_EXCEEDS_LIMIT,)
+    assert [fill.paper_order_id for fill in result.fills] == [filled.paper_order_id]
+    assert broker.get_order(skipped.paper_order_id).status is OrderStatus.ACCEPTED
+
+
+@pytest.mark.parametrize(
+    ("currency", "rule_instrument", "expected_reason"),
+    [
+        (None, "TAIFEX:0:TX00", MatchSkipReason.METADATA_UNAVAILABLE),
+        ("USD", "TAIFEX:0:TX00", MatchSkipReason.METADATA_MISMATCH),
+        ("TWD", "TAIFEX:0:MXF", MatchSkipReason.METADATA_UNAVAILABLE),
+    ],
+)
+def test_nonzero_fee_metadata_and_rule_fail_closed(
+    currency: str | None,
+    rule_instrument: str,
+    expected_reason: MatchSkipReason,
+) -> None:
+    broker = _broker(execution_config=_execution_config(fee_instrument_id=rule_instrument))
+    instrument_envelope = make_offline_fixture_envelopes()[2]
+    instrument = instrument_envelope.payload
+    assert isinstance(instrument, Instrument)
+    broker.process_market_data(
+        replace(instrument_envelope, payload=replace(instrument, currency=currency))
+    )
+    quote = make_offline_fixture_envelopes()[3]
+    broker.submit(_intent("fee-fail"))
+    before = broker.snapshot()
+
+    result = broker.process_market_data(quote)
+
+    assert not result.fills
+    assert result.skip_reasons == (expected_reason,)
+    assert broker.list_positions() == ()
+    assert broker.get_order(broker.list_orders()[0].paper_order_id).status is OrderStatus.ACCEPTED
+    assert broker.snapshot().last_committed_ingest_sequence != before.last_committed_ingest_sequence
+
+
+def test_position_ledger_is_keyed_versioned_and_sorted() -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    broker.submit(_intent("long", quantity="3", strategy_id="z", account_id="b"))
+    first = broker.process_market_data(_shift_quote(quote, 3, ask_qty=3))
+    assert first.positions[0].net_quantity == Decimal("3")
+    assert first.positions[0].version == 1
+
+    broker.submit(
+        _intent(
+            "reverse",
+            side=OrderSide.SELL,
+            quantity="5",
+            strategy_id="z",
+            account_id="b",
+        )
+    )
+    second = broker.process_market_data(_shift_quote(quote, 4, bid_qty=5, seconds=1))
+    assert second.positions[0].net_quantity == Decimal("-2")
+    assert second.positions[0].average_open_price == Decimal("20000.00")
+    assert second.positions[0].version == 2
+
+    broker.submit(_intent("other", strategy_id="a", account_id="a"))
+    third = broker.process_market_data(_shift_quote(quote, 5, ask_qty=1, seconds=2))
+    assert third.positions[0].version == 1
+    assert [
+        (position.strategy_id, position.account_id, position.instrument_id)
+        for position in broker.list_positions()
+    ] == [
+        ("a", "a", "TAIFEX:0:TX00"),
+        ("z", "b", "TAIFEX:0:TX00"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "limited_field",
+    ["max_positions", "max_events"],
+)
+def test_position_and_three_event_capacity_overflow_are_atomic(
+    limited_field: str,
+) -> None:
+    limits = replace(
+        LIMITS,
+        max_positions=1 if limited_field == "max_positions" else LIMITS.max_positions,
+        max_events=4 if limited_field == "max_events" else LIMITS.max_events,
+    )
+    broker = _broker(limits)
+    _, quote = _prime(broker)
+    broker.submit(_intent("one", strategy_id="one"))
+    broker.submit(_intent("two", strategy_id="two"))
+    before = broker.snapshot()
+
+    with pytest.raises(PaperBrokerCapacityError):
+        broker.process_market_data(_shift_quote(quote, 3, ask_qty=2))
+
+    assert broker.snapshot() == before
+
+
+def test_unexpected_execution_policy_failure_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    broker.submit(_intent("policy-error"))
+    before = broker.snapshot()
+
+    def fail(*args: object, **kwargs: object) -> object:
+        raise ArithmeticError("injected")
+
+    monkeypatch.setattr("tx_trade.orders.paper_broker.assess_fee", fail)
+    with pytest.raises(ArithmeticError, match="injected"):
+        broker.process_market_data(quote)
+    assert broker.snapshot() == before
+
+
+def test_typed_fee_arithmetic_failure_on_second_fifo_fill_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    broker.submit(_intent("first"))
+    broker.submit(_intent("second"))
+    before = broker.snapshot()
+    calls = 0
+
+    def fail_second(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ExecutionPolicyError(ExecutionPolicyErrorCode.ARITHMETIC_FAILURE)
+        return assess_fee(*args, **kwargs)
+
+    monkeypatch.setattr("tx_trade.orders.paper_broker.assess_fee", fail_second)
+    with pytest.raises(ExecutionPolicyError) as raised:
+        broker.process_market_data(_shift_quote(quote, 3, ask_qty=2))
+
+    assert raised.value.code is ExecutionPolicyErrorCode.ARITHMETIC_FAILURE
+    assert calls == 2
+    assert broker.snapshot() == before
+
+
+def test_temporal_position_order_skips_only_that_order_and_does_not_debit() -> None:
+    broker = _broker()
+    _, quote = _prime(broker)
+    broker.submit(_intent("initial"))
+    broker.process_market_data(_shift_quote(quote, 3, ask_qty=1, seconds=10))
+    previous = broker.get_position("strategy", "paper", "TAIFEX:0:TX00")
+    assert previous is not None
+
+    stale = broker.submit(_intent("stale-position"))
+    following = broker.submit(_intent("following", strategy_id="other"))
+    result = broker.process_market_data(_shift_quote(quote, 4, ask_qty=1, seconds=5))
+
+    assert result.skip_reasons == (MatchSkipReason.ORDER_NOT_ELIGIBLE,)
+    assert [fill.paper_order_id for fill in result.fills] == [following.paper_order_id]
+    assert broker.get_order(stale.paper_order_id).status is OrderStatus.ACCEPTED
+    assert broker.get_position("strategy", "paper", "TAIFEX:0:TX00") == previous
+    other = broker.get_position("other", "paper", "TAIFEX:0:TX00")
+    assert other is not None
+    assert other.version == 1
+
+
+def test_extreme_fee_arithmetic_failure_rolls_back_exactly() -> None:
+    instrument = make_offline_fixture_envelopes()[2].payload
+    assert isinstance(instrument, Instrument)
+    broker = _broker(
+        execution_config=_execution_config(
+            fee_instrument_id=instrument.instrument_id,
+            fee_per_unit="1e6144",
+        )
+    )
+    _, quote = _prime(broker)
+    broker.submit(_intent("extreme-fee", quantity="10"))
+    before = broker.snapshot()
+
+    with pytest.raises(ExecutionPolicyError) as raised:
+        broker.process_market_data(_shift_quote(quote, 3, ask_qty=10))
+
+    assert raised.value.code is ExecutionPolicyErrorCode.ARITHMETIC_FAILURE
+    assert broker.snapshot() == before
+
+
+def test_zero_incremental_fee_updates_large_fee_position_normally() -> None:
+    instrument = make_offline_fixture_envelopes()[2].payload
+    assert isinstance(instrument, Instrument)
+    broker = _broker(
+        execution_config=_execution_config(
+            fee_instrument_id=instrument.instrument_id,
+            fee_per_unit="1",
+            fee_quantum="1e34",
+        )
+    )
+    _, quote = _prime(broker)
+    broker.submit(_intent("large-fee-base"))
+    base_position = broker.process_market_data(
+        _shift_quote(quote, 3, ask_qty=1),
+    ).positions[0]
+    key = ("strategy", "paper", instrument.instrument_id)
+    # Exact ledger arithmetic deliberately cannot build 1e34 from zero: aligning
+    # Decimal(0) to that exponent signals Rounded. Seed only this boundary state
+    # so the broker integration exercises the zero-increment path under review.
+    base_position = replace(
+        base_position,
+        cumulative_fees=Decimal("1e34"),
+        fee_currency="TWD",
+    )
+    broker._state = replace(
+        broker._state,
+        positions=MappingProxyType({key: base_position}),
+    )
+    assert base_position.net_quantity == Decimal("1")
+    assert base_position.cumulative_fees == Decimal("1e34")
+    assert base_position.fee_currency == "TWD"
+    assert base_position.version == 1
+
+    broker.submit(_intent("zero-fee-increment", quantity="0.1"))
+    second = broker.process_market_data(
+        _shift_quote(quote, 4, ask_qty=1, seconds=1),
+    )
+
+    assert second.fills[0].fee == Decimal(0)
+    assert second.fills[0].fee_currency is None
+    assert [event.event_type for event in second.events] == [
+        PaperEventType.FILL_RECORDED,
+        PaperEventType.ORDER_FILLED,
+        PaperEventType.POSITION_CHANGED,
+    ]
+    position = second.positions[0]
+    assert position.net_quantity == Decimal("1.1")
+    assert position.version == 2
+    assert position.cumulative_fees == Decimal("1e34")
+    assert position.fee_currency == "TWD"
+    assert broker.get_position("strategy", "paper", instrument.instrument_id) == position

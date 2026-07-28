@@ -30,6 +30,14 @@ class FakeBroker:
     def list_positions(self) -> tuple[PaperPosition, ...]:
         return ()
 
+    def get_position(
+        self,
+        strategy_id: str,
+        account_id: str,
+        instrument_id: str,
+    ) -> PaperPosition | None:
+        return None
+
 
 class FakeEventSink:
     def __init__(self) -> None:
@@ -53,4 +61,5 @@ def test_broker_port_does_not_require_market_data_input() -> None:
         "get_order",
         "list_orders",
         "list_positions",
+        "get_position",
     }

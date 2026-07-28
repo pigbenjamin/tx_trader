@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -89,6 +90,22 @@ class MatchSkipReason(StrEnum):
     NO_LIQUIDITY = "no_liquidity"
     ORDER_NOT_ELIGIBLE = "order_not_eligible"
     LIMIT_NOT_CROSSED = "limit_not_crossed"
+    SLIPPAGE_EXCEEDS_LIMIT = "slippage_exceeds_limit"
+
+
+class SlippageMode(StrEnum):
+    NONE = "none"
+    BASIS_POINTS = "basis_points"
+    ABSOLUTE = "absolute"
+
+
+class FeePolicyKind(StrEnum):
+    ZERO = "zero"
+    PER_UNIT = "per_unit"
+
+
+class FeeRoundingMode(StrEnum):
+    ROUND_HALF_UP = "round_half_up"
 
 
 class PaperEventType(StrEnum):
@@ -143,6 +160,7 @@ def _decimal(
     positive: bool = False,
     nonnegative: bool = False,
     optional: bool = False,
+    bounded: bool = False,
 ) -> None:
     if value is None and optional:
         return
@@ -154,6 +172,164 @@ def _decimal(
         raise ValueError(f"{name} must be greater than zero")
     if nonnegative and value < 0:
         raise ValueError(f"{name} must be non-negative")
+    if bounded:
+        parts = value.as_tuple()
+        exponent = parts.exponent
+        assert isinstance(exponent, int)
+        if len(parts.digits) > 34 or not -6143 <= exponent <= 6144:
+            raise ValueError(f"{name} exceeds the supported Decimal bounds")
+
+
+def _bounded_identifier(value: Any, name: str) -> None:
+    _strict_string(value, name)
+    if len(value) > 128:
+        raise ValueError(f"{name} must be at most 128 characters")
+
+
+def _currency(value: Any, name: str, *, optional: bool = False) -> None:
+    if value is None and optional:
+        return
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string")
+    if len(value) != 3 or not value.isascii() or not value.isalpha() or not value.isupper():
+        raise ValueError(f"{name} must be an uppercase 3-letter currency")
+
+
+def _fingerprint(value: Any, name: str) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string")
+    prefix = "sha256:"
+    digest = value[len(prefix) :]
+    if not value.startswith(prefix) or len(digest) != 64:
+        raise ValueError(f"{name} must be a sha256 fingerprint")
+    if any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{name} must be a sha256 fingerprint")
+
+
+def _semantic_decimal(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    parts = value.as_tuple()
+    digits = list(parts.digits)
+    exponent = parts.exponent
+    assert isinstance(exponent, int)
+    while digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    coefficient = "".join(str(digit) for digit in digits)
+    sign = "-" if parts.sign else ""
+    return f"{sign}{coefficient}e{exponent}"
+
+
+@dataclass(frozen=True, slots=True)
+class SlippageConfig:
+    mode: SlippageMode = SlippageMode.NONE
+    value: Decimal = Decimal("0")
+
+    def __post_init__(self) -> None:
+        _strict_enum(self.mode, SlippageMode, "mode")
+        _decimal(self.value, "value", nonnegative=True, bounded=True)
+        if self.mode is SlippageMode.NONE and self.value != 0:
+            raise ValueError("NONE slippage requires value equal to zero")
+        if self.mode is SlippageMode.BASIS_POINTS and not 0 < self.value < 10_000:
+            raise ValueError("BASIS_POINTS slippage requires 0 < value < 10000")
+        if self.mode is SlippageMode.ABSOLUTE and self.value <= 0:
+            raise ValueError("ABSOLUTE slippage requires value greater than zero")
+
+
+@dataclass(frozen=True, slots=True)
+class PaperFeeRule:
+    instrument_id: str
+    currency: str
+    amount_per_unit: Decimal
+    quantum: Decimal
+    rounding_mode: FeeRoundingMode
+    policy_id: str
+    policy_version: str
+
+    def __post_init__(self) -> None:
+        _bounded_identifier(self.instrument_id, "instrument_id")
+        _currency(self.currency, "currency")
+        _decimal(self.amount_per_unit, "amount_per_unit", positive=True, bounded=True)
+        _decimal(self.quantum, "quantum", positive=True, bounded=True)
+        _strict_enum(self.rounding_mode, FeeRoundingMode, "rounding_mode")
+        _bounded_identifier(self.policy_id, "policy_id")
+        _bounded_identifier(self.policy_version, "policy_version")
+
+
+@dataclass(frozen=True, slots=True)
+class PaperFeeSchedule:
+    kind: FeePolicyKind = FeePolicyKind.ZERO
+    rules: tuple[PaperFeeRule, ...] = ()
+
+    def __post_init__(self) -> None:
+        _strict_enum(self.kind, FeePolicyKind, "kind")
+        if type(self.rules) is not tuple:
+            raise TypeError("rules must be a tuple")
+        if any(type(rule) is not PaperFeeRule for rule in self.rules):
+            raise TypeError("rules must contain only PaperFeeRule")
+        if self.kind is FeePolicyKind.ZERO and self.rules:
+            raise ValueError("ZERO fee schedule must not contain rules")
+        if self.kind is FeePolicyKind.PER_UNIT and not self.rules:
+            raise ValueError("PER_UNIT fee schedule requires at least one rule")
+        keys = tuple(rule.instrument_id for rule in self.rules)
+        if keys != tuple(sorted(keys)):
+            raise ValueError("fee rules must be sorted by instrument_id")
+        if len(set(keys)) != len(keys):
+            raise ValueError("fee rules must have unique instrument_id values")
+
+
+@dataclass(frozen=True, slots=True)
+class PaperExecutionConfig:
+    slippage: SlippageConfig = SlippageConfig()
+    fee_schedule: PaperFeeSchedule = PaperFeeSchedule()
+    algorithm_version: str = "paper-execution-v1"
+
+    def __post_init__(self) -> None:
+        if type(self.slippage) is not SlippageConfig:
+            raise TypeError("slippage must be SlippageConfig")
+        if type(self.fee_schedule) is not PaperFeeSchedule:
+            raise TypeError("fee_schedule must be PaperFeeSchedule")
+        _bounded_identifier(self.algorithm_version, "algorithm_version")
+
+    @property
+    def fingerprint(self) -> str:
+        payload = {
+            "algorithm_version": self.algorithm_version,
+            "fee_schedule": {
+                "kind": self.fee_schedule.kind.value,
+                "rules": [
+                    {
+                        "amount_per_unit": _semantic_decimal(rule.amount_per_unit),
+                        "currency": rule.currency,
+                        "instrument_id": rule.instrument_id,
+                        "policy_id": rule.policy_id,
+                        "policy_version": rule.policy_version,
+                        "quantum": _semantic_decimal(rule.quantum),
+                        "rounding_mode": rule.rounding_mode.value,
+                    }
+                    for rule in self.fee_schedule.rules
+                ],
+            },
+            "semantics": {
+                "decimal_context": "decimal128-round-half-even",
+                "limit_after_slippage": True,
+                "position_ledger": "signed-net-v1-allow-short",
+                "tick_snapping": False,
+            },
+            "slippage": {
+                "mode": self.slippage.mode.value,
+                "value": _semantic_decimal(self.slippage.value),
+            },
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("ascii")
+        return f"sha256:{sha256(b'tx_trade.paper.execution.v1:' + encoded).hexdigest()}"
+
+
+DEFAULT_EXECUTION_CONFIG = PaperExecutionConfig()
+DEFAULT_EXECUTION_CONFIG_FINGERPRINT = DEFAULT_EXECUTION_CONFIG.fingerprint
 
 
 def _positive_int(value: Any, name: str) -> None:
@@ -300,6 +476,10 @@ class PaperFill:
     source_session_id: UUID
     source_ingest_sequence: int
     occurred_at: datetime
+    reference_price: Decimal | None = None
+    slippage_amount: Decimal = Decimal("0")
+    fee_currency: str | None = None
+    execution_config_fingerprint: str = DEFAULT_EXECUTION_CONFIG_FINGERPRINT
     provenance: ExecutionProvenance = ExecutionProvenance.PAPER
 
     def __post_init__(self) -> None:
@@ -311,9 +491,27 @@ class PaperFill:
         _decimal(self.quantity, "quantity", positive=True)
         _decimal(self.execution_price, "execution_price", positive=True)
         _decimal(self.fee, "fee", nonnegative=True)
+        if self.reference_price is None:
+            object.__setattr__(self, "reference_price", self.execution_price)
+        _decimal(self.reference_price, "reference_price", positive=True)
+        _decimal(self.slippage_amount, "slippage_amount", nonnegative=True)
+        _currency(self.fee_currency, "fee_currency", optional=True)
+        _fingerprint(
+            self.execution_config_fingerprint,
+            "execution_config_fingerprint",
+        )
         _source_pair(self.source_session_id, self.source_ingest_sequence)
         _taipei_datetime(self.occurred_at, "occurred_at")
         _strict_enum(self.provenance, ExecutionProvenance, "provenance")
+        assert self.reference_price is not None
+        if abs(self.execution_price - self.reference_price) != self.slippage_amount:
+            raise ValueError("slippage_amount must equal the absolute execution price delta")
+        if self.side is OrderSide.BUY and self.execution_price < self.reference_price:
+            raise ValueError("BUY execution_price must not be below reference_price")
+        if self.side is OrderSide.SELL and self.execution_price > self.reference_price:
+            raise ValueError("SELL execution_price must not be above reference_price")
+        if (self.fee == 0) != (self.fee_currency is None):
+            raise ValueError("fee_currency must be present exactly when fee is nonzero")
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,18 +541,21 @@ class PaperRejection:
 @dataclass(frozen=True, slots=True)
 class PaperPosition:
     paper_run_id: UUID
+    paper_position_id: UUID
     strategy_id: str
     account_id: str
     instrument_id: str
     net_quantity: Decimal
     average_open_price: Decimal | None
     cumulative_fees: Decimal
+    fee_currency: str | None
     version: int
     updated_at: datetime
     provenance: ExecutionProvenance = ExecutionProvenance.PAPER
 
     def __post_init__(self) -> None:
         _strict_uuid(self.paper_run_id, "paper_run_id")
+        _strict_uuid(self.paper_position_id, "paper_position_id")
         for name in ("strategy_id", "account_id", "instrument_id"):
             _strict_string(getattr(self, name), name)
         _decimal(self.net_quantity, "net_quantity")
@@ -365,6 +566,7 @@ class PaperPosition:
             optional=True,
         )
         _decimal(self.cumulative_fees, "cumulative_fees", nonnegative=True)
+        _currency(self.fee_currency, "fee_currency", optional=True)
         _positive_int(self.version, "version")
         _taipei_datetime(self.updated_at, "updated_at")
         _strict_enum(self.provenance, ExecutionProvenance, "provenance")
@@ -372,6 +574,8 @@ class PaperPosition:
             raise ValueError(
                 "average_open_price must be present exactly when net_quantity is non-zero"
             )
+        if (self.cumulative_fees == 0) != (self.fee_currency is None):
+            raise ValueError("fee_currency must be present exactly when cumulative_fees is nonzero")
 
 
 PaperEventPayload: TypeAlias = PaperOrder | PaperFill | PaperRejection | PaperPosition
@@ -457,12 +661,14 @@ class InstrumentMetadataSnapshot:
     metadata_version: int
     price_scale: Decimal | None
     quantity_scale: Decimal | None
+    currency: str | None = None
 
     def __post_init__(self) -> None:
         _strict_string(self.instrument_id, "instrument_id")
         _positive_int(self.metadata_version, "metadata_version")
         _decimal(self.price_scale, "price_scale", positive=True, optional=True)
         _decimal(self.quantity_scale, "quantity_scale", positive=True, optional=True)
+        _currency(self.currency, "currency", optional=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +679,7 @@ class PaperBrokerLimits:
     max_events: int
     max_market_data_records: int
     max_instrument_versions: int
+    max_positions: int = 10_000
 
     def __post_init__(self) -> None:
         _positive_int(self.max_orders, "max_orders")
@@ -481,6 +688,7 @@ class PaperBrokerLimits:
         _positive_int(self.max_events, "max_events")
         _positive_int(self.max_market_data_records, "max_market_data_records")
         _positive_int(self.max_instrument_versions, "max_instrument_versions")
+        _positive_int(self.max_positions, "max_positions")
         if self.max_open_orders > self.max_orders:
             raise ValueError("max_open_orders must not exceed max_orders")
 
@@ -495,6 +703,7 @@ class MatchResult:
     events: tuple[PaperEvent, ...]
     skip_reasons: tuple[MatchSkipReason, ...]
     snapshot_version: int
+    positions: tuple[PaperPosition, ...] = ()
 
     def __post_init__(self) -> None:
         _strict_uuid(self.paper_run_id, "paper_run_id")
@@ -504,6 +713,7 @@ class MatchResult:
         _strict_contract_tuple(self.fills, PaperFill, "fills")
         _strict_contract_tuple(self.events, PaperEvent, "events")
         _strict_contract_tuple(self.skip_reasons, MatchSkipReason, "skip_reasons")
+        _strict_contract_tuple(self.positions, PaperPosition, "positions")
         if len(set(self.skip_reasons)) != len(self.skip_reasons):
             raise ValueError("skip_reasons must not contain duplicates")
         for fill in self.fills:
@@ -522,8 +732,13 @@ class MatchResult:
                 or event.source_ingest_sequence != self.source_ingest_sequence
             ):
                 raise ValueError("event source causation must match result")
-        if self.disposition is MatchDisposition.DUPLICATE and (self.fills or self.events):
-            raise ValueError("duplicate results must not contain fills or events")
+        for position in self.positions:
+            if position.paper_run_id != self.paper_run_id:
+                raise ValueError("position paper_run_id must match result")
+        if self.disposition is MatchDisposition.DUPLICATE and (
+            self.fills or self.events or self.positions
+        ):
+            raise ValueError("duplicate results must not contain fills, events, or positions")
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,6 +752,8 @@ class PaperBrokerSnapshot:
     fills: tuple[PaperFill, ...]
     events: tuple[PaperEvent, ...]
     instruments: tuple[InstrumentMetadataSnapshot, ...]
+    positions: tuple[PaperPosition, ...] = ()
+    execution_config_fingerprint: str = DEFAULT_EXECUTION_CONFIG_FINGERPRINT
 
     def __post_init__(self) -> None:
         _strict_uuid(self.paper_run_id, "paper_run_id")
@@ -554,13 +771,27 @@ class PaperBrokerSnapshot:
             InstrumentMetadataSnapshot,
             "instruments",
         )
+        _strict_contract_tuple(self.positions, PaperPosition, "positions")
+        _fingerprint(
+            self.execution_config_fingerprint,
+            "execution_config_fingerprint",
+        )
         for collection_name, collection in (
             ("order", self.orders),
             ("fill", self.fills),
             ("event", self.events),
+            ("position", self.positions),
         ):
             if any(item.paper_run_id != self.paper_run_id for item in collection):
                 raise ValueError(f"{collection_name} paper_run_id must match snapshot")
+        position_keys = tuple(
+            (position.strategy_id, position.account_id, position.instrument_id)
+            for position in self.positions
+        )
+        if position_keys != tuple(sorted(position_keys)):
+            raise ValueError("positions must be sorted by strategy, account, and instrument")
+        if len(set(position_keys)) != len(position_keys):
+            raise ValueError("positions must have unique strategy, account, and instrument keys")
         expected_next_sequence = 1 if not self.events else self.events[-1].paper_sequence + 1
         if self.next_paper_sequence != expected_next_sequence:
             raise ValueError("next_paper_sequence must follow the event journal")

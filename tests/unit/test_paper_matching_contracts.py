@@ -22,6 +22,7 @@ from tx_trade.orders import (
     PaperEventType,
     PaperFill,
     PaperOrder,
+    PaperPosition,
     TimeInForce,
     canonical_json,
 )
@@ -32,6 +33,7 @@ OTHER_RUN_ID = UUID("99999999-9999-4999-8999-999999999999")
 ORDER_ID = UUID("22222222-2222-4222-8222-222222222222")
 FILL_ID = UUID("33333333-3333-4333-8333-333333333333")
 EVENT_ID = UUID("44444444-4444-4444-8444-444444444444")
+POSITION_ID = UUID("66666666-6666-4666-8666-666666666666")
 SESSION_ID = UUID("55555555-5555-4555-8555-555555555555")
 NOW = datetime(2026, 7, 28, 9, 0, tzinfo=TAIPEI)
 
@@ -111,6 +113,22 @@ def make_fill_event(*, source_ingest_sequence: int = 7) -> PaperEvent:
     )
 
 
+def make_position(*, paper_run_id: UUID = RUN_ID) -> PaperPosition:
+    return PaperPosition(
+        paper_run_id=paper_run_id,
+        paper_position_id=POSITION_ID,
+        strategy_id="strategy-a",
+        account_id="paper-account",
+        instrument_id="TXF-202608",
+        net_quantity=Decimal("1"),
+        average_open_price=Decimal("22100.5"),
+        cumulative_fees=Decimal("0"),
+        fee_currency=None,
+        version=1,
+        updated_at=NOW,
+    )
+
+
 def test_limits_are_frozen_strict_positive_and_internally_bounded() -> None:
     limits = PaperBrokerLimits(
         max_orders=100,
@@ -165,6 +183,7 @@ def test_match_result_requires_immutable_typed_collections_and_consistent_causat
         events=(),
         skip_reasons=(MatchSkipReason.LIMIT_NOT_CROSSED,),
         snapshot_version=2,
+        positions=(make_position(),),
     )
 
     assert result.fills[0].fee == 0
@@ -179,6 +198,8 @@ def test_match_result_requires_immutable_typed_collections_and_consistent_causat
         replace(result, events=(make_fill_event(source_ingest_sequence=8),))
     with pytest.raises(ValueError, match="paper_run_id must match"):
         replace(result, fills=(make_fill(paper_run_id=OTHER_RUN_ID),))
+    with pytest.raises(ValueError, match="position paper_run_id must match"):
+        replace(result, positions=(make_position(paper_run_id=OTHER_RUN_ID),))
 
 
 def test_duplicate_match_result_cannot_claim_new_side_effects() -> None:
@@ -196,6 +217,8 @@ def test_duplicate_match_result_cannot_claim_new_side_effects() -> None:
     assert duplicate.disposition is MatchDisposition.DUPLICATE
     with pytest.raises(ValueError, match="must not contain"):
         replace(duplicate, events=(make_event(),))
+    with pytest.raises(ValueError, match="must not contain"):
+        replace(duplicate, positions=(make_position(),))
 
 
 def test_snapshot_is_immutable_ordered_and_run_consistent() -> None:
@@ -216,6 +239,7 @@ def test_snapshot_is_immutable_ordered_and_run_consistent() -> None:
         fills=(make_fill(),),
         events=(event,),
         instruments=(metadata,),
+        positions=(make_position(),),
     )
 
     assert snapshot.events == (event,)

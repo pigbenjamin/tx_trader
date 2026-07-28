@@ -29,6 +29,13 @@ class PaperBrokerPort(Protocol):
 
     def list_positions(self) -> tuple[PaperPosition, ...]: ...
 
+    def get_position(
+        self,
+        strategy_id: str,
+        account_id: str,
+        instrument_id: str,
+    ) -> PaperPosition | None: ...
+
 
 @runtime_checkable
 class PaperEventSink(Protocol):

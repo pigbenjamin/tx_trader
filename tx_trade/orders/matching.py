@@ -26,6 +26,7 @@ class QuoteTop:
     ask: Decimal
     bid_capacity: Decimal | None
     ask_capacity: Decimal | None
+    currency: str | None = None
     skip_reasons: tuple[MatchSkipReason, ...] = ()
 
 
@@ -70,6 +71,7 @@ def inspect_quote_top(
         ask=quote.ask_normalized,
         bid_capacity=bid_capacity,
         ask_capacity=ask_capacity,
+        currency=metadata.currency,
         skip_reasons=tuple(reasons),
     )
 

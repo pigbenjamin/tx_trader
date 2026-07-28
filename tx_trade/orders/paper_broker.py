@@ -21,6 +21,7 @@ from tx_trade.market_data.models import (
 
 from .contracts import (
     CancelIntent,
+    DEFAULT_EXECUTION_CONFIG,
     InstrumentMetadataSnapshot,
     MatchDisposition,
     MatchResult,
@@ -30,6 +31,7 @@ from .contracts import (
     OrderStatus,
     PaperBrokerLimits,
     PaperBrokerSnapshot,
+    PaperExecutionConfig,
     PaperEvent,
     PaperEventType,
     PaperFill,
@@ -39,6 +41,13 @@ from .contracts import (
     RejectionCode,
     canonical_json,
 )
+from .execution_policies import (
+    ExecutionPolicyError,
+    ExecutionPolicyErrorCode,
+    assess_fee,
+    assess_limit,
+    assess_slippage,
+)
 from .matching import (
     MATCHING_CONTEXT,
     QuoteTop,
@@ -47,10 +56,16 @@ from .matching import (
     weighted_average,
 )
 from .ports import OrderCommandResult
+from .position_ledger import (
+    PositionLedgerError,
+    PositionLedgerErrorCode,
+    apply_fill_to_position,
+)
 from .state_machine import validate_order_transition
 
 SubmitKey: TypeAlias = tuple[str, str]
 CancelKey: TypeAlias = tuple[UUID, str, str]
+PositionKey: TypeAlias = tuple[str, str, str]
 _Key = TypeVar("_Key")
 _Value = TypeVar("_Value")
 
@@ -90,7 +105,9 @@ class _BrokerState:
     last_sequence: int | None
     next_paper_sequence: int
     snapshot_version: int
+    execution_config_fingerprint: str
     orders: Mapping[UUID, PaperOrder]
+    positions: Mapping[PositionKey, PaperPosition]
     submit_outcomes: Mapping[SubmitKey, _OutcomeRecord]
     cancel_outcomes: Mapping[CancelKey, _OutcomeRecord]
     acceptance_ordinal: Mapping[UUID, int]
@@ -117,16 +134,22 @@ class PaperBroker:
         *,
         paper_run_id: UUID,
         limits: PaperBrokerLimits,
+        execution_config: PaperExecutionConfig | None = None,
         expected_source_session_id: UUID | None = None,
     ) -> None:
         if type(paper_run_id) is not UUID:
             raise TypeError("paper_run_id must be UUID")
         if type(limits) is not PaperBrokerLimits:
             raise TypeError("limits must be PaperBrokerLimits")
+        if execution_config is not None and type(execution_config) is not PaperExecutionConfig:
+            raise TypeError("execution_config must be PaperExecutionConfig or None")
         if expected_source_session_id is not None and type(expected_source_session_id) is not UUID:
             raise TypeError("expected_source_session_id must be UUID or None")
         self._paper_run_id = paper_run_id
         self._limits = limits
+        self._execution_config = (
+            DEFAULT_EXECUTION_CONFIG if execution_config is None else execution_config
+        )
         self._lock = RLock()
         self._state = _BrokerState(
             effective_session=expected_source_session_id,
@@ -135,7 +158,9 @@ class PaperBroker:
             last_sequence=None,
             next_paper_sequence=1,
             snapshot_version=0,
+            execution_config_fingerprint=self._execution_config.fingerprint,
             orders=_mapping(),
+            positions=_mapping(),
             submit_outcomes=_mapping(),
             cancel_outcomes=_mapping(),
             acceptance_ordinal=_mapping(),
@@ -357,7 +382,26 @@ class PaperBroker:
             return self._ordered_orders(self._state)
 
     def list_positions(self) -> tuple[PaperPosition, ...]:
-        return ()
+        with self._lock:
+            return self._ordered_positions(self._state)
+
+    def get_position(
+        self,
+        strategy_id: str,
+        account_id: str,
+        instrument_id: str,
+    ) -> PaperPosition | None:
+        for name, value in (
+            ("strategy_id", strategy_id),
+            ("account_id", account_id),
+            ("instrument_id", instrument_id),
+        ):
+            if type(value) is not str:
+                raise TypeError(f"{name} must be a string")
+            if not value.strip():
+                raise ValueError(f"{name} must not be empty")
+        with self._lock:
+            return self._state.positions.get((strategy_id, account_id, instrument_id))
 
     def snapshot(self) -> PaperBrokerSnapshot:
         with self._lock:
@@ -368,10 +412,12 @@ class PaperBroker:
                 last_committed_ingest_sequence=state.last_sequence,
                 next_paper_sequence=state.next_paper_sequence,
                 snapshot_version=state.snapshot_version,
+                execution_config_fingerprint=state.execution_config_fingerprint,
                 orders=self._ordered_orders(state),
                 fills=state.fills,
                 events=state.events,
                 instruments=tuple(state.instruments[key] for key in sorted(state.instruments)),
+                positions=self._ordered_positions(state),
             )
 
     def publish(self, envelope: MarketDataEnvelope) -> None:
@@ -405,11 +451,13 @@ class PaperBroker:
                 raise PaperBrokerCapacityError("market-data record capacity was exceeded")
 
             orders = dict(state.orders)
+            positions = dict(state.positions)
             instruments = dict(state.instruments)
             fills = list(state.fills)
             events = list(state.events)
             next_sequence = state.next_paper_sequence
             result_fills: list[PaperFill] = []
+            result_positions: list[PaperPosition] = []
             result_events: list[PaperEvent] = []
             reasons: list[MatchSkipReason] = []
 
@@ -421,6 +469,7 @@ class PaperBroker:
                     metadata_version=payload.metadata_version,
                     price_scale=payload.price_scale,
                     quantity_scale=payload.quantity_scale,
+                    currency=payload.currency,
                 )
                 metadata_key = (payload.instrument_id, payload.metadata_version)
                 existing = instruments.get(metadata_key)
@@ -450,9 +499,11 @@ class PaperBroker:
                         envelope=envelope,
                         top=assessment,
                         orders=orders,
+                        positions=positions,
                         fills=fills,
                         events=events,
                         result_fills=result_fills,
+                        result_positions=result_positions,
                         result_events=result_events,
                         reasons=reasons,
                         next_sequence=next_sequence,
@@ -460,7 +511,11 @@ class PaperBroker:
             else:
                 reasons.append(MatchSkipReason.EVENT_NOT_QUOTE)
 
-            if len(fills) > self._limits.max_fills or len(events) > self._limits.max_events:
+            if (
+                len(fills) > self._limits.max_fills
+                or len(events) > self._limits.max_events
+                or len(positions) > self._limits.max_positions
+            ):
                 raise PaperBrokerCapacityError("market-data batch exceeds paper broker capacity")
             fingerprints = dict(state.envelope_fingerprints)
             fingerprints[envelope.ingest_sequence] = fingerprint
@@ -475,6 +530,7 @@ class PaperBroker:
                 next_paper_sequence=next_sequence,
                 snapshot_version=state.snapshot_version + 1,
                 orders=_mapping(orders),
+                positions=_mapping(positions),
                 fills=tuple(fills),
                 events=tuple(events),
                 instruments=_mapping(instruments),
@@ -490,6 +546,7 @@ class PaperBroker:
                 events=tuple(result_events),
                 skip_reasons=_unique_reasons(reasons),
                 snapshot_version=staged.snapshot_version,
+                positions=tuple(result_positions),
             )
             self._commit(staged)
             return result
@@ -501,9 +558,11 @@ class PaperBroker:
         envelope: MarketDataEnvelope,
         top: QuoteTop,
         orders: dict[UUID, PaperOrder],
+        positions: dict[PositionKey, PaperPosition],
         fills: list[PaperFill],
         events: list[PaperEvent],
         result_fills: list[PaperFill],
+        result_positions: list[PaperPosition],
         result_events: list[PaperEvent],
         reasons: list[MatchSkipReason],
         next_sequence: int,
@@ -537,8 +596,8 @@ class PaperBroker:
             ):
                 reasons.append(MatchSkipReason.ORDER_NOT_ELIGIBLE)
                 continue
-            price = execution_price(order, top)
-            if price is None:
+            reference_price = execution_price(order, top)
+            if reference_price is None:
                 reasons.append(MatchSkipReason.LIMIT_NOT_CROSSED)
                 continue
             available = capacities[order.intent.side]
@@ -548,9 +607,45 @@ class PaperBroker:
             if available <= 0:
                 reasons.append(MatchSkipReason.NO_LIQUIDITY)
                 continue
+            try:
+                slippage = assess_slippage(
+                    reference_price,
+                    order.intent.side,
+                    self._execution_config.slippage,
+                )
+                limit = assess_limit(
+                    slippage.execution_price,
+                    order.intent.side,
+                    order.intent.limit_price,
+                )
+            except ExecutionPolicyError as exc:
+                skip_reason = _policy_skip_reason(exc)
+                if skip_reason is None:
+                    raise
+                reasons.append(skip_reason)
+                continue
+            if not limit.executable:
+                assert limit.skip_reason is not None
+                reasons.append(limit.skip_reason)
+                continue
             with localcontext(MATCHING_CONTEXT):
                 fill_quantity = min(order.remaining_quantity, available)
-                fill_ordinal += 1
+                filled_quantity = order.filled_quantity + fill_quantity
+                try:
+                    fee = assess_fee(
+                        self._execution_config.fee_schedule,
+                        instrument_id=order.intent.instrument_id,
+                        metadata_currency=top.currency,
+                        cumulative_quantity_before=order.filled_quantity,
+                        cumulative_quantity_after=filled_quantity,
+                    )
+                except ExecutionPolicyError as exc:
+                    skip_reason = _policy_skip_reason(exc)
+                    if skip_reason is None:
+                        raise
+                    reasons.append(skip_reason)
+                    continue
+                candidate_fill_ordinal = fill_ordinal + 1
                 fill = PaperFill(
                     paper_run_id=self._paper_run_id,
                     paper_fill_id=self._uuid(
@@ -558,7 +653,8 @@ class PaperBroker:
                         str(order_id),
                         str(envelope.session_id),
                         str(envelope.ingest_sequence),
-                        str(fill_ordinal),
+                        str(candidate_fill_ordinal),
+                        state.execution_config_fingerprint,
                     ),
                     paper_order_id=order_id,
                     strategy_id=order.intent.strategy_id,
@@ -566,13 +662,16 @@ class PaperBroker:
                     instrument_id=order.intent.instrument_id,
                     side=order.intent.side,
                     quantity=fill_quantity,
-                    execution_price=price,
-                    fee=Decimal(0),
+                    execution_price=slippage.execution_price,
+                    fee=fee.fee,
                     source_session_id=envelope.session_id,
                     source_ingest_sequence=envelope.ingest_sequence,
                     occurred_at=causal_time,
+                    reference_price=slippage.reference_price,
+                    slippage_amount=slippage.slippage_amount,
+                    fee_currency=fee.currency,
+                    execution_config_fingerprint=state.execution_config_fingerprint,
                 )
-                filled_quantity = order.filled_quantity + fill_quantity
                 status = (
                     OrderStatus.FILLED
                     if filled_quantity == order.intent.quantity
@@ -587,11 +686,24 @@ class PaperBroker:
                         order.filled_quantity,
                         order.average_fill_price,
                         fill_quantity,
-                        price,
+                        slippage.execution_price,
                     ),
                     updated_at=causal_time,
                 )
                 validate_order_transition(order, updated)
+                position_key = (
+                    order.intent.strategy_id,
+                    order.intent.account_id,
+                    order.intent.instrument_id,
+                )
+                try:
+                    position = apply_fill_to_position(positions.get(position_key), fill)
+                except PositionLedgerError as exc:
+                    if exc.code is not PositionLedgerErrorCode.TEMPORAL_ORDER:
+                        raise
+                    reasons.append(MatchSkipReason.ORDER_NOT_ELIGIBLE)
+                    continue
+                fill_ordinal = candidate_fill_ordinal
                 remaining_capacity = available - fill_quantity
             fill_event = self._make_event(
                 next_sequence,
@@ -611,12 +723,21 @@ class PaperBroker:
                 causal_time,
                 envelope,
             )
-            next_sequence += 2
+            position_event = self._make_event(
+                next_sequence + 2,
+                PaperEventType.POSITION_CHANGED,
+                position,
+                causal_time,
+                envelope,
+            )
+            next_sequence += 3
             orders[order_id] = updated
+            positions[position_key] = position
             fills.append(fill)
             result_fills.append(fill)
-            events.extend((fill_event, order_event))
-            result_events.extend((fill_event, order_event))
+            result_positions.append(position)
+            events.extend((fill_event, order_event, position_event))
+            result_events.extend((fill_event, order_event, position_event))
             capacities[order.intent.side] = remaining_capacity
         return next_sequence
 
@@ -784,7 +905,7 @@ class PaperBroker:
         self,
         sequence: int,
         event_type: PaperEventType,
-        payload: PaperOrder | PaperFill | PaperRejection,
+        payload: PaperOrder | PaperFill | PaperPosition | PaperRejection,
         occurred_at: datetime,
         envelope: MarketDataEnvelope | None = None,
     ) -> PaperEvent:
@@ -833,6 +954,10 @@ class PaperBroker:
             )
         )
 
+    @staticmethod
+    def _ordered_positions(state: _BrokerState) -> tuple[PaperPosition, ...]:
+        return tuple(state.positions[key] for key in sorted(state.positions))
+
 
 def _command_digest(command: OrderIntent | CancelIntent) -> str:
     return sha256(canonical_json(command).encode("utf-8")).hexdigest()
@@ -842,3 +967,16 @@ def _unique_reasons(
     reasons: list[MatchSkipReason],
 ) -> tuple[MatchSkipReason, ...]:
     return tuple(dict.fromkeys(reasons))
+
+
+def _policy_skip_reason(error: ExecutionPolicyError) -> MatchSkipReason | None:
+    if error.code is ExecutionPolicyErrorCode.FEE_CURRENCY_MISMATCH:
+        return MatchSkipReason.METADATA_MISMATCH
+    if error.code in {
+        ExecutionPolicyErrorCode.FEE_RULE_MISSING,
+        ExecutionPolicyErrorCode.FEE_CURRENCY_MISSING,
+    }:
+        return MatchSkipReason.METADATA_UNAVAILABLE
+    if error.code is ExecutionPolicyErrorCode.SLIPPAGE_UNREPRESENTABLE:
+        return MatchSkipReason.PRICE_UNAVAILABLE
+    return None

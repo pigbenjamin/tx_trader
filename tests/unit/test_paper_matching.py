@@ -74,6 +74,7 @@ def test_quote_top_uses_exact_scales_and_independent_capacities() -> None:
         metadata_version=instrument.metadata_version,
         price_scale=instrument.price_scale,
         quantity_scale=Decimal("0.5"),
+        currency=instrument.currency,
     )
 
     result = inspect_quote_top(quote, metadata)
@@ -83,6 +84,7 @@ def test_quote_top_uses_exact_scales_and_independent_capacities() -> None:
     assert result.ask == Decimal("20002.00")
     assert result.bid_capacity == Decimal("1.5")
     assert result.ask_capacity == Decimal("2.0")
+    assert result.currency == "TWD"
 
 
 def test_execution_price_uses_ask_for_buy_bid_for_sell_and_limit_crossing() -> None:

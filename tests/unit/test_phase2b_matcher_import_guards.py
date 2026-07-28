@@ -9,7 +9,9 @@ from pathlib import Path
 
 import pytest
 
-MATCHER_PATHS = (
+PAPER_EXECUTION_PATHS = (
+    Path("tx_trade/orders/execution_policies.py"),
+    Path("tx_trade/orders/position_ledger.py"),
     Path("tx_trade/orders/matching.py"),
     Path("tx_trade/orders/paper_broker.py"),
 )
@@ -25,6 +27,7 @@ _NONDETERMINISTIC_CALLS = {
     "datetime.datetime.today",
     "datetime.datetime.now",
     "datetime.datetime.utcnow",
+    "datetime.date.today",
     "os.urandom",
 }
 
@@ -78,6 +81,8 @@ import sys
 
 before = set(sys.modules)
 for module_name in (
+    "tx_trade.orders.execution_policies",
+    "tx_trade.orders.position_ledger",
     "tx_trade.orders.matching",
     "tx_trade.orders.paper_broker",
 ):
@@ -93,10 +98,11 @@ forbidden = sorted(
         "win32com",
         "win32com.client",
         "dotenv",
+        "dotenv.main",
         "quote_client",
         "config",
     }
-    or name.startswith(("tx_trade.broker", "tx_trade.app.config"))
+    or name.startswith(("tx_trade.broker", "tx_trade.app", "dotenv."))
 )
 print(json.dumps(forbidden))
 """
@@ -118,13 +124,14 @@ print(json.dumps(forbidden))
 
 
 def test_matcher_sources_have_no_live_execution_or_credential_symbols() -> None:
-    source = "\n".join(path.read_text(encoding="utf-8") for path in MATCHER_PATHS)
+    source = "\n".join(path.read_text(encoding="utf-8") for path in PAPER_EXECUTION_PATHS)
     forbidden = (
         "python" + "com",
         "win32" + "com",
         "comtypes" + ".client",
         "SK" + "OrderLib",
         "SK" + "ReplyLib",
+        "Connect" + "ByID",
         "Send" + "Order",
         "Order" + "Lib",
         "Reply" + "Lib",
@@ -139,7 +146,7 @@ def test_matcher_sources_have_no_live_execution_or_credential_symbols() -> None:
 
 
 def test_matcher_sources_have_no_random_or_wall_clock_dependencies() -> None:
-    for path in MATCHER_PATHS:
+    for path in PAPER_EXECUTION_PATHS:
         findings = _nondeterministic_dependencies(path.read_text(encoding="utf-8"))
         assert findings == set(), f"{path}: {sorted(findings)}"
 
@@ -169,6 +176,10 @@ def test_matcher_sources_have_no_random_or_wall_clock_dependencies() -> None:
             "from datetime import datetime\ndatetime.utcnow()",
             "datetime.datetime.utcnow",
         ),
+        (
+            "from datetime import date as Date\nDate.today()",
+            "datetime.date.today",
+        ),
     ],
 )
 def test_scanner_detects_alias_aware_hostile_snippets(
@@ -182,6 +193,8 @@ def test_scanner_detects_alias_aware_hostile_snippets(
     "source",
     [
         "from uuid import uuid5\nuuid5(namespace, name)",
+        "import hashlib as hashing\nhashing.sha256(payload)",
+        "from hashlib import sha256 as digest\ndigest(payload)",
         "from decimal import localcontext\nwith localcontext():\n    pass",
         (
             "from decimal import Decimal, localcontext\n"
