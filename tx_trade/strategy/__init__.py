@@ -9,6 +9,7 @@ from .contracts import (
 )
 from .coordinator import (
     PaperReplayCoordinator,
+    StrategyCheckpointError,
     StrategyCoordinatorError,
     StrategyDecisionRecord,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "OrderTemplate",
     "PaperReplayCoordinator",
     "StrategyContext",
+    "StrategyCheckpointError",
     "StrategyCoordinatorError",
     "StrategyDecision",
     "StrategyDecisionRecord",

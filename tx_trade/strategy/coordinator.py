@@ -2,17 +2,39 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import json
+from dataclasses import dataclass, fields, replace
+from datetime import datetime
+from decimal import Decimal
+from enum import Enum
 from hashlib import sha256
+from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from tx_trade.market_data.models import MarketDataEnvelope, serialize_envelope
 from tx_trade.orders.contracts import (
     CancelIntent,
+    ExecutionProvenance,
+    MatchDisposition,
+    MatchResult,
+    MatchSkipReason,
     OrderIntent,
+    OrderSide,
+    OrderStatus,
+    OrderType,
     PaperDecision,
     PaperDecisionBatchResult,
+    PaperEvent,
+    PaperEventType,
+    PaperFill,
+    PaperOrder,
+    PaperPosition,
+    PaperRejection,
+    RejectionCode,
+    TimeInForce,
 )
+from tx_trade.research.contracts import CheckpointKind, VersionedCheckpoint
 
 from .contracts import (
     StrategyContext,
@@ -25,6 +47,10 @@ from .ports import TransactionalPaperBrokerSnapshotPort
 
 class StrategyCoordinatorError(RuntimeError):
     """A stable, non-sensitive strategy coordination failure."""
+
+
+class StrategyCheckpointError(ValueError):
+    """A stable, non-sensitive coordinator checkpoint failure."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +142,161 @@ class PaperReplayCoordinator:
                 ),
             )
         )
+
+    def export_checkpoint(self) -> VersionedCheckpoint:
+        payload = {
+            "max_decision_records": self._max_decision_records,
+            "mode": _encode(self._mode),
+            "records": _encode(self.decision_records()),
+            "registrations": _encode(
+                tuple(
+                    (registration.strategy_id, registration.fingerprint)
+                    for registration in self._registrations
+                )
+            ),
+            "source_digests": _encode(
+                tuple(
+                    (session_id, sequence, digest)
+                    for (session_id, sequence), digest in sorted(
+                        self._source_digests.items(),
+                        key=lambda item: (str(item[0][0]), item[0][1]),
+                    )
+                )
+            ),
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        return VersionedCheckpoint.create(
+            kind=CheckpointKind.COORDINATOR,
+            schema_version=1,
+            payload=encoded,
+        )
+
+    @classmethod
+    def restore_checkpoint(
+        cls,
+        checkpoint: VersionedCheckpoint,
+        *,
+        broker: TransactionalPaperBrokerSnapshotPort,
+        registrations: tuple[StrategyRegistration, ...],
+    ) -> PaperReplayCoordinator:
+        try:
+            if type(checkpoint) is not VersionedCheckpoint:
+                raise TypeError
+            if checkpoint.kind is not CheckpointKind.COORDINATOR or checkpoint.schema_version != 1:
+                raise ValueError
+            document = json.loads(
+                checkpoint.payload.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
+            _exact_keys(
+                document,
+                {
+                    "max_decision_records",
+                    "mode",
+                    "records",
+                    "registrations",
+                    "source_digests",
+                },
+            )
+            mode = _decode(document["mode"])
+            records = _decode(document["records"])
+            identities = _decode(document["registrations"])
+            source_digests = _decode(document["source_digests"])
+            if (
+                type(mode) is not StrategyExecutionMode
+                or type(records) is not tuple
+                or type(identities) is not tuple
+                or type(source_digests) is not tuple
+            ):
+                raise TypeError
+            expected_identities = tuple(
+                (registration.strategy_id, registration.fingerprint)
+                for registration in sorted(
+                    registrations, key=lambda registration: registration.strategy_id
+                )
+            )
+            if identities != expected_identities:
+                raise ValueError
+            coordinator = cls(
+                broker=broker,
+                registrations=registrations,
+                mode=mode,
+                max_decision_records=document["max_decision_records"],
+            )
+            coordinator._restore_state(records, source_digests)
+            if coordinator.export_checkpoint().payload != checkpoint.payload:
+                raise ValueError
+            return coordinator
+        except StrategyCheckpointError:
+            raise
+        except (
+            TypeError,
+            ValueError,
+            KeyError,
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+        ):
+            raise StrategyCheckpointError("strategy coordinator checkpoint is invalid") from None
+
+    def _restore_state(
+        self,
+        records: tuple[object, ...],
+        source_digests: tuple[object, ...],
+    ) -> None:
+        if len(records) > self._max_decision_records or len(records) != len(source_digests):
+            raise ValueError
+        registered_strategy_ids = {registration.strategy_id for registration in self._registrations}
+        restored_records: dict[tuple[UUID, int, str], StrategyDecisionRecord] = {}
+        prior_record_key: tuple[str, int, str] | None = None
+        for record in records:
+            if type(record) is not StrategyDecisionRecord:
+                raise TypeError
+            sort_key = (
+                str(record.source_session_id),
+                record.source_ingest_sequence,
+                record.envelope_digest,
+            )
+            if prior_record_key is not None and sort_key <= prior_record_key:
+                raise ValueError
+            if (
+                self._mode is StrategyExecutionMode.OBSERVE_ONLY and record.batch_result is not None
+            ) or any(
+                command.strategy_id not in registered_strategy_ids
+                for command in record.decision.commands
+            ):
+                raise ValueError
+            prior_record_key = sort_key
+            key = (
+                record.source_session_id,
+                record.source_ingest_sequence,
+                record.envelope_digest,
+            )
+            restored_records[key] = record
+        restored_digests: dict[tuple[UUID, int], str] = {}
+        prior_source_key: tuple[str, int] | None = None
+        for item in source_digests:
+            if (
+                type(item) is not tuple
+                or len(item) != 3
+                or type(item[0]) is not UUID
+                or type(item[1]) is not int
+                or type(item[2]) is not str
+            ):
+                raise TypeError
+            session_id, sequence, digest = item
+            source_sort_key = (str(session_id), sequence)
+            if prior_source_key is not None and source_sort_key <= prior_source_key:
+                raise ValueError
+            prior_source_key = source_sort_key
+            matching = restored_records.get((session_id, sequence, digest))
+            if matching is None:
+                raise ValueError
+            restored_digests[(session_id, sequence)] = digest
+        self._records = restored_records
+        self._source_digests = restored_digests
 
     def publish(self, envelope: MarketDataEnvelope) -> None:
         if type(envelope) is not MarketDataEnvelope:
@@ -245,3 +426,122 @@ class PaperReplayCoordinator:
         keys = tuple((command.strategy_id, command.client_order_id) for command in commands)
         if len(keys) != len(set(keys)):
             raise StrategyCoordinatorError("strategy command client id conflict")
+
+
+_CHECKPOINT_TYPES: dict[str, Any] = {
+    item.__name__: item
+    for item in (
+        StrategyDecisionRecord,
+        OrderIntent,
+        CancelIntent,
+        PaperDecision,
+        PaperOrder,
+        PaperFill,
+        PaperRejection,
+        PaperPosition,
+        PaperEvent,
+        MatchResult,
+        PaperDecisionBatchResult,
+    )
+}
+_CHECKPOINT_ENUMS: dict[str, Any] = {
+    item.__name__: item
+    for item in (
+        StrategyExecutionMode,
+        OrderSide,
+        OrderStatus,
+        OrderType,
+        TimeInForce,
+        ExecutionProvenance,
+        RejectionCode,
+        PaperEventType,
+        MatchDisposition,
+        MatchSkipReason,
+    )
+}
+
+
+def _encode(value: object) -> object:
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    if type(value) is UUID:
+        return {"$uuid": str(value)}
+    if type(value) is Decimal:
+        return {"$decimal": str(value)}
+    if type(value) is datetime:
+        return {"$datetime": value.isoformat(timespec="microseconds")}
+    if isinstance(value, Enum):
+        return {"$enum": type(value).__name__, "value": value.value}
+    if type(value) is tuple:
+        return {"$tuple": [_encode(item) for item in value]}
+    value_type = type(value)
+    if value_type.__name__ in _CHECKPOINT_TYPES:
+        return {
+            "$type": value_type.__name__,
+            **{
+                item.name: _encode(getattr(value, item.name))
+                for item in fields(value)  # type: ignore[arg-type]
+                if item.init
+            },
+        }
+    raise TypeError
+
+
+def _decode(value: object) -> object:
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    if type(value) is not dict:
+        raise TypeError
+    if "$uuid" in value:
+        _exact_keys(value, {"$uuid"})
+        if type(value["$uuid"]) is not str:
+            raise TypeError
+        return UUID(value["$uuid"])
+    if "$decimal" in value:
+        _exact_keys(value, {"$decimal"})
+        if type(value["$decimal"]) is not str:
+            raise TypeError
+        return Decimal(value["$decimal"])
+    if "$datetime" in value:
+        _exact_keys(value, {"$datetime"})
+        if type(value["$datetime"]) is not str:
+            raise TypeError
+        parsed = datetime.fromisoformat(value["$datetime"])
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError
+        return parsed.astimezone(ZoneInfo("Asia/Taipei"))
+    if "$enum" in value:
+        _exact_keys(value, {"$enum", "value"})
+        enum_type = _CHECKPOINT_ENUMS.get(value["$enum"])
+        if enum_type is None or type(value["value"]) is not str:
+            raise TypeError
+        return enum_type(value["value"])
+    if "$tuple" in value:
+        _exact_keys(value, {"$tuple"})
+        if type(value["$tuple"]) is not list:
+            raise TypeError
+        return tuple(_decode(item) for item in value["$tuple"])
+    type_name = value.get("$type")
+    if type(type_name) is not str:
+        raise TypeError
+    value_type = _CHECKPOINT_TYPES.get(type_name)
+    if value_type is None:
+        raise TypeError
+    expected = {"$type", *(item.name for item in fields(value_type) if item.init)}
+    _exact_keys(value, expected)
+    arguments = {item.name: _decode(value[item.name]) for item in fields(value_type) if item.init}
+    return value_type(**arguments)
+
+
+def _exact_keys(value: object, expected: set[str]) -> None:
+    if type(value) is not dict or set(value) != expected:
+        raise ValueError
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result

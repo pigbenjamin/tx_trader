@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -150,6 +151,60 @@ def test_main_rejects_arguments_without_opening_or_output(tmp_path, capsys) -> N
     assert output.getvalue() == b""
     assert captured.out == ""
     assert captured.err == "Research paper replay failed safely.\n"
+
+
+def test_main_treats_short_write_as_failure(tmp_path, capsys) -> None:
+    database_path = tmp_path / "short-write.db"
+    _record(database_path)
+
+    class ShortWriter:
+        def write(self, payload: bytes) -> int:
+            return len(payload) - 1
+
+        def flush(self) -> None:
+            raise AssertionError("short writes must fail before flush")
+
+    assert main([], environment=_environment(database_path), output=ShortWriter()) == 2  # type: ignore[arg-type]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "Research paper replay failed safely.\n"
+
+
+def test_durable_state_path_must_not_be_a_hardlink_to_source(tmp_path: Path) -> None:
+    source = tmp_path / "source.sqlite3"
+    state = tmp_path / "state.sqlite3"
+    _record(source)
+    try:
+        os.link(source, state)
+    except OSError:
+        pytest.skip("hard links are unavailable on this filesystem")
+    environment = _environment(source)
+    environment.update(
+        {
+            "TX_TRADE_RESEARCH_PAPER_RESTART_MODE": "resume",
+            "TX_TRADE_RESEARCH_PAPER_STATE_DB_PATH": str(state),
+            "TX_TRADE_RESEARCH_PAPER_MAX_STATE_MAIN_DB_BYTES": str(16 * 1024 * 1024),
+        }
+    )
+
+    opened = []
+
+    def forbidden_state_open(
+        path,
+        *,
+        max_main_database_bytes,
+        create_new,
+        forbidden_file_identity,
+    ):
+        opened.append(path)
+        raise OSError
+
+    with pytest.raises(ResearchPaperApplicationError, match="failed safely"):
+        run_research_paper_app(
+            environment,
+            state_repository_factory=forbidden_state_open,
+        )
+    assert opened == []
 
 
 def test_composition_passes_one_canonical_path_and_closes_repository(tmp_path) -> None:

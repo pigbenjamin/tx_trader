@@ -243,7 +243,48 @@ Output is buffered until replay and broker processing complete. Standard
 output then contains versioned deterministic JSON Lines in `market`, `paper`,
 and terminal `summary` records. The broker's internal event journal is the
 authoritative paper event source. Durable broker checkpoints and a durable
-output outbox are not implemented yet.
+output outbox are available when restart mode is enabled.
+
+Phase 2B-5 adds an independent writable paper-state SQLite database. The
+Phase 1 recording remains immutable and read-only. To create a resumable run,
+add the following settings to the complete `research_paper` environment:
+
+```powershell
+$env:TX_TRADE_RESEARCH_PAPER_RESTART_MODE = "create"
+$env:TX_TRADE_RESEARCH_PAPER_STATE_DB_PATH = "D:\path\to\paper-state.sqlite3"
+$env:TX_TRADE_RESEARCH_PAPER_MAX_STATE_MAIN_DB_BYTES = "268435456"
+```
+
+After an interrupted run, use the same semantic settings and paper run UUID,
+then change only:
+
+```powershell
+$env:TX_TRADE_RESEARCH_PAPER_RESTART_MODE = "resume"
+```
+
+`create` refuses an existing state database, while `resume` requires one.
+Source and state paths must be distinct local regular files; aliases,
+hardlinks, symbolic links, reparse paths, and network paths fail closed. A raw
+replay cursor remains forbidden: the exclusive resume cursor is derived only
+from the validated durable state.
+
+`MAX_STATE_MAIN_DB_BYTES` limits the SQLite main database's logical page
+capacity. SQLite WAL/SHM sidecars and filesystem overhead are not included;
+the state directory therefore needs additional free space and should be
+protected by an appropriate filesystem quota when a hard total-disk limit is
+required.
+
+Each committed envelope stores the strategy decision, complete broker and
+coordinator checkpoints, durable cursor, and output rows in one paper-state
+transaction. Restart therefore preserves matching FIFO, N+1 eligibility,
+idempotency fences, and cached strategy decisions. A completed resume emits
+the complete artifact again.
+
+The database provides exactly-once durable broker effects and outbox enqueue.
+Delivery to stdout or a pipe remains at-least-once because a process can stop
+after a successful external write but before that write can be acknowledged.
+Consumers that require exactly-once effects must apply their own idempotency
+boundary.
 
 This mode does not import SKCOM, create Center/Quote/Reply/Order objects, read
 live credentials or `TX_TRADE_SKCOM_DLL_PATH`, connect Reply, or submit a live

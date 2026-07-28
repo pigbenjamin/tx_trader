@@ -130,13 +130,9 @@ def _materialize(
     lines: list[bytes] = []
     output_bytes = 0
     for envelope in envelopes:
-        output_bytes = _append_line(
+        output_bytes = _append_encoded_line(
             lines,
-            {
-                "envelope": to_primitive(envelope),
-                "record_type": "market",
-                "schema_version": OUTPUT_SCHEMA_VERSION,
-            },
+            encode_market_record(envelope),
             limits.max_output_bytes,
             output_bytes,
         )
@@ -146,45 +142,102 @@ def _materialize(
             if event.source_session_id is None or event.source_ingest_sequence is None
             else decision_by_source.get((event.source_session_id, event.source_ingest_sequence))
         )
-        output_bytes = _append_line(
+        output_bytes = _append_encoded_line(
             lines,
-            {
-                "decision_fingerprint": (
-                    None if record is None else record.decision.decision_fingerprint
-                ),
-                "envelope_digest": None if record is None else record.envelope_digest,
-                "event": to_canonical_primitive(event),
-                "record_type": "paper",
-                "schema_version": OUTPUT_SCHEMA_VERSION,
-            },
+            encode_paper_record(event, record),
             limits.max_output_bytes,
             output_bytes,
         )
-    terminal_paper_sequence = snapshot.next_paper_sequence - 1
-    _append_line(
+    _append_encoded_line(
         lines,
+        encode_summary_record(
+            market_record_count=len(envelopes),
+            decision_record_count=len(decisions),
+            broker_snapshot=snapshot,
+            correlation=correlation,
+        ),
+        limits.max_output_bytes,
+        output_bytes,
+    )
+    return b"".join(lines)
+
+
+def encode_market_record(envelope: MarketDataEnvelope) -> bytes:
+    """Encode one schema-v1 market record as canonical newline-terminated JSON."""
+
+    if type(envelope) is not MarketDataEnvelope:
+        raise TypeError("envelope must be MarketDataEnvelope")
+    return _encode_line(
         {
-            "broker_snapshot_version": snapshot.snapshot_version,
+            "envelope": to_primitive(envelope),
+            "record_type": "market",
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+        }
+    )
+
+
+def encode_paper_record(
+    event: PaperEvent,
+    decision_record: StrategyDecisionRecord | None,
+) -> bytes:
+    """Encode one schema-v1 paper record as canonical newline-terminated JSON."""
+
+    if type(event) is not PaperEvent:
+        raise TypeError("event must be PaperEvent")
+    if decision_record is not None and type(decision_record) is not StrategyDecisionRecord:
+        raise TypeError("decision_record must be StrategyDecisionRecord or None")
+    return _encode_line(
+        {
+            "decision_fingerprint": (
+                None if decision_record is None else decision_record.decision.decision_fingerprint
+            ),
+            "envelope_digest": (
+                None if decision_record is None else decision_record.envelope_digest
+            ),
+            "event": to_canonical_primitive(event),
+            "record_type": "paper",
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+        }
+    )
+
+
+def encode_summary_record(
+    *,
+    market_record_count: int,
+    decision_record_count: int,
+    broker_snapshot: PaperBrokerSnapshot,
+    correlation: ResearchOutputCorrelation,
+) -> bytes:
+    """Encode the unique schema-v1 terminal summary record."""
+
+    if type(market_record_count) is not int or market_record_count < 1:
+        raise ValueError("market_record_count must be a positive integer")
+    if type(decision_record_count) is not int or decision_record_count < 0:
+        raise ValueError("decision_record_count must be a non-negative integer")
+    if type(broker_snapshot) is not PaperBrokerSnapshot:
+        raise TypeError("broker_snapshot must be PaperBrokerSnapshot")
+    if type(correlation) is not ResearchOutputCorrelation:
+        raise TypeError("correlation must be ResearchOutputCorrelation")
+    return _encode_line(
+        {
+            "broker_snapshot_version": broker_snapshot.snapshot_version,
             "counts": {
-                "decisions": len(decisions),
-                "fills": len(snapshot.fills),
-                "market_records": len(envelopes),
-                "orders": len(snapshot.orders),
-                "paper_events": len(snapshot.events),
-                "positions": len(snapshot.positions),
+                "decisions": decision_record_count,
+                "fills": len(broker_snapshot.fills),
+                "market_records": market_record_count,
+                "orders": len(broker_snapshot.orders),
+                "paper_events": len(broker_snapshot.events),
+                "positions": len(broker_snapshot.positions),
             },
             "execution_config_fingerprint": correlation.execution_config_fingerprint,
             "paper_run_id": str(correlation.paper_run_id),
             "record_type": "summary",
             "replay_session_id": str(correlation.replay_session_id),
             "schema_version": OUTPUT_SCHEMA_VERSION,
-            "terminal_broker_sequence": terminal_paper_sequence,
+            "terminal_broker_sequence": broker_snapshot.next_paper_sequence - 1,
             "terminal_cursor": correlation.terminal_cursor,
-        },
-        limits.max_output_bytes,
-        output_bytes,
+        }
     )
-    return b"".join(lines)
 
 
 def _validate_correlation(
@@ -255,15 +308,20 @@ def _append_line(
     max_bytes: int,
     current_bytes: int,
 ) -> int:
-    encoded = (
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+    encoded = _encode_line(value)
+    return _append_encoded_line(lines, encoded, max_bytes, current_bytes)
+
+
+def _encode_line(value: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         + b"\n"
     )
+
+
+def _append_encoded_line(
+    lines: list[bytes], encoded: bytes, max_bytes: int, current_bytes: int
+) -> int:
     next_bytes = current_bytes + len(encoded)
     if next_bytes > max_bytes:
         raise ValueError("output capacity exceeded")

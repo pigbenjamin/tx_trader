@@ -11,6 +11,7 @@ PHASE2_APP_SOURCES = (
     Path("tx_trade/app/phase2_config.py"),
 )
 RESEARCH_PAPER_SOURCES = (
+    *sorted(Path("tx_trade/research").rglob("*.py")),
     *sorted(Path("tx_trade/strategy").rglob("*.py")),
     Path("tx_trade/app/research_paper_config.py"),
     Path("tx_trade/app/research_output.py"),
@@ -113,6 +114,10 @@ for module_name in (
     "tx_trade.app.research_paper_config",
     "tx_trade.app.research_output",
     "tx_trade.app.research_paper",
+    "tx_trade.research",
+    "tx_trade.research.contracts",
+    "tx_trade.research.ports",
+    "tx_trade.research.sqlite_repository",
 ):
     importlib.import_module(module_name)
 added = set(sys.modules) - before

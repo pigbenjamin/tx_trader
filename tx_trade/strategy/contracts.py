@@ -105,8 +105,18 @@ class StrategyDecision:
 class StrategyRegistration:
     strategy_id: str
     strategy: StrategyPort
+    fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         _strict_nonempty_string(self.strategy_id, "strategy_id")
         if self.strategy is None or not callable(getattr(self.strategy, "decide", None)):
             raise TypeError("strategy must implement StrategyPort")
+        if self.fingerprint is not None:
+            if type(self.fingerprint) is not str:
+                raise TypeError("fingerprint must be a string or None")
+            if (
+                len(self.fingerprint) != 71
+                or not self.fingerprint.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in self.fingerprint[7:])
+            ):
+                raise ValueError("fingerprint must be a canonical sha256 fingerprint")

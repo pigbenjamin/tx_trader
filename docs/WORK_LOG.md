@@ -408,3 +408,47 @@ Boundaries:
 - The internal bounded broker journal is authoritative. Durable broker
   checkpoints and a durable output outbox are intentionally deferred.
 - `phase1_smoke.sqlite3` is unrelated local data and remains untouched.
+
+## 2026-07-28: Phase 2B-5 durable recovery and output outbox
+
+Scope:
+
+- Add process-restart recovery without weakening the immutable Phase 1 source,
+  deterministic paper semantics, or the no-COM/no-live-order boundary.
+
+Delivered:
+
+- Strict persistence contracts for run identity, versioned broker/coordinator
+  checkpoints, optimistic state versions, durable batches, and output rows.
+- Canonical checkpoint codecs that restore all broker retry, matching,
+  eligibility, journal, position, decision-cache, and pending-decision state.
+- A separate writable SQLite paper-state repository with schema/application
+  version checks, migration checksum, WAL/FULL durability, capacity limits,
+  atomic batch commits, duplicate/conflict fences, and corruption detection.
+- Restart modes `disabled`, `create`, and `resume`. Raw replay cursors remain
+  rejected; resume derives its cursor from validated durable state.
+- Full source-content and semantic configuration identity validation.
+- Per-envelope atomic persistence of the strategy decision, broker and
+  coordinator checkpoints, committed cursor, and market/paper outbox rows.
+- Terminal summary persistence, completed-run re-emission, and byte equality
+  against the existing schema-v1 JSONL materializer.
+- Crash, stale-writer, corruption, flush failure, source immutability, COM
+  isolation, and hardlink/symlink/reparse path safety coverage.
+
+Delivery semantics:
+
+- Broker effects and durable outbox enqueue are exactly-once within the
+  paper-state database transaction.
+- stdout/pipe delivery is at-least-once. A completed resume intentionally
+  re-emits the complete artifact because stdout has no acknowledgment
+  protocol.
+
+Boundaries:
+
+- The Phase 1 recording remains read-only and immutable.
+- The state database must be a distinct local regular file.
+- `MAX_STATE_MAIN_DB_BYTES` limits SQLite main-database logical pages only;
+  WAL/SHM sidecars require separate filesystem capacity/quota planning.
+- No SKCOM/Capital import, credential or DLL read, Reply/Order connection,
+  callback registration, or live order path was added.
+- `phase1_smoke.sqlite3` remains unrelated and untouched.

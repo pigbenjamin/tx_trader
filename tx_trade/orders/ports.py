@@ -6,6 +6,7 @@ from typing import Protocol, TypeAlias, runtime_checkable
 from uuid import UUID
 
 from tx_trade.market_data.models import MarketDataEnvelope
+from tx_trade.research.contracts import VersionedCheckpoint
 
 from .contracts import (
     CancelIntent,
@@ -48,6 +49,13 @@ class TransactionalPaperBrokerPort(PaperBrokerPort, Protocol):
         envelope: MarketDataEnvelope,
         decision: PaperDecision,
     ) -> PaperDecisionBatchResult: ...
+
+
+@runtime_checkable
+class CheckpointablePaperBrokerPort(Protocol):
+    """Optional durable-state capability, separate from transactional execution."""
+
+    def export_checkpoint(self) -> VersionedCheckpoint: ...
 
 
 @runtime_checkable

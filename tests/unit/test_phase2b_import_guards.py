@@ -11,6 +11,7 @@ import pytest
 
 ORDER_ROOT = Path("tx_trade/orders")
 RESEARCH_PAPER_PATHS = (
+    *sorted(Path("tx_trade/research").rglob("*.py")),
     *sorted(Path("tx_trade/strategy").rglob("*.py")),
     Path("tx_trade/app/research_paper_config.py"),
     Path("tx_trade/app/research_output.py"),

@@ -722,3 +722,27 @@ composition、不讀 live credential、不載入 COM。
 - Durable paper checkpoints and a durable output outbox remain future work.
 - Research paper mode remains isolated from SKCOM, live credentials,
   Center/Quote/Reply/Order creation, Reply connections, and live orders.
+
+## Phase 2B-5 status update (2026-07-28)
+
+- Added versioned broker and strategy-coordinator checkpoints that preserve
+  private retry fences, command outcome caches, FIFO acceptance order, N+1
+  eligibility, decision records, and pending cached decisions.
+- Added a separate writable paper-state SQLite database. The immutable Phase 1
+  source database is never used for checkpoint or outbox writes.
+- Every envelope atomically commits its decision, complete checkpoints,
+  derived replay cursor, batch fingerprints, and market/paper outbox rows.
+- `disabled` preserves the Phase 2B-4 fresh run. `create` starts a new durable
+  run and `resume` restores an exact validated run. User-provided replay
+  cursors remain forbidden.
+- Completed output is reconstructed from the durable outbox and verified
+  byte-for-byte against the canonical schema-v1 materializer.
+- Durable broker effects and outbox enqueue are exactly-once. stdout/pipe
+  delivery is explicitly at-least-once and a completed resume may re-emit the
+  complete artifact.
+- State/source identity, schema/checksum, checkpoint digest, ledger/outbox
+  corruption, stale writers, hardlinks, symlinks, reparse paths, and unsafe
+  path collisions fail closed.
+- `MAX_STATE_MAIN_DB_BYTES` is intentionally a logical-page limit for the
+  SQLite main database. WAL/SHM sidecars are excluded; deployments requiring a
+  hard total-disk bound must use a filesystem or directory quota.

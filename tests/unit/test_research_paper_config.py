@@ -11,6 +11,7 @@ import pytest
 
 from tx_trade.app.research_paper_config import (
     ResearchPaperConfigError,
+    ResearchRestartMode,
     ResearchPaperSettings,
     parse_research_paper_settings,
 )
@@ -80,6 +81,9 @@ def test_minimal_settings_are_complete_immutable_and_safe() -> None:
     assert settings.order_template.order_type is OrderType.MARKET
     assert settings.order_template.time_in_force is TimeInForce.DAY
     assert not settings.order_template.day_trade
+    assert settings.restart_mode is ResearchRestartMode.DISABLED
+    assert settings.state_database_path is None
+    assert settings.max_state_main_database_bytes is None
     with pytest.raises(FrozenInstanceError):
         settings.execution_mode = "live"
 
@@ -146,6 +150,132 @@ def test_any_cursor_is_rejected_without_broker_checkpoint(cursor: str) -> None:
 
     with pytest.raises(ResearchPaperConfigError, match="checkpoint"):
         parse_research_paper_settings(values)
+
+
+@pytest.mark.parametrize("mode", ["create", "resume"])
+def test_restart_modes_require_and_parse_state_settings(mode: str) -> None:
+    values = {
+        **_required(),
+        "TX_TRADE_RESEARCH_PAPER_RESTART_MODE": mode,
+        "TX_TRADE_RESEARCH_PAPER_STATE_DB_PATH": "paper-state.sqlite3",
+        "TX_TRADE_RESEARCH_PAPER_MAX_STATE_MAIN_DB_BYTES": "50000000",
+    }
+
+    settings = parse_research_paper_settings(values)
+
+    assert settings.restart_mode is ResearchRestartMode(mode)
+    assert settings.state_database_path == Path("paper-state.sqlite3")
+    assert settings.max_state_main_database_bytes == 50_000_000
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["disabled", "create", "resume"],
+)
+def test_raw_cursor_remains_rejected_in_every_restart_mode(mode: str) -> None:
+    values = {
+        **_required(),
+        "TX_TRADE_RESEARCH_PAPER_RESTART_MODE": mode,
+        "TX_TRADE_RESEARCH_PAPER_REPLAY_AFTER_INGEST_SEQUENCE": "0",
+    }
+    if mode != "disabled":
+        values["TX_TRADE_RESEARCH_PAPER_STATE_DB_PATH"] = "paper-state.sqlite3"
+        values["TX_TRADE_RESEARCH_PAPER_MAX_STATE_MAIN_DB_BYTES"] = "50000000"
+
+    with pytest.raises(ResearchPaperConfigError, match="checkpoint"):
+        parse_research_paper_settings(values)
+
+
+@pytest.mark.parametrize("missing_suffix", ["STATE_DB_PATH", "MAX_STATE_MAIN_DB_BYTES"])
+def test_enabled_restart_requires_all_state_settings(missing_suffix: str) -> None:
+    values = {
+        **_required(),
+        "TX_TRADE_RESEARCH_PAPER_RESTART_MODE": "create",
+        "TX_TRADE_RESEARCH_PAPER_STATE_DB_PATH": "paper-state.sqlite3",
+        "TX_TRADE_RESEARCH_PAPER_MAX_STATE_MAIN_DB_BYTES": "50000000",
+    }
+    del values[f"TX_TRADE_RESEARCH_PAPER_{missing_suffix}"]
+
+    with pytest.raises(ResearchPaperConfigError, match=missing_suffix):
+        parse_research_paper_settings(values)
+
+
+@pytest.mark.parametrize("suffix", ["STATE_DB_PATH", "MAX_STATE_MAIN_DB_BYTES"])
+def test_disabled_restart_rejects_state_settings(suffix: str) -> None:
+    value = "paper-state.sqlite3" if suffix == "STATE_DB_PATH" else "50000000"
+    values = {
+        **_required(),
+        "TX_TRADE_RESEARCH_PAPER_RESTART_MODE": "disabled",
+        f"TX_TRADE_RESEARCH_PAPER_{suffix}": value,
+    }
+
+    with pytest.raises(ResearchPaperConfigError, match=suffix):
+        parse_research_paper_settings(values)
+
+
+def test_ambiguous_legacy_state_database_limit_key_is_unknown() -> None:
+    values = {
+        **_required(),
+        "TX_TRADE_RESEARCH_PAPER_MAX_STATE_DB_BYTES": "50000000",
+    }
+
+    with pytest.raises(
+        ResearchPaperConfigError,
+        match="unknown research paper setting.*MAX_STATE_DB_BYTES",
+    ):
+        parse_research_paper_settings(values)
+
+
+def test_research_fingerprint_is_semantic_not_operational() -> None:
+    baseline = parse_research_paper_settings(_required())
+    operational = parse_research_paper_settings(
+        {
+            **_required(),
+            "TX_TRADE_RESEARCH_PAPER_DB_PATH": "elsewhere.sqlite3",
+            "TX_TRADE_RESEARCH_PAPER_REPLAY_MODE": "paced",
+            "TX_TRADE_RESEARCH_PAPER_REPLAY_SPEED": "9.5",
+            "TX_TRADE_RESEARCH_PAPER_RESTART_MODE": "create",
+            "TX_TRADE_RESEARCH_PAPER_STATE_DB_PATH": "state.sqlite3",
+            "TX_TRADE_RESEARCH_PAPER_MAX_STATE_MAIN_DB_BYTES": "999999",
+        }
+    )
+
+    assert baseline.research_config_fingerprint == operational.research_config_fingerprint
+    assert baseline.research_config_fingerprint.startswith("sha256:")
+    assert len(baseline.research_config_fingerprint) == 71
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("TX_TRADE_RESEARCH_PAPER_MAX_EVENTS", "399999"),
+        ("TX_TRADE_RESEARCH_PAPER_SLIPPAGE_MODE", "absolute"),
+        ("TX_TRADE_RESEARCH_PAPER_ACCOUNT_ID", "another-paper-account"),
+        ("TX_TRADE_RESEARCH_PAPER_ORDER_QUANTITY", "3"),
+    ],
+)
+def test_research_fingerprint_changes_with_semantics(key: str, value: str) -> None:
+    baseline = parse_research_paper_settings(_required())
+    changed_values = {**_required(), key: value}
+    if key.endswith("SLIPPAGE_MODE"):
+        changed_values["TX_TRADE_RESEARCH_PAPER_SLIPPAGE_VALUE"] = "1"
+
+    changed = parse_research_paper_settings(changed_values)
+
+    assert baseline.research_config_fingerprint != changed.research_config_fingerprint
+
+
+def test_research_fingerprint_does_not_contain_live_secrets() -> None:
+    values = {
+        **_required(),
+        "TX_TRADE_ACCOUNT": "live-account-canary",
+        "TX_TRADE_PASSWORD": "password-canary",
+        "TX_TRADE_SKCOM_DLL_PATH": "dll-canary",
+    }
+
+    fingerprint = parse_research_paper_settings(values).research_config_fingerprint
+
+    assert "canary" not in fingerprint
 
 
 @pytest.mark.parametrize(

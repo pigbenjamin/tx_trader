@@ -12,6 +12,9 @@ from tx_trade.app.research_output import (
     ResearchOutputCorrelation,
     ResearchOutputError,
     ResearchOutputLimits,
+    encode_market_record,
+    encode_paper_record,
+    encode_summary_record,
     materialize_research_jsonl,
 )
 from tx_trade.market_data.fixtures import make_offline_fixture_envelopes
@@ -138,6 +141,36 @@ def test_materializes_canonical_market_paper_and_one_terminal_summary() -> None:
         "paper_events": len(snapshot.events),
         "positions": len(snapshot.positions),
     }
+
+
+def test_single_record_encoders_preserve_materialized_schema_bytes() -> None:
+    envelopes, decisions, snapshot, correlation = _completed_run()
+    decision_by_source = {
+        (record.source_session_id, record.source_ingest_sequence): record for record in decisions
+    }
+    encoded = b"".join(encode_market_record(envelope) for envelope in envelopes)
+    encoded += b"".join(
+        encode_paper_record(
+            event,
+            decision_by_source[(event.source_session_id, event.source_ingest_sequence)],
+        )
+        for event in snapshot.events
+        if event.source_session_id is not None and event.source_ingest_sequence is not None
+    )
+    encoded += encode_summary_record(
+        market_record_count=len(envelopes),
+        decision_record_count=len(decisions),
+        broker_snapshot=snapshot,
+        correlation=correlation,
+    )
+
+    assert encoded == materialize_research_jsonl(
+        market_envelopes=envelopes,
+        decision_records=decisions,
+        broker_snapshot=snapshot,
+        correlation=correlation,
+        limits=_limits(),
+    )
 
 
 def test_paper_records_come_from_complete_snapshot_journal() -> None:

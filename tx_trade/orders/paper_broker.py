@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import json
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from decimal import Decimal, localcontext
+from enum import Enum
 from hashlib import sha256
 from threading import RLock
 from types import MappingProxyType
-from typing import Mapping, TypeAlias, TypeVar
+from typing import Any, Mapping, TypeAlias, TypeVar
 from uuid import UUID, uuid5
+from zoneinfo import ZoneInfo
 
 from tx_trade.market_data.models import (
     EventType,
@@ -18,17 +21,22 @@ from tx_trade.market_data.models import (
     Quote,
     serialize_envelope,
 )
+from tx_trade.research.contracts import CheckpointKind, VersionedCheckpoint
 
 from .contracts import (
     CancelIntent,
     DEFAULT_EXECUTION_CONFIG,
     InstrumentMetadataSnapshot,
+    ExecutionProvenance,
+    FeePolicyKind,
+    FeeRoundingMode,
     MatchDisposition,
     MatchResult,
     MatchSkipReason,
     OrderIntent,
     OrderSide,
     OrderStatus,
+    OrderType,
     PaperBrokerLimits,
     PaperBrokerSnapshot,
     PaperDecision,
@@ -36,11 +44,16 @@ from .contracts import (
     PaperExecutionConfig,
     PaperEvent,
     PaperEventType,
+    PaperFeeRule,
+    PaperFeeSchedule,
     PaperFill,
     PaperOrder,
     PaperPosition,
     PaperRejection,
     RejectionCode,
+    SlippageConfig,
+    SlippageMode,
+    TimeInForce,
     canonical_json,
 )
 from .execution_policies import (
@@ -62,6 +75,7 @@ from .position_ledger import (
     PositionLedgerError,
     PositionLedgerErrorCode,
     apply_fill_to_position,
+    paper_position_id,
 )
 from .state_machine import validate_order_transition
 
@@ -78,6 +92,10 @@ class PaperBrokerInputError(ValueError):
 
 class PaperBrokerCapacityError(RuntimeError):
     """Raised when an envelope's complete staged batch cannot fit."""
+
+
+class PaperBrokerCheckpointError(ValueError):
+    """A checkpoint was not a valid, self-consistent paper-broker state."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,6 +459,331 @@ class PaperBroker:
                 instruments=tuple(state.instruments[key] for key in sorted(state.instruments)),
                 positions=self._ordered_positions(state),
             )
+
+    def export_checkpoint(self) -> VersionedCheckpoint:
+        """Export every authoritative and retry-fence field as canonical JSON."""
+
+        with self._lock:
+            payload = {
+                "execution_config": _checkpoint_encode(self._execution_config),
+                "limits": _checkpoint_encode(self._limits),
+                "paper_run_id": _checkpoint_encode(self._paper_run_id),
+                "state": _checkpoint_encode(self._state),
+            }
+            encoded = json.dumps(
+                payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        return VersionedCheckpoint.create(
+            kind=CheckpointKind.BROKER,
+            schema_version=1,
+            payload=encoded,
+        )
+
+    @classmethod
+    def restore_checkpoint(cls, checkpoint: VersionedCheckpoint) -> PaperBroker:
+        """Restore a broker without consulting the environment, clock, or filesystem."""
+
+        try:
+            if type(checkpoint) is not VersionedCheckpoint:
+                raise TypeError
+            if checkpoint.kind is not CheckpointKind.BROKER or checkpoint.schema_version != 1:
+                raise ValueError
+            document = json.loads(
+                checkpoint.payload.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
+            _validate_json_complexity(document)
+            _exact_keys(
+                document,
+                {"execution_config", "limits", "paper_run_id", "state"},
+            )
+            paper_run_id = _checkpoint_decode(document["paper_run_id"])
+            limits = _checkpoint_decode(document["limits"])
+            execution_config = _checkpoint_decode(document["execution_config"])
+            state = _checkpoint_decode(document["state"])
+            if (
+                type(paper_run_id) is not UUID
+                or type(limits) is not PaperBrokerLimits
+                or type(execution_config) is not PaperExecutionConfig
+                or type(state) is not _BrokerState
+            ):
+                raise ValueError
+            restored = cls(
+                paper_run_id=paper_run_id,
+                limits=limits,
+                execution_config=execution_config,
+                expected_source_session_id=state.effective_session,
+            )
+            restored._validate_checkpoint_state(state)
+            restored._state = state
+            if restored.export_checkpoint().payload != checkpoint.payload:
+                raise ValueError
+            return restored
+        except PaperBrokerCheckpointError:
+            raise
+        except (
+            TypeError,
+            ValueError,
+            KeyError,
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid") from None
+
+    def _validate_checkpoint_state(self, state: _BrokerState) -> None:
+        if (
+            type(state.effective_session) not in {UUID, type(None)}
+            or type(state.bound_session) not in {UUID, type(None)}
+            or type(state.bound_source) not in {str, type(None)}
+            or type(state.last_sequence) not in {int, type(None)}
+            or type(state.next_paper_sequence) is not int
+            or type(state.snapshot_version) is not int
+            or type(state.next_acceptance_ordinal) is not int
+            or state.next_paper_sequence < 1
+            or state.snapshot_version < 0
+            or state.next_acceptance_ordinal < 1
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if (
+            any(
+                type(key) is not UUID or type(value) is not PaperOrder
+                for key, value in state.orders.items()
+            )
+            or any(
+                type(key) is not tuple
+                or len(key) != 3
+                or any(type(part) is not str for part in key)
+                or type(value) is not PaperPosition
+                for key, value in state.positions.items()
+            )
+            or any(type(value) is not PaperFill for value in state.fills)
+            or any(type(value) is not PaperEvent for value in state.events)
+            or any(
+                type(key) is not tuple
+                or len(key) != 2
+                or type(key[0]) is not str
+                or type(key[1]) is not int
+                or type(value) is not InstrumentMetadataSnapshot
+                or key != (value.instrument_id, value.metadata_version)
+                for key, value in state.instruments.items()
+            )
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if state.execution_config_fingerprint != self._execution_config.fingerprint:
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if state.effective_session is not None and state.bound_session not in {
+            None,
+            state.effective_session,
+        }:
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if (state.bound_session is None) != (state.bound_source is None):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if (state.bound_session is None) != (state.last_sequence is None):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if state.next_paper_sequence != len(state.events) + 1:
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if tuple(event.paper_sequence for event in state.events) != tuple(
+            range(1, state.next_paper_sequence)
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if any(
+            event.paper_event_id
+            != self._uuid("event", str(event.paper_sequence), event.event_type.value)
+            for event in state.events
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if set(state.acceptance_ordinal) != set(state.orders):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        ordinals = tuple(sorted(state.acceptance_ordinal.values()))
+        if ordinals != tuple(range(1, state.next_acceptance_ordinal)):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if set(state.eligibility_sequence) != set(state.orders):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if any(
+            type(value) is not int or value < -1 for value in state.eligibility_sequence.values()
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        for order_id, order in state.orders.items():
+            if (
+                order.paper_run_id != self._paper_run_id
+                or order_id != order.paper_order_id
+                or order_id
+                != self._order_id(order.intent.strategy_id, order.intent.client_order_id)
+            ):
+                raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+            submit_record = state.submit_outcomes.get(
+                (order.intent.strategy_id, order.intent.client_order_id)
+            )
+            if (
+                submit_record is None
+                or type(submit_record.primary_outcome) is not PaperOrder
+                or submit_record.primary_outcome.paper_order_id != order_id
+                or submit_record.primary_outcome.status is not OrderStatus.ACCEPTED
+                or submit_record.primary_digest
+                != _command_digest(submit_record.primary_outcome.intent)
+            ):
+                raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if any(fill.paper_run_id != self._paper_run_id for fill in state.fills):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        fill_ordinals: dict[tuple[UUID, UUID, int], int] = {}
+        for fill in state.fills:
+            fill_key = (
+                fill.paper_order_id,
+                fill.source_session_id,
+                fill.source_ingest_sequence,
+            )
+            fill_ordinals[fill_key] = fill_ordinals.get(fill_key, 0) + 1
+            if fill.paper_fill_id != self._uuid(
+                "fill",
+                str(fill.paper_order_id),
+                str(fill.source_session_id),
+                str(fill.source_ingest_sequence),
+                str(fill_ordinals[fill_key]),
+                state.execution_config_fingerprint,
+            ):
+                raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+            if (
+                fill.paper_order_id not in state.orders
+                or fill.execution_config_fingerprint != state.execution_config_fingerprint
+            ):
+                raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        for position_key, position in state.positions.items():
+            if (
+                position.paper_run_id != self._paper_run_id
+                or position_key
+                != (position.strategy_id, position.account_id, position.instrument_id)
+                or position.paper_position_id
+                != paper_position_id(self._paper_run_id, *position_key)
+            ):
+                raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        fill_events = tuple(
+            event for event in state.events if event.event_type is PaperEventType.FILL_RECORDED
+        )
+        if (
+            len(fill_events) != len(state.fills)
+            or {
+                event.payload.paper_fill_id
+                for event in fill_events
+                if isinstance(event.payload, PaperFill)
+            }
+            != {fill.paper_fill_id for fill in state.fills}
+            or any(
+                type(event.payload) is not PaperFill or event.payload not in state.fills
+                for event in fill_events
+            )
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        for order_id, order in state.orders.items():
+            order_events = tuple(
+                event
+                for event in state.events
+                if type(event.payload) is PaperOrder and event.payload.paper_order_id == order_id
+            )
+            order_fills = tuple(fill for fill in state.fills if fill.paper_order_id == order_id)
+            if (
+                not order_events
+                or order_events[0].event_type is not PaperEventType.ORDER_ACCEPTED
+                or order_events[-1].payload != order
+                or sum((fill.quantity for fill in order_fills), Decimal("0"))
+                != order.filled_quantity
+            ):
+                raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        for position_key, position in state.positions.items():
+            position_events = tuple(
+                event
+                for event in state.events
+                if type(event.payload) is PaperPosition
+                and (
+                    event.payload.strategy_id,
+                    event.payload.account_id,
+                    event.payload.instrument_id,
+                )
+                == position_key
+            )
+            if not position_events or position_events[-1].payload != position:
+                raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if any(
+            (type(event.payload) is PaperOrder and event.payload.paper_order_id not in state.orders)
+            or (
+                type(event.payload) is PaperFill
+                and event.payload.paper_order_id not in state.orders
+            )
+            for event in state.events
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if len(state.orders) > self._limits.max_orders:
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if self._open_order_count(state) > self._limits.max_open_orders:
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if len(state.fills) > self._limits.max_fills or len(state.events) > self._limits.max_events:
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if len(state.positions) > self._limits.max_positions:
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if len(state.instruments) > self._limits.max_instrument_versions:
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if (
+            len(state.submit_outcomes) > self._limits.max_orders
+            or len(state.cancel_outcomes) > self._limits.max_orders
+            or len(state.acceptance_ordinal) > self._limits.max_orders
+            or len(state.eligibility_sequence) > self._limits.max_orders
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        fence_keys = set(state.envelope_fingerprints)
+        if (
+            len(fence_keys) > self._limits.max_market_data_records
+            or any(type(key) is not int or key < 0 for key in fence_keys)
+            or any(
+                type(value) is not str or len(value) != 64
+                for value in state.envelope_fingerprints.values()
+            )
+            or any(
+                type(value) is not str or not value.startswith("sha256:")
+                for value in state.decision_fingerprints.values()
+            )
+            or any(
+                type(key) is not str or len(key) != 64 or type(value) is not int
+                for key, value in state.dedupe_sequences.items()
+            )
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if fence_keys != set(state.decision_fingerprints):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if any(sequence not in fence_keys for sequence in state.dedupe_sequences.values()):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        if state.last_sequence is not None and (
+            not fence_keys or max(fence_keys) != state.last_sequence
+        ):
+            raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+        for key, record in state.submit_outcomes.items():
+            if any(
+                key != _outcome_strategy_client(outcome)
+                or outcome.paper_run_id != self._paper_run_id
+                for outcome in (record.primary_outcome, record.alternate_outcome)
+                if outcome is not None
+            ):
+                raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+            _validate_outcome_record(record)
+        for cancel_key, record in state.cancel_outcomes.items():
+            outcome = record.primary_outcome
+            if any(
+                cancel_key
+                != (
+                    getattr(candidate, "paper_order_id", None),
+                    *_outcome_strategy_client(candidate),
+                )
+                or candidate.paper_run_id != self._paper_run_id
+                for candidate in (record.primary_outcome, record.alternate_outcome)
+                if candidate is not None
+            ) or (
+                cancel_key[0] not in state.orders
+                and not (
+                    isinstance(outcome, PaperRejection)
+                    and outcome.code is RejectionCode.UNKNOWN_ORDER
+                )
+            ):
+                raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+            _validate_outcome_record(record)
 
     def publish(self, envelope: MarketDataEnvelope) -> None:
         self.process_market_data(envelope)
@@ -1263,3 +1606,189 @@ def _policy_skip_reason(error: ExecutionPolicyError) -> MatchSkipReason | None:
     if error.code is ExecutionPolicyErrorCode.SLIPPAGE_UNREPRESENTABLE:
         return MatchSkipReason.PRICE_UNAVAILABLE
     return None
+
+
+_CHECKPOINT_TYPES: dict[str, Any] = {
+    item.__name__: item
+    for item in (
+        _BrokerState,
+        _OutcomeRecord,
+        PaperBrokerLimits,
+        PaperExecutionConfig,
+        SlippageConfig,
+        PaperFeeSchedule,
+        PaperFeeRule,
+        OrderIntent,
+        PaperOrder,
+        PaperFill,
+        PaperRejection,
+        PaperPosition,
+        PaperEvent,
+        InstrumentMetadataSnapshot,
+    )
+}
+_CHECKPOINT_ENUMS: dict[str, Any] = {
+    item.__name__: item
+    for item in (
+        OrderSide,
+        OrderStatus,
+        OrderType,
+        TimeInForce,
+        ExecutionProvenance,
+        RejectionCode,
+        PaperEventType,
+        SlippageMode,
+        FeePolicyKind,
+        FeeRoundingMode,
+    )
+}
+
+
+def _checkpoint_encode(value: object) -> object:
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    if type(value) is UUID:
+        return {"$uuid": str(value)}
+    if type(value) is Decimal:
+        return {"$decimal": str(value)}
+    if type(value) is datetime:
+        return {"$datetime": value.isoformat(timespec="microseconds")}
+    if isinstance(value, Enum):
+        return {"$enum": type(value).__name__, "value": value.value}
+    if type(value) is tuple:
+        return {"$tuple": [_checkpoint_encode(item) for item in value]}
+    if isinstance(value, Mapping):
+        encoded_items = [
+            [_checkpoint_encode(key), _checkpoint_encode(item)] for key, item in value.items()
+        ]
+        encoded_items.sort(
+            key=lambda item: json.dumps(
+                item[0], ensure_ascii=True, separators=(",", ":"), sort_keys=True
+            )
+        )
+        return {"$map": encoded_items}
+    value_type = type(value)
+    if value_type.__name__ in _CHECKPOINT_TYPES:
+        return {
+            "$type": value_type.__name__,
+            **{
+                item.name: _checkpoint_encode(getattr(value, item.name))
+                for item in fields(value)  # type: ignore[arg-type]
+                if item.init
+            },
+        }
+    raise TypeError("unsupported paper broker checkpoint value")
+
+
+def _checkpoint_decode(value: object) -> object:
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    if type(value) is not dict:
+        raise TypeError
+    if "$uuid" in value:
+        _exact_keys(value, {"$uuid"})
+        if type(value["$uuid"]) is not str:
+            raise TypeError
+        return UUID(value["$uuid"])
+    if "$decimal" in value:
+        _exact_keys(value, {"$decimal"})
+        if type(value["$decimal"]) is not str:
+            raise TypeError
+        return Decimal(value["$decimal"])
+    if "$datetime" in value:
+        _exact_keys(value, {"$datetime"})
+        if type(value["$datetime"]) is not str:
+            raise TypeError
+        parsed = datetime.fromisoformat(value["$datetime"])
+        return parsed.astimezone(ZoneInfo("Asia/Taipei"))
+    if "$enum" in value:
+        _exact_keys(value, {"$enum", "value"})
+        enum_type = _CHECKPOINT_ENUMS.get(value["$enum"])
+        if enum_type is None or type(value["value"]) is not str:
+            raise TypeError
+        return enum_type(value["value"])
+    if "$tuple" in value:
+        _exact_keys(value, {"$tuple"})
+        if type(value["$tuple"]) is not list:
+            raise TypeError
+        return tuple(_checkpoint_decode(item) for item in value["$tuple"])
+    if "$map" in value:
+        _exact_keys(value, {"$map"})
+        if type(value["$map"]) is not list:
+            raise TypeError
+        result: dict[object, object] = {}
+        for pair in value["$map"]:
+            if type(pair) is not list or len(pair) != 2:
+                raise TypeError
+            key = _checkpoint_decode(pair[0])
+            if key in result:
+                raise ValueError
+            result[key] = _checkpoint_decode(pair[1])
+        return _mapping(result)
+    type_name = value.get("$type")
+    if type(type_name) is not str:
+        raise TypeError
+    value_type = _CHECKPOINT_TYPES.get(type_name)
+    if value_type is None:
+        raise TypeError
+    expected = {"$type", *(item.name for item in fields(value_type) if item.init)}
+    _exact_keys(value, expected)
+    arguments = {
+        item.name: _checkpoint_decode(value[item.name]) for item in fields(value_type) if item.init
+    }
+    return value_type(**arguments)
+
+
+def _exact_keys(value: object, expected: set[str]) -> None:
+    if type(value) is not dict or set(value) != expected:
+        raise ValueError
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def _validate_json_complexity(value: object) -> None:
+    stack = [(value, 0)]
+    node_count = 0
+    while stack:
+        current, depth = stack.pop()
+        node_count += 1
+        if depth > 64 or node_count > 1_000_000:
+            raise ValueError
+        if type(current) is dict:
+            stack.extend((item, depth + 1) for item in current.values())
+        elif type(current) is list:
+            stack.extend((item, depth + 1) for item in current)
+
+
+def _validate_outcome_record(record: _OutcomeRecord) -> None:
+    if (
+        type(record.primary_digest) is not str
+        or len(record.primary_digest) != 64
+        or any(character not in "0123456789abcdef" for character in record.primary_digest)
+        or type(record.primary_outcome) not in {PaperOrder, PaperRejection}
+    ):
+        raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+    if (record.alternate_digest is None) != (record.alternate_outcome is None):
+        raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+    if record.alternate_digest == record.primary_digest:
+        raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+    if record.alternate_digest is not None and (
+        type(record.alternate_digest) is not str
+        or len(record.alternate_digest) != 64
+        or any(character not in "0123456789abcdef" for character in record.alternate_digest)
+        or type(record.alternate_outcome) not in {PaperOrder, PaperRejection}
+    ):
+        raise PaperBrokerCheckpointError("paper broker checkpoint is invalid")
+
+
+def _outcome_strategy_client(outcome: OrderCommandResult) -> tuple[str, str]:
+    if isinstance(outcome, PaperOrder):
+        return outcome.intent.strategy_id, outcome.intent.client_order_id
+    return outcome.strategy_id, outcome.client_order_id

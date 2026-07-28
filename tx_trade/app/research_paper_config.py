@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from hashlib import sha256
+import json
 from pathlib import Path
 from typing import Literal, TypeVar
 from uuid import UUID
@@ -32,9 +34,21 @@ class ResearchPaperConfigError(ValueError):
     """Raised when research-paper settings are missing or unsafe."""
 
 
+class ResearchRestartMode(StrEnum):
+    """Durability mode for a research-paper run."""
+
+    DISABLED = "disabled"
+    CREATE = "create"
+    RESUME = "resume"
+
+
 @dataclass(frozen=True, slots=True)
 class ResearchPaperSettings:
-    """Validated settings for one fresh, deterministic paper replay."""
+    """Validated deterministic paper replay settings.
+
+    ``max_state_main_database_bytes`` caps SQLite main-database logical pages.
+    SQLite WAL and SHM sidecars are deliberately excluded from that limit.
+    """
 
     runtime_preset: Literal["research_paper"]
     execution_mode: Literal["paper"]
@@ -46,6 +60,9 @@ class ResearchPaperSettings:
     execution_config: PaperExecutionConfig
     max_decision_records: int
     order_template: OrderTemplate
+    restart_mode: ResearchRestartMode = ResearchRestartMode.DISABLED
+    state_database_path: Path | None = None
+    max_state_main_database_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.runtime_preset != "research_paper":
@@ -72,6 +89,100 @@ class ResearchPaperSettings:
             raise ResearchPaperConfigError("max_decision_records must be a positive integer")
         if type(self.order_template) is not OrderTemplate:
             raise ResearchPaperConfigError("order_template must be OrderTemplate")
+        if type(self.restart_mode) is not ResearchRestartMode:
+            raise ResearchPaperConfigError("restart_mode must be ResearchRestartMode")
+        if self.restart_mode is ResearchRestartMode.DISABLED:
+            if self.state_database_path is not None:
+                raise ResearchPaperConfigError(
+                    "state_database_path must be absent when restart is disabled"
+                )
+            if self.max_state_main_database_bytes is not None:
+                raise ResearchPaperConfigError(
+                    "max_state_main_database_bytes must be absent when restart is disabled"
+                )
+        else:
+            if not isinstance(self.state_database_path, Path):
+                raise ResearchPaperConfigError(
+                    "state_database_path must be a Path when restart is enabled"
+                )
+            if (
+                type(self.max_state_main_database_bytes) is not int
+                or self.max_state_main_database_bytes < 1
+                or self.max_state_main_database_bytes > 1_000_000_000
+            ):
+                raise ResearchPaperConfigError(
+                    "max_state_main_database_bytes must be between 1 and 1000000000; "
+                    "it caps SQLite main-database logical pages and excludes WAL/SHM"
+                )
+
+    @property
+    def research_config_fingerprint(self) -> str:
+        """Return a pacing/path-independent fingerprint of paper semantics."""
+
+        payload = {
+            "broker_limits": {
+                "max_events": self.limits.max_events,
+                "max_fills": self.limits.max_fills,
+                "max_instrument_versions": self.limits.max_instrument_versions,
+                "max_market_data_records": self.limits.max_market_data_records,
+                "max_open_orders": self.limits.max_open_orders,
+                "max_orders": self.limits.max_orders,
+                "max_positions": self.limits.max_positions,
+            },
+            "execution_config_fingerprint": self.execution_config.fingerprint,
+            "output": {
+                "algorithm_version": "research-jsonl-v1",
+                "schema_version": 1,
+            },
+            "strategy": self._strategy_material(),
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        return f"sha256:{sha256(b'tx_trade.research.config.v1\\0' + encoded).hexdigest()}"
+
+    @property
+    def strategy_fingerprint(self) -> str:
+        """Return the configured strategy fingerprint for run identity composition."""
+
+        encoded = json.dumps(
+            self._strategy_material(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        marker = b"tx_trade.research.strategy.instrument_triggered_order.v1\0"
+        return f"sha256:{sha256(marker + encoded).hexdigest()}"
+
+    def _strategy_material(self) -> dict[str, object]:
+        template = self.order_template
+        return {
+            "kind": "instrument-triggered-order",
+            "max_decision_records": self.max_decision_records,
+            "parameters": {
+                "account_id": template.account_id,
+                "client_order_id": template.client_order_id,
+                "day_trade": template.day_trade,
+                "instrument_id": template.instrument_id,
+                "limit_price": (
+                    None
+                    if template.limit_price is None
+                    else _semantic_decimal(template.limit_price)
+                ),
+                "order_type": template.order_type.value,
+                "quantity": _semantic_decimal(template.quantity),
+                "side": template.side.value,
+                "strategy_id": template.strategy_id,
+                "time_in_force": template.time_in_force.value,
+            },
+            "version": "instrument-triggered-order-v1",
+        }
+
+
+def _semantic_decimal(value: Decimal) -> str:
+    normalized = value.normalize()
+    rendered = format(normalized, "f")
+    return "0" if rendered in {"-0", ""} else rendered
 
 
 _PREFIX = "TX_TRADE_RESEARCH_PAPER_"
@@ -117,6 +228,9 @@ _ALLOWED_SUFFIXES = frozenset(
         "LIMIT_PRICE",
         "TIME_IN_FORCE",
         "DAY_TRADE",
+        "RESTART_MODE",
+        "STATE_DB_PATH",
+        "MAX_STATE_MAIN_DB_BYTES",
         *_LIMIT_SUFFIXES,
         *_FEE_DETAIL_SUFFIXES,
     )
@@ -387,6 +501,34 @@ def parse_research_paper_settings(
     assert database_raw is not None
     if len(database_raw) > 4096:
         raise ResearchPaperConfigError(f"{_key('DB_PATH')} must be at most 4096 characters")
+    restart_mode = _enum(
+        values,
+        "RESTART_MODE",
+        ResearchRestartMode,
+        default=ResearchRestartMode.DISABLED.value,
+    )
+    state_database_path: Path | None = None
+    max_state_main_database_bytes: int | None = None
+    state_path_present = _key("STATE_DB_PATH") in values
+    state_max_present = _key("MAX_STATE_MAIN_DB_BYTES") in values
+    if restart_mode is ResearchRestartMode.DISABLED:
+        if state_path_present:
+            raise ResearchPaperConfigError(
+                f"{_key('STATE_DB_PATH')} is not valid when restart is disabled"
+            )
+        if state_max_present:
+            raise ResearchPaperConfigError(
+                f"{_key('MAX_STATE_MAIN_DB_BYTES')} is not valid when restart is disabled"
+            )
+    else:
+        state_raw = _read(values, "STATE_DB_PATH", required=True)
+        assert state_raw is not None
+        if len(state_raw) > 4096:
+            raise ResearchPaperConfigError(
+                f"{_key('STATE_DB_PATH')} must be at most 4096 characters"
+            )
+        state_database_path = Path(state_raw)
+        max_state_main_database_bytes = _positive_int(values, "MAX_STATE_MAIN_DB_BYTES")
     limits, max_decision_records = _limits(values)
     return ResearchPaperSettings(
         runtime_preset="research_paper",
@@ -399,4 +541,7 @@ def parse_research_paper_settings(
         execution_config=_execution_config(values),
         max_decision_records=max_decision_records,
         order_template=_order_template(values),
+        restart_mode=restart_mode,
+        state_database_path=state_database_path,
+        max_state_main_database_bytes=max_state_main_database_bytes,
     )

@@ -1,0 +1,45 @@
+"""Durable research-paper persistence contracts."""
+
+from .contracts import (
+    MAX_BATCH_OUTBOX_RECORDS,
+    MAX_CHECKPOINT_BYTES,
+    MAX_OUTBOX_PAYLOAD_BYTES,
+    CheckpointKind,
+    CompleteResearchRun,
+    DurableBatchDisposition,
+    ResearchDurableBatch,
+    ResearchDurableBatchResult,
+    ResearchHydrationState,
+    ResearchOutboxRecord,
+    ResearchOutboxRecordType,
+    ResearchPersistenceError,
+    ResearchPersistenceErrorCode,
+    ResearchRunIdentity,
+    ResearchRunState,
+    ResearchRunStatus,
+    StrategyFingerprint,
+    VersionedCheckpoint,
+)
+from .ports import ResearchStateRepositoryPort
+
+__all__ = [
+    "MAX_BATCH_OUTBOX_RECORDS",
+    "MAX_CHECKPOINT_BYTES",
+    "MAX_OUTBOX_PAYLOAD_BYTES",
+    "CheckpointKind",
+    "CompleteResearchRun",
+    "DurableBatchDisposition",
+    "ResearchDurableBatch",
+    "ResearchDurableBatchResult",
+    "ResearchHydrationState",
+    "ResearchOutboxRecord",
+    "ResearchOutboxRecordType",
+    "ResearchPersistenceError",
+    "ResearchPersistenceErrorCode",
+    "ResearchRunIdentity",
+    "ResearchRunState",
+    "ResearchRunStatus",
+    "ResearchStateRepositoryPort",
+    "StrategyFingerprint",
+    "VersionedCheckpoint",
+]

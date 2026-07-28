@@ -38,6 +38,7 @@ from .contracts import (
     to_canonical_primitive,
 )
 from .ports import (
+    CheckpointablePaperBrokerPort,
     OrderCommandResult,
     PaperBrokerPort,
     PaperEventSink,
@@ -47,6 +48,7 @@ from .state_machine import InvalidOrderTransition, can_transition, validate_orde
 
 __all__ = [
     "CancelIntent",
+    "CheckpointablePaperBrokerPort",
     "DEFAULT_EXECUTION_CONFIG",
     "DEFAULT_EXECUTION_CONFIG_FINGERPRINT",
     "ExecutionProvenance",
