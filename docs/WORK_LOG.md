@@ -452,3 +452,52 @@ Boundaries:
 - No SKCOM/Capital import, credential or DLL read, Reply/Order connection,
   callback registration, or live order path was added.
 - `phase1_smoke.sqlite3` remains unrelated and untouched.
+
+## 2026-07-28: Phase 2 final acceptance
+
+Scope:
+
+- Close Phase 2A and Phase 2B-1 through 2B-5 with process-level,
+  recovery-level and full release evidence.
+- Preserve the offline/no-live-order boundary. Existing Phase 1 quote-only
+  smoke evidence is a prerequisite, not authorization to connect trading
+  services during this gate.
+
+Added acceptance evidence:
+
+- Real module subprocess runs for `tx_trade.app.phase2` and
+  `tx_trade.app.research_paper`, including exit status, stderr contract,
+  canonical UTF-8 JSONL and byte-identical repeated stdout.
+- SQLite-backed replay pause/resume and stop lifecycle tests using explicit
+  acknowledgements rather than timing sleeps.
+- Observation-only strategy evaluation with no paper broker effect, plus paper
+  provenance, fill, fee and position-conservation assertions.
+- A real abruptly killed durable child process followed by a new resume
+  process. Recovered stdout, checkpoints, cursor, ledger and independently
+  reopened outbox match a clean run exactly.
+- Direct local-path safety coverage for UNC, mapped drives,
+  junctions/reparse points, symlinks where permitted, and state/source
+  hardlink collision before a writable repository is opened.
+
+Validation:
+
+- New final-acceptance tests: `14 passed, 3 skipped`.
+- Phase 2 targeted gate: `618 passed, 4 skipped`.
+- Full safe offline regression:
+  `888 passed, 4 skipped, 6 deselected`.
+- The skips are explicit platform cases where Windows symlink creation is not
+  permitted or no mapped network drive exists.
+- Phase 1 quote-only live smoke prerequisite remains the previously recorded
+  `8 passed`.
+
+Boundaries and decision:
+
+- Phase 2 is accepted as complete.
+- No production API, checkpoint format, output schema, SQLite schema or
+  migration changed during final acceptance.
+- Phase 1 source bytes and source WAL/SHM state remain unchanged.
+- stdout/pipe delivery remains at-least-once; durable broker effects and
+  outbox enqueue remain exactly-once inside the paper-state transaction.
+- No SKCOM trading import, live credential or DLL read, Order object, trading
+  Reply connection, order/fill callback or real order was added or exercised.
+- Phase 3 requires a separate PLAN PHASE and explicit authorization.

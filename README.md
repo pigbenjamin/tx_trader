@@ -289,3 +289,44 @@ boundary.
 This mode does not import SKCOM, create Center/Quote/Reply/Order objects, read
 live credentials or `TX_TRADE_SKCOM_DLL_PATH`, connect Reply, or submit a live
 order.
+
+## Phase 2 final acceptance
+
+Phase 2 final acceptance exercises both module entry points in real child
+processes, SQLite-backed replay lifecycle controls, deterministic paper
+results, abrupt-process recovery, independent durable outbox readback and
+local-path safety. It remains an offline gate and must not be used to opt in to
+legacy COM, live quote, stress or trading behavior.
+
+Run the dedicated acceptance tests with:
+
+```powershell
+.\venv_tx_trade_fresh\Scripts\python.exe -B -m pytest `
+    -p no:cacheprovider `
+    --basetemp .\.pytest_tmp\phase2-final `
+    -o addopts="" `
+    tests\integration\test_phase2_final_replay.py `
+    tests\integration\test_phase2_final_paper.py `
+    tests\integration\test_phase2_final_recovery.py `
+    tests\unit\test_phase2_final_safety.py `
+    -q
+```
+
+Run the complete safe offline regression explicitly excluding every opt-in
+class:
+
+```powershell
+.\venv_tx_trade_fresh\Scripts\python.exe -B -m pytest `
+    -p no:cacheprovider `
+    --basetemp .\.pytest_tmp\phase2-final-full `
+    -o addopts="" `
+    -m "not legacy_com and not stress and not live" `
+    -q
+```
+
+The accepted 2026-07-28 baseline is `14 passed, 3 skipped` for the dedicated
+gate, `618 passed, 4 skipped` for the Phase 2 targeted suite, and
+`888 passed, 4 skipped, 6 deselected` for the full safe offline regression.
+Platform skips are explicit Windows symlink or mapped-drive fixture
+limitations. The previously recorded Phase 1 quote-only live smoke remains
+`8 passed`; final acceptance does not reconnect it.

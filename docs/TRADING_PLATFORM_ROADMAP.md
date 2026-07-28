@@ -46,8 +46,8 @@
 
 目前已具備：
 
-- Phase 0 的依賴與安全模式基線；fresh-env 建立文件及乾淨環境驗證尚待
-  完成。
+- Phase 0 的依賴與安全模式基線，以及 Python 3.13 fresh-environment
+  建立與乾淨環境驗證。
 - Phase 1 的標準行情模型、pipeline contract、SQLite event log/readback、
   bounded ingress、health/metrics、Capital quote-only STA adapter、相容 façade
   與安全 recorder entry point。
@@ -58,19 +58,19 @@
 - live quote composition 建立 SKCOM Center/Quote，以及登入必要且只註冊
   `OnReplyMessage` 的 announcement-only Reply；不建立 Order、不呼叫
   `ConnectByID`、不註冊委託／成交 callback，也不提供下單能力。
+- Phase 2A deterministic Replay Runtime，以及 Phase 2B-1 至 2B-5 的
+  PaperBroker、matching、execution policies、positions、strategy
+  coordination、durable checkpoint 與 output outbox。
 
 目前主要缺口：
 
-- Phase 1 真實 SKCOM quote-only smoke 已於 2026-07-28 完成：登入、
-  ready、`TX00` lookup、quote/tick subscription 與 cleanup 均成功。
-- Phase 2A contract-first Replay Runtime 第一切片已實作、正在最終驗收；
-  Phase 2B PaperBroker 尚未開始。
 - 舊 `QuoteClient` façade 仍保留相容行為，後續須在不破壞既有 contract
   的前提下逐步收斂。
 - 尚未實作完整的新單、改單、刪單。
 - 尚未解析完整委託及成交回報。
-- 沒有委託狀態機、冪等控制及重啟對帳。
-- 沒有部位與損益管理。
+- 尚未建立真實券商委託的冪等 journal、啟動對帳與狀態恢復。
+- PaperBroker 已提供 deterministic position projection；真實帳戶部位與
+  損益管理仍未實作。
 - 沒有集中式風控。
 
 ## 3.1 API 官方參考資料
@@ -501,7 +501,7 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 |---|---|---|---|---|
 | Phase 0 專案基線 | 已完成 | 2026-07-25 | 2026-07-27 | fresh Python 3.13.14 環境、依賴、品質檢查與安全測試已驗證 |
 | Phase 1 穩定行情 | 已完成 | 2026-07-26 | 2026-07-28 | 離線驗證與真實 quote-only live smoke 均完成 |
-| Phase 2 Replay/Paper | 進行中 | 2026-07-28 |  | Phase 2A Replay Runtime 與獨立 CLI 已實作、待整體驗收；Phase 2B 尚未開始 |
+| Phase 2 Replay/Paper | 已完成 | 2026-07-28 | 2026-07-28 | Phase 2A Replay Runtime 與 Phase 2B-1 至 2B-5 PaperBroker、durable recovery 及 output outbox 已完成 final acceptance |
 | Phase 3 委託與回報 | 待開始 |  |  |  |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
@@ -559,18 +559,11 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 
 ## 14. 下一個工作項目
 
-目前 implementation slice 是：
-
-1. 驗收 Phase 2A `ReplayRuntime` 的 public contract、狀態機、clock、
-   cursor semantics 與 complete SQLite session deterministic replay；
-   不得藉此擴大到 Phase 2B。
-
-Phase 2B 的 broker abstraction、paper fill policy 與費用模型屬後續
-backlog；必須等 Phase 2A contract 通過驗收後才能開始設計。
-
-獨立的 acceptance gate：在市場時段完成 Phase 1 live quote-only smoke；
-此項不是上述 implementation slice 的範圍，但必須在 Phase 2 最終驗收前
-完成。
+Phase 0、Phase 1 與 Phase 2 已完成。下一個候選階段是 Phase 3
+「完整委託及回報」，但開始前必須另行完成 PLAN PHASE，確認測試環境、
+帳號選擇、最小真單授權、Reply/Order 生命週期、冪等 journal、啟動對帳
+與 fail-closed 驗收條件。Phase 2 的完成不授權建立 Order、連接交易
+Reply、註冊委託／成交 callback 或送出真實委託。
 
 ## 15. 新工作階段交接清單（2026-07-27）
 
@@ -694,7 +687,7 @@ code `2017` 失敗；尚未到達 quote ready、`TX00` lookup 或 subscription�
 integration test 為 `8 passed`，登入、quote ready、`TX00` lookup、
 quote/tick subscription 與 cleanup 均成功。
 
-### 15.4 Phase 2 下一個安全切片
+### 15.4 Phase 2 交付歷程
 
 Phase 2A 第一個 slice 已進入實作與驗收：`ReplayRuntime` 提供
 FASTEST/PACED、可中斷 clock、狀態機、exclusive cursor、pause/resume/stop
@@ -709,7 +702,7 @@ composition root 與 `python -m tx_trade.app.phase2` CLI。它只接受既存
 SQLite DB、明確 session UUID、FASTEST/PACED、speed 與 optional exclusive
 cursor；stdout 只輸出 canonical JSON Lines。此入口不沿用 Phase 1
 composition、不讀 live credential、不載入 COM。
-# Phase 2B-4 status update (2026-07-28)
+#### Phase 2B-4 status update (2026-07-28)
 
 - Phase 2B-1 through 2B-3 are complete: paper order/state contracts,
   deterministic matching and execution policies, and paper positions.
@@ -723,7 +716,7 @@ composition、不讀 live credential、不載入 COM。
 - Research paper mode remains isolated from SKCOM, live credentials,
   Center/Quote/Reply/Order creation, Reply connections, and live orders.
 
-## Phase 2B-5 status update (2026-07-28)
+#### Phase 2B-5 status update (2026-07-28)
 
 - Added versioned broker and strategy-coordinator checkpoints that preserve
   private retry fences, command outcome caches, FIFO acceptance order, N+1
@@ -746,3 +739,29 @@ composition、不讀 live credential、不載入 COM。
 - `MAX_STATE_MAIN_DB_BYTES` is intentionally a logical-page limit for the
   SQLite main database. WAL/SHM sidecars are excluded; deployments requiring a
   hard total-disk bound must use a filesystem or directory quota.
+
+### 15.5 Phase 2 final acceptance（2026-07-28）
+
+- Phase 2 targeted contract/runtime/broker/strategy/persistence/recovery and
+  safety gate: `618 passed, 4 skipped`.
+- Full safe offline regression:
+  `888 passed, 4 skipped, 6 deselected`.
+- Real `python -m tx_trade.app.phase2` and
+  `python -m tx_trade.app.research_paper` child processes produced
+  byte-identical artifacts across repeated runs while leaving the Phase 1
+  source database and sidecars unchanged.
+- SQLite-backed pause/resume completed without duplicate or missing events;
+  stop acknowledged at the event boundary and published no later event.
+- A parent process observed the first durable batch commit, abruptly killed
+  the child, and resumed in a new process. The recovered artifact, checkpoint,
+  batch ledger, cursor and independently read durable outbox matched a clean
+  run exactly.
+- Direct Windows path tests cover regular local files, UNC and mapped-drive
+  rejection, junction/reparse rejection, and state/source hardlink collision.
+  Platform-unavailable symlink and mapped-drive fixtures are explicit skips.
+- Phase 1 quote-only live smoke evidence remains `8 passed`; it was not
+  repeated because Phase 2 final acceptance is offline and must not authorize
+  live trading.
+- Phase 2 remains isolated from SKCOM trading, live credentials and DLL
+  configuration, Order creation, Reply connections, transaction callbacks and
+  real orders.
