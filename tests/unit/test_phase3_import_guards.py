@@ -16,6 +16,16 @@ PHASE3A_MODULES = (
     "tx_trade.broker.capital.trading_contracts",
     "tx_trade.broker.capital.reply_parser",
 )
+RUNTIME_PERSISTENCE_MODULES = frozenset(
+    {
+        "tx_trade.orders.sqlite_live_order_journal",
+    }
+)
+BROKER_RUNTIME_MODULES = frozenset(
+    {
+        "tx_trade.broker.capital.com_backend",
+    }
+)
 CAPITAL_ROOT = Path("tx_trade/broker/capital")
 LIVE_ORDER_ROOT = Path("tx_trade/orders")
 
@@ -106,6 +116,7 @@ def _production_paths() -> tuple[Path, ...]:
     return (
         *sorted(CAPITAL_ROOT.rglob("*.py")),
         *sorted(LIVE_ORDER_ROOT.glob("live_*.py")),
+        *sorted(LIVE_ORDER_ROOT.glob("sqlite_live_*.py")),
     )
 
 
@@ -137,7 +148,12 @@ def _resolved_name(node: ast.expr, bindings: dict[str, str]) -> str | None:
     return None
 
 
-def _safety_violations(source: str, *, pure: bool = True) -> set[str]:
+def _safety_violations(
+    source: str,
+    *,
+    allow_runtime_io: bool = False,
+    allow_broker_integration: bool = False,
+) -> set[str]:
     tree = ast.parse(source)
     bindings: dict[str, str] = {}
     violations: set[str] = set()
@@ -147,10 +163,10 @@ def _safety_violations(source: str, *, pure: bool = True) -> set[str]:
             for alias in node.names:
                 local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
                 bindings[local_name] = alias.name if alias.asname else local_name
-                if pure and _is_forbidden_import(alias.name):
+                if not allow_broker_integration and _is_forbidden_import(alias.name):
                     violations.add(f"import:{alias.name}")
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            if pure and _is_forbidden_import(node.module):
+            if not allow_broker_integration and _is_forbidden_import(node.module):
                 violations.add(f"import:{node.module}")
             for alias in node.names:
                 local_name = alias.asname or alias.name
@@ -160,19 +176,33 @@ def _safety_violations(source: str, *, pure: bool = True) -> set[str]:
         if isinstance(node, ast.Call):
             called = _resolved_name(node.func, bindings)
             member = node.func.attr if isinstance(node.func, ast.Attribute) else None
-            if pure and (called in _FORBIDDEN_CALLS or member in _FORBIDDEN_SDK_MEMBERS):
+            if (
+                (not allow_runtime_io and called in _FORBIDDEN_CALLS)
+                or (not allow_broker_integration and member in _FORBIDDEN_SDK_MEMBERS)
+                or called
+                in {
+                    "os.getenv",
+                    "os.putenv",
+                    "dotenv.load_dotenv",
+                    "dotenv.dotenv_values",
+                }
+            ):
                 violations.add(f"call:{called or member}")
-            if pure and called is not None and called.startswith("os.environ."):
+            if called is not None and called.startswith("os.environ."):
                 violations.add(f"environment:{called}")
-            if called is not None and any(part in called for part in _ORDER_SDK_NAME_PARTS):
+            if (
+                not allow_broker_integration
+                and called is not None
+                and any(part in called for part in _ORDER_SDK_NAME_PARTS)
+            ):
                 violations.add(f"order-sdk-call:{called}")
         elif isinstance(node, (ast.Attribute, ast.Name)):
             name = node.attr if isinstance(node, ast.Attribute) else node.id
-            if any(part in name for part in _ORDER_SDK_NAME_PARTS):
+            if not allow_broker_integration and any(part in name for part in _ORDER_SDK_NAME_PARTS):
                 violations.add(f"order-sdk-name:{name}")
         elif isinstance(node, ast.Subscript):
             accessed = _resolved_name(node.value, bindings)
-            if pure and accessed == "os.environ":
+            if accessed == "os.environ":
                 violations.add("environment:os.environ[]")
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             if node.value in {".env", "./.env"} or node.value.lower().endswith(".dll"):
@@ -184,7 +214,7 @@ def _safety_violations(source: str, *, pure: bool = True) -> set[str]:
     return violations
 
 
-def test_phase3a_fresh_imports_have_no_external_side_effects() -> None:
+def test_phase3_fresh_imports_have_no_external_side_effects() -> None:
     script = r"""
 import builtins
 import importlib
@@ -282,14 +312,19 @@ print(json.dumps(forbidden_loaded))
     assert json.loads(completed.stdout) == []
 
 
-def test_phase3a_sources_have_no_external_integration_dependencies() -> None:
-    pure_paths = {
-        Path(*module_name.split(".")).with_suffix(".py") for module_name in PHASE3A_MODULES
+def test_phase3_sources_have_no_external_integration_dependencies() -> None:
+    runtime_paths = {
+        Path(*module_name.split(".")).with_suffix(".py")
+        for module_name in RUNTIME_PERSISTENCE_MODULES
+    }
+    broker_runtime_paths = {
+        Path(*module_name.split(".")).with_suffix(".py") for module_name in BROKER_RUNTIME_MODULES
     }
     for path in _production_paths():
         violations = _safety_violations(
             path.read_text(encoding="utf-8"),
-            pure=path in pure_paths or path.parent == LIVE_ORDER_ROOT,
+            allow_runtime_io=path in runtime_paths,
+            allow_broker_integration=path in broker_runtime_paths,
         )
         assert violations == set(), f"{path}: {sorted(violations)}"
 
@@ -299,6 +334,7 @@ def test_production_path_enumeration_includes_future_capital_and_live_modules(
 ) -> None:
     future_capital = Path("future/capital/future_adapter.py")
     future_live = Path("future/orders/live_future.py")
+    future_sqlite_live = Path("future/orders/sqlite_live_future.py")
 
     class CapitalRoot:
         def rglob(self, pattern: str) -> list[Path]:
@@ -307,15 +343,17 @@ def test_production_path_enumeration_includes_future_capital_and_live_modules(
 
     class LiveRoot:
         def glob(self, pattern: str) -> list[Path]:
-            assert pattern == "live_*.py"
-            return [future_live]
+            if pattern == "live_*.py":
+                return [future_live]
+            assert pattern == "sqlite_live_*.py"
+            return [future_sqlite_live]
 
     capital_root = CapitalRoot()
     live_root = LiveRoot()
     monkeypatch.setattr(sys.modules[__name__], "CAPITAL_ROOT", capital_root)
     monkeypatch.setattr(sys.modules[__name__], "LIVE_ORDER_ROOT", live_root)
 
-    assert _production_paths() == (future_capital, future_live)
+    assert _production_paths() == (future_capital, future_live, future_sqlite_live)
 
 
 @pytest.mark.parametrize(
@@ -338,6 +376,57 @@ def test_safety_scanner_detects_alias_aware_hostile_fragments(
     expected: str,
 ) -> None:
     assert expected in _safety_violations(source)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import socket", "import:socket"),
+        ("import ctypes", "import:ctypes"),
+        ("import os\nos.getenv('ACCOUNT')", "call:os.getenv"),
+        ("import os\nvalue = os.environ['ACCOUNT']", "environment:os.environ[]"),
+        ("import comtypes.client", "import:comtypes.client"),
+        ("broker.SendOrder(order)", "order-sdk-call:broker.SendOrder"),
+    ],
+)
+def test_runtime_persistence_scanner_still_rejects_external_integrations(
+    source: str,
+    expected: str,
+) -> None:
+    assert expected in _safety_violations(source, allow_runtime_io=True)
+
+
+def test_runtime_persistence_scanner_allows_explicit_local_sqlite_io() -> None:
+    source = """
+import os
+import sqlite3
+from pathlib import Path
+
+def open_journal(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    Path(path).read_text(encoding="utf-8")
+    return sqlite3.connect(path), descriptor
+"""
+    assert _safety_violations(source, allow_runtime_io=True) == set()
+
+
+def test_future_capital_module_does_not_inherit_broker_runtime_allowance() -> None:
+    future_path = CAPITAL_ROOT / "future_adapter.py"
+    broker_runtime_paths = {
+        Path(*module_name.split(".")).with_suffix(".py") for module_name in BROKER_RUNTIME_MODULES
+    }
+    source = """
+import socket
+import comtypes.client
+"""
+
+    assert future_path not in broker_runtime_paths
+    violations = _safety_violations(
+        source,
+        allow_broker_integration=future_path in broker_runtime_paths,
+    )
+    assert "import:socket" in violations
+    assert "import:comtypes.client" in violations
 
 
 @pytest.mark.parametrize(

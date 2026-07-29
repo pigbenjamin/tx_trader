@@ -799,3 +799,25 @@ composition、不讀 live credential、不載入 COM。
 - No COM initialization, credential/DLL read, `SKOrderLib` creation,
   `SKReplyLib_ConnectByID`, callback registration or broker order operation
   was added or exercised.
+
+### 15.7 Phase 3B-1 durable live-order journal（2026-07-30）
+
+- Added a fail-closed SQLite v1 journal for live intents, commands, permanent
+  dispatch claims, receipts, raw observations, normalized facts, application
+  outcomes, fills, reconciliation requirements and order projections.
+- Added versioned canonical payloads, bounded strict decoding,
+  domain-separated digests and one global heterogeneous fact sequence.
+- Resume first validates the target read-only, then verifies schema identity,
+  authoritative table contents, projection history and global-record mapping.
+- Claim-without-receipt recovery is permanently fenced and never authorizes
+  automatic resend.
+- Raw evidence is durable before normalization; normalized facts and all
+  derived state commit atomically.
+- Targeted Phase 3B-1 gate: `87 passed`.
+- Combined Phase 3A/3B-1 gate: `274 passed`.
+- Full safe offline regression:
+  `1153 passed, 4 skipped, 6 deselected`.
+- No COM, credential/DLL, Reply connection, Order creation, callback or broker
+  operation was added or exercised.
+- Next candidate slice is Phase 3B-2 fake-only reconciliation; production
+  SKCOM query/order integration remains separately gated.

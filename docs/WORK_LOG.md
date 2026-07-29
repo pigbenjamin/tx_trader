@@ -561,3 +561,45 @@ Boundaries:
   was added or exercised.
 - Any SKCOM query-only integration and any real-order smoke require separate
   planning and explicit authorization.
+
+## 2026-07-30: Phase 3B-1 durable live-order journal
+
+Delivered:
+
+- Added strict versioned live-journal contracts and canonical codec with
+  bounded Decimal parsing, explicit type discriminators and domain-separated
+  digests.
+- Added a SQLite v1 durable journal with verified schema identity, read-only
+  resume prevalidation, WAL/FULL durability, global fact sequence, optimistic
+  order CAS, exact retry/conflict handling and poisoned fail-closed behavior.
+- Commands and permanent dispatch claims commit before any future external
+  side effect. A claim without a receipt remains outcome-unknown and never
+  permits automatic resend.
+- Raw observations commit before normalization. Normalized facts,
+  application dispositions, reconciliation requirements, fills, order
+  projections and global records commit atomically.
+- Resume verifies reservations, complete order history, commands, claims,
+  receipts, raw observations, normalized facts, event applications,
+  reconciliation rows, fills and their global-record mappings.
+- Added pure recovery classification and subprocess abrupt-exit tests. Pending
+  commands, outstanding claims, conflict observations and reconciliation
+  requirements keep startup in reconciliation-required state.
+
+Validation:
+
+- Phase 3B-1 targeted gate: `87 passed`.
+- Combined Phase 3A and Phase 3B-1 gate: `274 passed`.
+- Full safe offline regression:
+  `1153 passed, 4 skipped, 6 deselected`.
+- Ruff format/check passed; mypy reported no issues in 62 source files.
+
+Boundaries:
+
+- No COM initialization, credential/DLL read, Reply connection, Order
+  creation, callback registration or broker operation was added or exercised.
+- Full fake broker reconciliation remains Phase 3B-2.
+- Journal files must live in a deployment-controlled private local directory;
+  concurrent hostile path replacement inside that trusted directory is not
+  fully preventable through Python's standard SQLite API.
+- Query-only SKCOM integration and every real-order smoke still require
+  separate planning and explicit authorization.

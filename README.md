@@ -377,3 +377,46 @@ Run the Phase 3A offline gate with:
 
 The targeted Phase 3A baseline is `207 passed`. The integrated safe offline
 regression is `1086 passed, 4 skipped, 6 deselected`.
+
+## Phase 3B-1 durable live-order journal
+
+Phase 3B-1 adds a fail-closed SQLite v1 journal without enabling a broker
+connection. It persists immutable intents, exact commands, permanent dispatch
+claims, transport receipts, raw observations, normalized broker facts,
+application outcomes, fills, reconciliation requirements and materialized
+order projections.
+
+The journal uses a single global append sequence, versioned canonical payloads
+and domain-separated digests. Resume validates the schema, every authoritative
+table and its global-record mapping before allowing access. A committed claim
+without a receipt is outcome-unknown and never authorizes automatic resend.
+
+Run its offline gate with:
+
+```powershell
+.\venv_tx_trade_fresh\Scripts\python.exe -B -m pytest `
+    -p no:cacheprovider `
+    --basetemp .\.pytest_tmp\phase3b1 `
+    -o addopts="" `
+    tests\unit\test_live_order_journal_contracts.py `
+    tests\unit\test_live_order_journal_codec.py `
+    tests\unit\test_sqlite_live_order_journal.py `
+    tests\unit\test_live_order_journal_recovery.py `
+    tests\unit\test_phase3_import_guards.py `
+    tests\integration\test_live_order_journal_process_recovery.py `
+    -q
+```
+
+The targeted Phase 3B-1 gate is `87 passed`; the combined Phase 3A/3B-1 gate
+is `274 passed`. The full safe offline regression is
+`1153 passed, 4 skipped, 6 deselected`.
+
+This slice does not import or initialize COM, read live credentials or DLL
+settings, connect Reply, create Order, register callbacks, or invoke any
+broker operation.
+
+The journal path must be inside a deployment-controlled private local
+directory. Python's standard SQLite API cannot bind a database connection to
+the already-validated OS file handle across every supported platform, so an
+adversary able to replace files concurrently inside that directory remains
+outside this slice's threat model.
