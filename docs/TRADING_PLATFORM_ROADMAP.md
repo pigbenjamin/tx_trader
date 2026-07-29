@@ -502,7 +502,7 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 | Phase 0 專案基線 | 已完成 | 2026-07-25 | 2026-07-27 | fresh Python 3.13.14 環境、依賴、品質檢查與安全測試已驗證 |
 | Phase 1 穩定行情 | 已完成 | 2026-07-26 | 2026-07-28 | 離線驗證與真實 quote-only live smoke 均完成 |
 | Phase 2 Replay/Paper | 已完成 | 2026-07-28 | 2026-07-28 | Phase 2A Replay Runtime 與 Phase 2B-1 至 2B-5 PaperBroker、durable recovery 及 output outbox 已完成 final acceptance |
-| Phase 3 委託與回報 | 待開始 |  |  |  |
+| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A side-effect-free live contracts、state reducer、ports 與 Capital TF Reply parser 已完成 targeted gate；尚未建立 COM 或送單 |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
 | Phase 6 營運強化 | 待開始 |  |  |  |
@@ -559,11 +559,14 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 
 ## 14. 下一個工作項目
 
-Phase 0、Phase 1 與 Phase 2 已完成。下一個候選階段是 Phase 3
-「完整委託及回報」，但開始前必須另行完成 PLAN PHASE，確認測試環境、
-帳號選擇、最小真單授權、Reply/Order 生命週期、冪等 journal、啟動對帳
-與 fail-closed 驗收條件。Phase 2 的完成不授權建立 Order、連接交易
-Reply、註冊委託／成交 callback 或送出真實委託。
+Phase 0、Phase 1 與 Phase 2 已完成。Phase 3A 已開始建立純 live-order
+contracts、state reducer、ports 與 Capital TF Reply parser；此切片不建立
+Order、不連接交易 Reply、不註冊 live callback，也不送出真實委託。
+
+Phase 3 的下一個候選切片是獨立 live-state SQLite journal 與 fake-only
+reconciliation core。開始任何 SKCOM Order／full Reply integration 前，仍
+必須另行完成 PLAN PHASE並取得明確核准；一口真單及刪單 smoke 還需要
+更窄的帳號、商品、數量、價格、時段及人工監看授權。
 
 ## 15. 新工作階段交接清單（2026-07-27）
 
@@ -765,3 +768,34 @@ composition、不讀 live credential、不載入 COM。
 - Phase 2 remains isolated from SKCOM trading, live credentials and DLL
   configuration, Order creation, Reply connections, transaction callbacks and
   real orders.
+
+### 15.6 Phase 3A live-order contracts（2026-07-29）
+
+- Added broker-neutral immutable live intent, command, order, fill, position,
+  readiness, dispatch, correlation and reconciliation contracts.
+- Added a pure live-order reducer for local lifecycle, unknown dispatch,
+  confirmed broker events, exact duplicate/conflict handling and
+  cancel-versus-fill races.
+- Added separate runtime-checkable account, dispatch, Reply, query, journal,
+  service, reconciliation and event-sink ports. No SQLite or COM
+  implementation exists in this slice.
+- Added strict Capital domestic-futures `OnNewData` parsing for the 49
+  explicitly named fields in the bundled official documentation. Broker
+  observations do not invent a local client-order identity.
+- Dispatch success remains non-authoritative. Only confirmed normalized
+  broker evidence may move an order to an authoritative state; ambiguous
+  evidence requests reconciliation without poisoning the applied-event
+  ledger.
+- Domestic-futures `U`/`B` quantity changes use the documented `Qty`
+  decrement, and amendment facts must exactly match the pending command's
+  expected working values.
+- Existing `tx_trade.orders` and `tx_trade.broker.capital` package-level
+  compatibility exports are lazy, so focused contracts/parser imports do not
+  load Paper or Capital runtime modules.
+- Targeted Phase 3A and existing Phase 1 Capital safety gate:
+  `207 passed`.
+- Full safe offline regression:
+  `1086 passed, 4 skipped, 6 deselected`.
+- No COM initialization, credential/DLL read, `SKOrderLib` creation,
+  `SKReplyLib_ConnectByID`, callback registration or broker order operation
+  was added or exercised.

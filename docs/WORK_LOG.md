@@ -501,3 +501,63 @@ Boundaries and decision:
 - No SKCOM trading import, live credential or DLL read, Order object, trading
   Reply connection, order/fill callback or real order was added or exercised.
 - Phase 3 requires a separate PLAN PHASE and explicit authorization.
+
+## 2026-07-29: Phase 3A side-effect-free live-order contracts
+
+Scope:
+
+- Define the internal live-order boundary before implementing any broker
+  connection, persistence or side effect.
+- Preserve Phase 1 quote-only and Phase 2 replay/paper behavior.
+
+Delivered:
+
+- Strict immutable contracts for live intents, new/cancel/amend/decrease
+  commands, order aggregates, fills, broker positions, strategy attribution,
+  dispatch receipts, account readiness, correlation evidence and
+  reconciliation discrepancies.
+- Global-v1 `client_order_id` uniqueness semantics and independent
+  `client_command_id` values for every command operation.
+- A pure reducer covering created, validated, submitting, accepted, partial,
+  filled, rejected, cancel-pending, cancelled, submission-unknown and
+  reconciling states.
+- Exact event retry/conflict handling. Candidate, ambiguous, mismatched or
+  overfill evidence requests reconciliation without being recorded as an
+  applied event, so later confirmed evidence can still be reduced.
+- Separate runtime-checkable ports for account catalog, broker dispatch,
+  Reply source, broker queries, durable journal, order service,
+  reconciliation and normalized event sinks.
+- Strict Capital TF `OnNewData` parsing based on the 49 explicitly named
+  official fields. The documentation's `[4] N/A` BuySell position is not
+  treated as an invented fifth encoded character.
+- Fill price uses the official single-leg `Price1` field. Broker/account
+  identity is supplied as an opaque account ID; raw broker account evidence is
+  hidden from normal repr and parse errors.
+- Domestic-futures `U` and `B` replies use the official `Qty` decrement rather
+  than the securities-only `AfterQty`; amendment facts must exactly match the
+  pending command's expected price and/or resulting total before they apply.
+- Lazy compatibility exports for `tx_trade.orders` and
+  `tx_trade.broker.capital`, preventing focused Phase 3A imports from eagerly
+  loading Paper or Capital runtime modules.
+
+Validation:
+
+- Phase 3A contracts, reducer, ports, Capital parser and existing Phase 1
+  Capital safety gate: `207 passed`.
+- Existing lazy-export Paper/Phase 1 compatibility tests: `103 passed`.
+- Full safe offline regression:
+  `1086 passed, 4 skipped, 6 deselected`.
+- Ruff passed; mypy reported no issues in 58 source files.
+
+Boundaries:
+
+- Dispatch success is transport evidence only; it never means broker
+  acceptance.
+- Broker callbacks do not contain local `client_order_id`; Phase 3A does not
+  guess one.
+- No SQLite live journal or production adapter was added.
+- No COM import/initialization, credential or DLL read, Order creation,
+  trading Reply connection, live callback registration or broker order call
+  was added or exercised.
+- Any SKCOM query-only integration and any real-order smoke require separate
+  planning and explicit authorization.

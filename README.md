@@ -330,3 +330,50 @@ gate, `618 passed, 4 skipped` for the Phase 2 targeted suite, and
 Platform skips are explicit Windows symlink or mapped-drive fixture
 limitations. The previously recorded Phase 1 quote-only live smoke remains
 `8 passed`; final acceptance does not reconnect it.
+
+## Phase 3A live-order contracts
+
+Phase 3A defines side-effect-free live-order contracts without enabling live
+execution. The domain models, pure reducer and ports live in:
+
+- `tx_trade.orders.live_contracts`
+- `tx_trade.orders.live_state_machine`
+- `tx_trade.orders.live_ports`
+
+Capital's normalized domestic-futures Reply contracts and strict
+`OnNewData` parser live in:
+
+- `tx_trade.broker.capital.trading_contracts`
+- `tx_trade.broker.capital.reply_parser`
+
+The parser follows the 49 explicitly named fields in the bundled Capital
+`12.回報.docx`. It does not guess a local `client_order_id`; broker evidence
+remains candidate or ambiguous until a later reconciliation layer confirms
+the link. Dispatch success is transport evidence only and never changes an
+order to `ACCEPTED`.
+
+Phase 3A does not import or initialize COM, read credentials or DLL settings,
+create `SKOrderLib`, call `SKReplyLib_ConnectByID`, register a live callback,
+or send/cancel/amend any broker order. Importing the focused contracts/parser
+modules also does not eagerly load the existing Phase 1 Paper or Capital
+runtime modules.
+
+Run the Phase 3A offline gate with:
+
+```powershell
+.\venv_tx_trade_fresh\Scripts\python.exe -B -m pytest `
+    -p no:cacheprovider `
+    --basetemp .\.pytest_tmp\phase3a `
+    -o addopts="" `
+    tests\unit\test_live_order_contracts.py `
+    tests\unit\test_live_order_state_machine.py `
+    tests\unit\test_live_order_ports.py `
+    tests\unit\test_capital_trading_contracts.py `
+    tests\unit\test_capital_reply_parser.py `
+    tests\unit\test_phase3_import_guards.py `
+    tests\unit\test_capital_import_guards.py `
+    -q
+```
+
+The targeted Phase 3A baseline is `207 passed`. The integrated safe offline
+regression is `1086 passed, 4 skipped, 6 deselected`.

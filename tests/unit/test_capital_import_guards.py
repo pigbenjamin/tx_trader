@@ -1,3 +1,4 @@
+import ast
 import importlib
 import sys
 from pathlib import Path
@@ -7,6 +8,35 @@ import pytest
 
 from tx_trade.broker.capital.com_backend import ComtypesQuoteBackend
 from tx_trade.broker.capital.contracts import LiveQuoteInitializationError
+
+
+def _order_or_reply_sdk_symbols(source: str) -> set[str]:
+    tree = ast.parse(source)
+    forbidden_parts = (
+        "SKOrderLib",
+        "ISKOrderLib",
+        "SKReplyLib_ConnectByID",
+        "ConnectByID",
+        "OnStrategyData",
+        "SendFutureOrder",
+        "SendOrder",
+    )
+    findings: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            candidate = node.id
+        elif isinstance(node, ast.Attribute):
+            candidate = node.attr
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            candidate = node.name
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            candidate = node.value
+        else:
+            continue
+        for token in forbidden_parts:
+            if token in candidate:
+                findings.add(token)
+    return findings
 
 
 def test_package_import_is_side_effect_free():
@@ -21,16 +51,37 @@ def test_package_import_is_side_effect_free():
 
 def test_production_source_has_no_order_or_reply_stream_sdk_symbols():
     root = Path("tx_trade/broker/capital")
-    source = "\n".join(path.read_text("utf-8") for path in root.glob("*.py"))
-    forbidden = (
-        "SK" + "OrderLib",
-        "ISK" + "OrderLib",
-        "SKReplyLib_" + "ConnectByID",
-        "On" + "NewData",
-        "On" + "StrategyData",
-        "Send" + "Order",
-    )
-    assert not any(token in source for token in forbidden)
+    paths = sorted(root.rglob("*.py"))
+    assert paths
+    for path in paths:
+        findings = _order_or_reply_sdk_symbols(path.read_text("utf-8"))
+        assert findings == set(), f"{path}: {sorted(findings)}"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("sdk.SKOrderLib = sdk.CreateObject()", "SKOrderLib"),
+        ("reply.SKReplyLib_ConnectByID(user)", "SKReplyLib_ConnectByID"),
+        ("broker.SendFutureOrder(order)", "SendFutureOrder"),
+        ("class Sink:\n    def OnStrategyData(self): pass", "OnStrategyData"),
+    ],
+)
+def test_order_sdk_scanner_detects_hostile_fragments(source, expected):
+    assert expected in _order_or_reply_sdk_symbols(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "class CapitalOnNewDataRecord: pass",
+        "ON_NEW_DATA_SCHEMA_VERSION = 'capital.on_new_data.v1'",
+        "def OnNewData(payload): return payload",
+        "class LiveOrder: pass",
+    ],
+)
+def test_order_sdk_scanner_allows_callback_schema_and_domain_names(source):
+    assert _order_or_reply_sdk_symbols(source) == set()
 
 
 def test_actual_backend_creates_exact_center_quote_and_reply(monkeypatch):
