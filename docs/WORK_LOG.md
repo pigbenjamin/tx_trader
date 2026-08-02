@@ -603,3 +603,55 @@ Boundaries:
   fully preventable through Python's standard SQLite API.
 - Query-only SKCOM integration and every real-order smoke still require
   separate planning and explicit authorization.
+
+## 2026-08-02: Phase 3B-2 fake-only reconciliation
+
+Delivered:
+
+- Added strict immutable local and broker snapshots plus a pure deterministic
+  reconciliation assessment.
+- Added fake-only orchestration around one atomic snapshot-bundle call to the
+  broker source. The source owns and attests the coherent cut and cursor; the
+  service neither assembles three sequential query results nor manufactures a
+  snapshot ID.
+- Added a read-only SQLite account snapshot without changing schema v1.
+  Strategy position attribution is recomputed after resume only from the net
+  quantity of durable fills in this journal; it is not a production opening
+  balance.
+- Added order, fill and position mismatch reporting. Absence is inferred only
+  from complete evidence; incomplete evidence and candidate/conflicting
+  identity remain incomplete or ambiguous and fail closed.
+- Pending commands block resume, and the diagnostic assessment's
+  `may_dispatch` is always `False`.
+- Required open-order, fill and position evidence to share the same broker cut
+  token and to be no older than the local snapshot.
+- Included durable outstanding claims, unresolved/conflicting/ambiguous
+  observations and open reconciliation requirements as `may_resume` blockers.
+- Hardened local fill referential integrity, time bounds and exact typed
+  account/strategy/instrument/side identity. Fill and position aggregation now
+  uses exact, context-independent `Decimal` summation. Broker fill observations
+  map injectively to durable local fills.
+
+Validation:
+
+- Focused new Phase 3B-2 tests: `55 passed`.
+- Combined Phase 3 gate: `319 passed`.
+- Full safe offline regression: `1218 passed, 5 skipped, 2 deselected`.
+- Commander final gate passed: Ruff format/check, mypy over 64 source files,
+  `1119 passed, 4 skipped` unit tests and `96 passed, 1 deselected`
+  integration tests.
+
+Boundaries:
+
+- No COM/SKCOM initialization, credential or DLL read, Reply connection,
+  Order creation, callback registration, live query or dispatch was added or
+  exercised.
+- Assessment is read-only: it does not persist broker evidence, resolve a
+  durable reconciliation requirement or dispatch claim, or change SQLite
+  schema v1. It is recomputed after restart.
+- A claim without a receipt remains outcome-unknown and is never automatically
+  resent.
+- The next candidate planning item is a durable reconciliation
+  commit/resolution protocol plus schema migration. Any query-only SKCOM
+  adapter and every real-order step require a separate PLAN and explicit
+  authorization.

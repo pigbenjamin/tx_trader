@@ -502,7 +502,7 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 | Phase 0 專案基線 | 已完成 | 2026-07-25 | 2026-07-27 | fresh Python 3.13.14 環境、依賴、品質檢查與安全測試已驗證 |
 | Phase 1 穩定行情 | 已完成 | 2026-07-26 | 2026-07-28 | 離線驗證與真實 quote-only live smoke 均完成 |
 | Phase 2 Replay/Paper | 已完成 | 2026-07-28 | 2026-07-28 | Phase 2A Replay Runtime 與 Phase 2B-1 至 2B-5 PaperBroker、durable recovery 及 output outbox 已完成 final acceptance |
-| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A side-effect-free live contracts、state reducer、ports 與 Capital TF Reply parser 已完成 targeted gate；尚未建立 COM 或送單 |
+| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A contracts、3B-1 durable journal 與 3B-2 fake-only reconciliation 已完成；尚未建立 COM、live query 或送單 |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
 | Phase 6 營運強化 | 待開始 |  |  |  |
@@ -559,14 +559,17 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 
 ## 14. 下一個工作項目
 
-Phase 0、Phase 1 與 Phase 2 已完成。Phase 3A 已開始建立純 live-order
-contracts、state reducer、ports 與 Capital TF Reply parser；此切片不建立
-Order、不連接交易 Reply、不註冊 live callback，也不送出真實委託。
+Phase 0、Phase 1 與 Phase 2 已完成。Phase 3A live-order contracts、Phase
+3B-1 SQLite journal 與 Phase 3B-2 fake-only reconciliation 已完成各自的
+worker gate；Phase 3 整體仍在進行中，Commander 的 final quality gate
+另行執行。
 
-Phase 3 的下一個候選切片是獨立 live-state SQLite journal 與 fake-only
-reconciliation core。開始任何 SKCOM Order／full Reply integration 前，仍
-必須另行完成 PLAN PHASE並取得明確核准；一口真單及刪單 smoke 還需要
-更窄的帳號、商品、數量、價格、時段及人工監看授權。
+Phase 3 的下一個候選 planning item 是 durable reconciliation
+commit/resolution protocol 與 schema migration。現有 3B-2 assessment
+不寫入 broker evidence、不解決 durable requirement 或 dispatch claim，
+也不修改 schema v1；重啟後重新計算，claim 永不自動 resend。任何
+query-only SKCOM adapter、SKCOM Order／full Reply integration 或真單仍
+必須另行完成 PLAN PHASE並取得明確授權。
 
 ## 15. 新工作階段交接清單（2026-07-27）
 
@@ -821,3 +824,39 @@ composition、不讀 live credential、不載入 COM。
   operation was added or exercised.
 - Next candidate slice is Phase 3B-2 fake-only reconciliation; production
   SKCOM query/order integration remains separately gated.
+
+### 15.8 Phase 3B-2 fake-only reconciliation（2026-08-02）
+
+- Added immutable local/broker snapshots, deterministic assessment and thin
+  fake-only orchestration around one atomic broker-source snapshot-bundle call.
+  The source owns and attests the coherent cut and cursor; the service does not
+  assemble three sequential query results or manufacture a snapshot ID.
+- The SQLite v1 journal supplies a read-only account snapshot. Position
+  attribution is rebuilt only from the net quantity of durable fills in this
+  journal on every resume; it is not a production opening balance.
+- Assessment reports order, fill and position mismatches. Absence is inferred
+  only from complete evidence; incomplete, candidate or conflicting identity
+  evidence fails closed as incomplete/ambiguous.
+- Pending commands block resume. Assessment is diagnostic, never writes broker
+  evidence or resolves a durable requirement/claim, and `may_dispatch` is
+  always `False`.
+- Open-order, fill and position evidence must share one broker cut token and
+  must not predate the local snapshot. Durable recovery blockers also prevent
+  `may_resume`, even when the broker comparison itself is clean.
+- Hardened local fill referential integrity, time bounds and typed
+  account/strategy/instrument/side identity. Fill and position aggregates use
+  exact, context-independent `Decimal` summation; broker fill observations map
+  injectively to durable local fills.
+- Focused Phase 3B-2 gate: `55 passed`.
+- Combined Phase 3 gate: `319 passed`.
+- Full safe offline regression: `1218 passed, 5 skipped, 2 deselected`.
+- Commander final gate passed: Ruff format/check, mypy over 64 source files,
+  `1119 passed, 4 skipped` unit tests and `96 passed, 1 deselected`
+  integration tests.
+- No COM/SKCOM initialization, credential/DLL read, Reply/Order use, callback,
+  live query or dispatch was added or exercised. Schema v1 is unchanged and
+  assessment is recomputed after restart; a claim is never automatically
+  resent.
+- Next planning candidate is a durable reconciliation commit/resolution
+  protocol plus schema migration. Any query-only SKCOM adapter and any real
+  order require a separate PLAN and explicit authorization.

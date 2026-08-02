@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 import sqlite3
 
@@ -14,17 +14,20 @@ from tx_trade.orders.live_contracts import (
     DispatchReceipt,
     DispatchState,
     FingerprintDomain,
+    LiveOrder,
     LiveOrderIntent,
     LiveOrderState,
     LiveOrderType,
     LiveSide,
     LiveTimeInForce,
     NewOrderCommand,
+    NormalizedBrokerFillEvent,
     NormalizedBrokerOrderEvent,
     PendingCommandBinding,
     payload_fingerprint,
 )
 from tx_trade.orders.live_journal_contracts import (
+    DurableOrderJournalPort,
     JournalOpenMode,
     LiveJournalClosedError,
     LiveJournalConflictError,
@@ -33,6 +36,7 @@ from tx_trade.orders.live_journal_contracts import (
     RegistrationDisposition,
     intent_fingerprint,
 )
+from tx_trade.orders.live_reconciliation_contracts import LocalReconciliationSourcePort
 from tx_trade.orders.live_ports import (
     DispatchClaimDisposition,
     JournalAppendDisposition,
@@ -44,14 +48,22 @@ from tx_trade.orders.sqlite_live_order_journal import SqliteLiveOrderJournal
 NOW = datetime(2026, 7, 30, tzinfo=timezone.utc)
 
 
-def _intent(order_id: str = "order-1") -> LiveOrderIntent:
+def _intent(
+    order_id: str = "order-1",
+    *,
+    account_id: str = "account-1",
+    strategy_id: str = "strategy-1",
+    instrument_id: str = "TXF",
+    side: LiveSide = LiveSide.BUY,
+    quantity: Decimal = Decimal("1"),
+) -> LiveOrderIntent:
     return LiveOrderIntent(
-        strategy_id="strategy-1",
+        strategy_id=strategy_id,
         client_order_id=order_id,
-        account_id="account-1",
-        instrument_id="TXF",
-        side=LiveSide.BUY,
-        quantity=Decimal("1"),
+        account_id=account_id,
+        instrument_id=instrument_id,
+        side=side,
+        quantity=quantity,
         order_type=LiveOrderType.LIMIT,
         limit_price=Decimal("22000"),
         time_in_force=LiveTimeInForce.DAY,
@@ -60,9 +72,14 @@ def _intent(order_id: str = "order-1") -> LiveOrderIntent:
     )
 
 
-def _submitting() -> tuple[NewOrderCommand, object]:
-    intent = _intent()
-    command = NewOrderCommand("command-1", intent, NOW + timedelta(seconds=1))
+def _submitting(
+    intent: LiveOrderIntent | None = None,
+) -> tuple[NewOrderCommand, object]:
+    intent = intent or _intent()
+    command_id = (
+        "command-1" if intent.client_order_id == "order-1" else f"command-{intent.client_order_id}"
+    )
+    command = NewOrderCommand(command_id, intent, NOW + timedelta(seconds=1))
     fingerprint = payload_fingerprint(command, FingerprintDomain.NEW_COMMAND_V1)
     order = create_live_order(intent)
     order = advance_local(order, LiveOrderState.VALIDATED, NOW + timedelta(milliseconds=1))
@@ -73,6 +90,135 @@ def _submitting() -> tuple[NewOrderCommand, object]:
         PendingCommandBinding(command, fingerprint),
     )
     return command, order
+
+
+def _register_and_fill(
+    journal: SqliteLiveOrderJournal,
+    intent: LiveOrderIntent,
+    *,
+    sequence: int,
+    occurred_at: datetime,
+) -> None:
+    command, order = _submitting(intent)
+    journal.register_new_order(command, order, intent_fingerprint=intent_fingerprint(intent))
+    accepted_at = occurred_at - timedelta(milliseconds=1)
+    accepted_raw = RawBrokerObservation(
+        f"raw-accepted-{sequence}",
+        "capital-primary",
+        1,
+        sequence * 2 - 1,
+        accepted_at,
+        b"accepted",
+    )
+    journal.append_raw_observation(accepted_raw)
+    correlation = BrokerCorrelation(
+        1,
+        sequence * 2 - 1,
+        CorrelationStatus.CONFIRMED,
+        accepted_at,
+        broker_order_sequence=f"broker-order-{sequence}",
+        client_order_id=intent.client_order_id,
+    )
+    accepted = NormalizedBrokerOrderEvent(
+        event_id=f"accepted-{sequence}",
+        account_id=intent.account_id,
+        instrument_id=intent.instrument_id,
+        event_type=BrokerOrderEventType.NEW_ACCEPTED,
+        received_at=accepted_at,
+        broker_session_generation=1,
+        adapter_received_sequence=sequence * 2 - 1,
+        correlation=correlation,
+    )
+    result = journal.apply_normalized_event(
+        accepted,
+        raw_observation_id=accepted_raw.observation_id,
+        expected_order_version=order.version,
+    )
+    assert result.order is not None
+
+    fill_raw = RawBrokerObservation(
+        f"raw-fill-{sequence}",
+        "capital-primary",
+        1,
+        sequence * 2,
+        occurred_at,
+        b"fill",
+    )
+    journal.append_raw_observation(fill_raw)
+    fill_correlation = BrokerCorrelation(
+        1,
+        sequence * 2,
+        CorrelationStatus.CONFIRMED,
+        occurred_at,
+        broker_order_sequence=f"broker-order-{sequence}",
+        broker_fill_id=f"broker-fill-{sequence}",
+        client_order_id=intent.client_order_id,
+    )
+    fill = NormalizedBrokerFillEvent(
+        event_id=f"fill-{sequence}",
+        account_id=intent.account_id,
+        instrument_id=intent.instrument_id,
+        side=intent.side,
+        quantity=intent.quantity,
+        execution_price=Decimal("22100"),
+        received_at=occurred_at,
+        broker_session_generation=1,
+        adapter_received_sequence=sequence * 2,
+        correlation=fill_correlation,
+        occurred_at=occurred_at,
+    )
+    applied = journal.apply_normalized_event(
+        fill,
+        raw_observation_id=fill_raw.observation_id,
+        expected_order_version=result.order.version,
+    )
+    assert applied.order is not None
+
+
+def _register_and_accept(
+    journal: SqliteLiveOrderJournal,
+    intent: LiveOrderIntent,
+    *,
+    sequence: int,
+) -> LiveOrder:
+    command, order = _submitting(intent)
+    journal.register_new_order(command, order, intent_fingerprint=intent_fingerprint(intent))
+    accepted_at = NOW + timedelta(seconds=2)
+    raw = RawBrokerObservation(
+        f"raw-only-accepted-{sequence}",
+        "capital-primary",
+        1,
+        sequence,
+        accepted_at,
+        b"accepted",
+    )
+    journal.append_raw_observation(raw)
+    event = NormalizedBrokerOrderEvent(
+        event_id=f"only-accepted-{sequence}",
+        account_id=intent.account_id,
+        instrument_id=intent.instrument_id,
+        event_type=BrokerOrderEventType.NEW_ACCEPTED,
+        received_at=accepted_at,
+        broker_session_generation=1,
+        adapter_received_sequence=sequence,
+        correlation=BrokerCorrelation(
+            1,
+            sequence,
+            CorrelationStatus.CONFIRMED,
+            accepted_at,
+            broker_order_sequence=f"broker-only-accepted-{sequence}",
+            client_order_id=intent.client_order_id,
+        ),
+    )
+    result = journal.apply_normalized_event(
+        event,
+        raw_observation_id=raw.observation_id,
+        expected_order_version=order.version,
+    )
+    assert result.order is not None
+    assert result.order.state is LiveOrderState.ACCEPTED
+    assert result.order.pending_command is None
+    return result.order
 
 
 def _journal(
@@ -422,6 +568,323 @@ def test_reducer_reconciliation_is_durable_and_blocks_clean_recovery(
     connection.close()
     with pytest.raises(LiveJournalIntegrityError):
         _journal(path, JournalOpenMode.RESUME)
+
+
+def test_account_snapshot_is_read_only_isolated_and_recomputed_on_resume(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "account-snapshot.sqlite3"
+    as_of = NOW + timedelta(seconds=10)
+    journal = _journal(
+        path,
+        JournalOpenMode.CREATE_NEW,
+        journal_id="journal-snapshot",
+        clock=lambda: as_of,
+    )
+    assert isinstance(journal, DurableOrderJournalPort)
+    assert isinstance(journal, LocalReconciliationSourcePort)
+    with pytest.raises(TypeError, match="string"):
+        journal.load_account_snapshot(1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="bounded ASCII"):
+        journal.load_account_snapshot("bad account")
+
+    _register_and_fill(
+        journal,
+        _intent(
+            "order-buy",
+            quantity=Decimal("2"),
+            instrument_id="TXF-202608",
+        ),
+        sequence=1,
+        occurred_at=NOW + timedelta(seconds=3),
+    )
+    _register_and_fill(
+        journal,
+        _intent(
+            "order-sell",
+            side=LiveSide.SELL,
+            instrument_id="TXF-202608",
+        ),
+        sequence=2,
+        occurred_at=NOW + timedelta(seconds=2),
+    )
+    _register_and_fill(
+        journal,
+        _intent(
+            "order-flat-buy",
+            strategy_id="strategy-flat",
+            instrument_id="MXF-202608",
+        ),
+        sequence=3,
+        occurred_at=NOW + timedelta(seconds=5),
+    )
+    _register_and_fill(
+        journal,
+        _intent(
+            "order-flat-sell",
+            strategy_id="strategy-flat",
+            instrument_id="MXF-202608",
+            side=LiveSide.SELL,
+        ),
+        sequence=4,
+        occurred_at=NOW + timedelta(seconds=4),
+    )
+    _register_and_fill(
+        journal,
+        _intent("order-other", account_id="account-2"),
+        sequence=5,
+        occurred_at=NOW + timedelta(seconds=6),
+    )
+
+    sequence_before = journal.load_recovery_snapshot().journal_sequence
+    snapshot = journal.load_account_snapshot("account-1")
+    assert tuple(order.intent.client_order_id for order in snapshot.orders) == (
+        "order-buy",
+        "order-flat-buy",
+        "order-flat-sell",
+        "order-sell",
+    )
+    assert tuple(fill.fill_id for fill in snapshot.fills) == (
+        "broker-fill-2",
+        "broker-fill-1",
+        "broker-fill-4",
+        "broker-fill-3",
+    )
+    assert tuple(
+        (item.strategy_id, item.instrument_id, item.attributed_quantity)
+        for item in snapshot.position_attributions
+    ) == (("strategy-1", "TXF-202608", Decimal("1")),)
+    assert snapshot.as_of == as_of
+    assert journal.load_account_snapshot("empty-account").orders == ()
+    assert journal.load_account_snapshot("account-2").orders[0].intent.account_id == "account-2"
+    assert journal.load_recovery_snapshot().journal_sequence == sequence_before
+
+    journal.close()
+    resumed = _journal(path, JournalOpenMode.RESUME, clock=lambda: as_of)
+    assert resumed.load_account_snapshot("account-1") == snapshot
+    resumed.close()
+    with pytest.raises(LiveJournalClosedError):
+        resumed.load_account_snapshot("account-1")
+
+
+def test_account_snapshot_rejects_old_clock_without_writing(tmp_path: Path) -> None:
+    path = tmp_path / "old-snapshot-clock.sqlite3"
+    journal = _journal(
+        path,
+        JournalOpenMode.CREATE_NEW,
+        journal_id="journal-old-clock",
+        clock=lambda: NOW + timedelta(seconds=10),
+    )
+    _register_and_fill(
+        journal,
+        _intent("order-clock"),
+        sequence=1,
+        occurred_at=NOW + timedelta(seconds=3),
+    )
+    before = journal.load_recovery_snapshot().journal_sequence
+    journal._clock = lambda: NOW + timedelta(seconds=2)
+    with pytest.raises(ValueError, match="predates"):
+        journal.load_account_snapshot("account-1")
+    journal._clock = lambda: NOW + timedelta(seconds=10)
+    assert journal.load_recovery_snapshot().journal_sequence == before
+
+
+def test_legacy_journal_fake_does_not_need_reconciliation_method() -> None:
+    class LegacyJournalFake:
+        def register_new_order(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def register_command(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def claim_dispatch(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def record_dispatch_receipt(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def append_raw_observation(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def apply_normalized_event(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def get_order(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def list_active_orders(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def load_recovery_snapshot(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    legacy = LegacyJournalFake()
+    assert isinstance(legacy, DurableOrderJournalPort)
+    assert not isinstance(legacy, LocalReconciliationSourcePort)
+
+
+def test_account_snapshot_blocks_outstanding_claim_for_own_account_only(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(
+        tmp_path / "claim-blocker.sqlite3",
+        JournalOpenMode.CREATE_NEW,
+        journal_id="journal-claim-blocker",
+    )
+    command, order = _submitting()
+    journal.register_new_order(
+        command, order, intent_fingerprint=intent_fingerprint(command.intent)
+    )
+    journal.claim_dispatch(
+        command.client_command_id,
+        payload_fingerprint(command, FingerprintDomain.NEW_COMMAND_V1),
+        expected_order_version=order.version,
+        claimant_id="dispatcher-1",
+    )
+
+    blockers = journal.load_account_snapshot("account-1").recovery_blockers
+    assert len(blockers) == 1
+    assert blockers[0].startswith("recovery:claim:")
+    assert command.client_command_id not in blockers[0]
+    assert journal.load_account_snapshot("account-2").recovery_blockers == ()
+
+
+def test_unattributed_unresolved_observation_blocks_every_account_and_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "global-blocker.sqlite3"
+    journal = _journal(
+        path,
+        JournalOpenMode.CREATE_NEW,
+        journal_id="journal-global-blocker",
+    )
+    raw = RawBrokerObservation("secret-raw-id", "capital", 1, 1, NOW, b"opaque")
+    journal.append_raw_observation(raw)
+    first = journal.load_account_snapshot("account-1").recovery_blockers
+    assert len(first) == 1
+    assert first[0].startswith("recovery:observation-unresolved:")
+    assert raw.observation_id not in first[0]
+    assert journal.load_account_snapshot("account-2").recovery_blockers == first
+    journal.close()
+
+    resumed = _journal(path, JournalOpenMode.RESUME)
+    assert resumed.load_account_snapshot("account-1").recovery_blockers == first
+
+
+def test_accepted_order_conflict_and_requirement_are_durable_account_blockers(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "account-conflict-blocker.sqlite3"
+    journal = _journal(
+        path,
+        JournalOpenMode.CREATE_NEW,
+        journal_id="journal-account-conflict",
+    )
+    accepted = _register_and_accept(journal, _intent(), sequence=1)
+    conflict_at = NOW + timedelta(seconds=3)
+    raw = RawBrokerObservation("raw-account-conflict", "capital", 1, 2, conflict_at, b"conflict")
+    journal.append_raw_observation(raw)
+    event = NormalizedBrokerOrderEvent(
+        event_id="account-conflict",
+        account_id="account-1",
+        instrument_id="different-instrument",
+        event_type=BrokerOrderEventType.NEW_ACCEPTED,
+        received_at=conflict_at,
+        broker_session_generation=1,
+        adapter_received_sequence=2,
+        correlation=BrokerCorrelation(
+            1,
+            2,
+            CorrelationStatus.CONFIRMED,
+            conflict_at,
+            broker_order_sequence="broker-conflict",
+            client_order_id=accepted.intent.client_order_id,
+        ),
+    )
+    result = journal.apply_normalized_event(
+        event,
+        raw_observation_id=raw.observation_id,
+        expected_order_version=accepted.version,
+    )
+    assert result.disposition.value == "unresolved"
+    recovery = journal.load_recovery_snapshot()
+    assert recovery.conflict_observations == (raw,)
+    assert len(recovery.reconciliation_requirements) == 1
+    blockers = journal.load_account_snapshot("account-1").recovery_blockers
+    assert len(blockers) == 2
+    assert journal.load_account_snapshot("account-2").recovery_blockers == ()
+    journal.close()
+
+    resumed = _journal(path, JournalOpenMode.RESUME)
+    assert resumed.load_account_snapshot("account-1").recovery_blockers == blockers
+
+
+def test_account_attribution_sum_ignores_ambient_precision_and_overflow_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "exact-attribution.sqlite3"
+    journal = _journal(
+        path,
+        JournalOpenMode.CREATE_NEW,
+        journal_id="journal-exact-attribution",
+        clock=lambda: NOW + timedelta(seconds=20),
+    )
+    maximum = Decimal("9999999999999999999999999999999999")
+    one_less = Decimal("9999999999999999999999999999999998")
+    with localcontext() as setup_context:
+        setup_context.prec = 34
+        _register_and_fill(
+            journal,
+            _intent("order-exact-buy", quantity=maximum),
+            sequence=1,
+            occurred_at=NOW + timedelta(seconds=3),
+        )
+        _register_and_fill(
+            journal,
+            _intent(
+                "order-exact-sell",
+                side=LiveSide.SELL,
+                quantity=one_less,
+            ),
+            sequence=2,
+            occurred_at=NOW + timedelta(seconds=4),
+        )
+    with localcontext() as verification_context:
+        verification_context.prec = 34
+        sequence = journal.load_recovery_snapshot().journal_sequence
+    with localcontext() as context:
+        context.prec = 6
+        attribution = journal.load_account_snapshot("account-1").position_attributions
+    assert attribution[0].attributed_quantity == Decimal(1)
+    with localcontext() as verification_context:
+        verification_context.prec = 34
+        assert journal.load_recovery_snapshot().journal_sequence == sequence
+
+    with localcontext() as setup_context:
+        setup_context.prec = 34
+        _register_and_fill(
+            journal,
+            _intent("order-overflow", strategy_id="overflow", quantity=maximum),
+            sequence=3,
+            occurred_at=NOW + timedelta(seconds=5),
+        )
+        _register_and_fill(
+            journal,
+            _intent("order-overflow-2", strategy_id="overflow", quantity=maximum),
+            sequence=4,
+            occurred_at=NOW + timedelta(seconds=6),
+        )
+    with localcontext() as verification_context:
+        verification_context.prec = 34
+        sequence = journal.load_recovery_snapshot().journal_sequence
+    with pytest.raises(ValueError, match="exact sum exceeds"):
+        journal.load_account_snapshot("account-1")
+    with localcontext() as verification_context:
+        verification_context.prec = 34
+        assert journal.load_recovery_snapshot().journal_sequence == sequence
 
 
 def test_mismatched_incoming_raw_provenance_is_durable_conflict(

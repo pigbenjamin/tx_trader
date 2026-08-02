@@ -420,3 +420,59 @@ directory. Python's standard SQLite API cannot bind a database connection to
 the already-validated OS file handle across every supported platform, so an
 adversary able to replace files concurrently inside that directory remains
 outside this slice's threat model.
+
+## Phase 3B-2 fake-only reconciliation
+
+Phase 3B-2 adds immutable local and broker reconciliation snapshots, a pure
+deterministic assessment, and thin fake-only snapshot orchestration. The
+service makes one atomic snapshot-bundle call to a broker source; that source
+owns and attests the coherent cut and cursor for its open-order, fill and
+position evidence. The SQLite v1 journal exposes a read-only account snapshot
+and recomputes strategy position attribution from durable fills already present
+in this journal whenever the process resumes. This is not a production opening
+balance or an independently authoritative portfolio position.
+
+The assessment reports order, fill and position mismatches. It infers absence
+only when the corresponding broker query evidence is complete, treats
+candidate/conflicting identity as ambiguous and fails closed, and keeps an
+order with a pending command from resuming. An assessment is diagnostic only:
+`may_dispatch` is always `False`.
+
+All three broker evidence sets must carry the same snapshot cut token and must
+not predate the local snapshot. Durable recovery blockers, including
+outcome-unknown claims, unresolved/conflicting/ambiguous observations and open
+reconciliation requirements, also participate in `may_resume`. Local fills
+must refer to a local order and match its typed account/strategy/instrument/side
+identity, time bounds and aggregate filled quantity. Broker fill observations
+map injectively to durable local fills, so one local fill cannot satisfy
+multiple observations. Position totals use exact, context-independent
+`Decimal` summation.
+
+Run the focused Phase 3B-2 offline gate with:
+
+```powershell
+.\venv_tx_trade_fresh\Scripts\python.exe -B -m pytest `
+    -p no:cacheprovider `
+    --basetemp .\.pytest_tmp\phase3b2 `
+    -o addopts="" `
+    tests\unit\test_live_reconciliation_contracts.py `
+    tests\unit\test_live_reconciliation.py `
+    tests\integration\test_live_reconciliation_fake.py `
+    -q
+```
+
+The focused new tests are `55 passed`; the combined Phase 3 gate is
+`319 passed`. The full safe offline regression is
+`1218 passed, 5 skipped, 2 deselected`. Its split is
+`1119 passed, 4 skipped` unit tests and `96 passed, 1 deselected` integration
+tests.
+
+This slice does not import or initialize COM/SKCOM, read credentials or DLL
+settings, connect Reply, create Order, register callbacks, perform a live
+query, dispatch or submit an order. Assessment does not write broker evidence,
+resolve a durable reconciliation requirement or dispatch claim, or change the
+SQLite v1 schema; it is recomputed after restart. A committed claim without a
+receipt remains outcome-unknown and is never resent automatically. Durable
+reconciliation commit/resolution and its schema migration are a later planning
+item. Any query-only SKCOM adapter and every real-order step still require a
+separate PLAN and explicit authorization.

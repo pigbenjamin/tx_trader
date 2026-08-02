@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from decimal import Context, Decimal, localcontext
 from hashlib import sha256
 import json
 import os
@@ -30,9 +31,11 @@ from .live_contracts import (
     LiveFill,
     LiveOrder,
     LiveOrderState,
+    LiveSide,
     NewOrderCommand,
     NormalizedBrokerFillEvent,
     NormalizedBrokerOrderEvent,
+    StrategyPositionAttribution,
     broker_semantic_fingerprint,
     canonical_bytes,
     payload_fingerprint,
@@ -70,6 +73,7 @@ from .live_ports import (
     JournalAppendResult,
     RawBrokerObservation,
 )
+from .live_reconciliation_contracts import LocalReconciliationSnapshot, exact_decimal_sum
 from .live_state_machine import (
     AppliedEvent,
     AppliedEventLedger,
@@ -94,6 +98,7 @@ _FILL_DOMAIN = "tx_trade.live.journal.fill.v1"
 _RECONCILIATION_DOMAIN = "tx_trade.live.journal.reconciliation.v1"
 _APPLICATION_FACT_DOMAIN = "tx_trade.live.journal.application-fact.v1"
 _RESOLUTION_FACT_DOMAIN = "tx_trade.live.journal.observation-resolution.v1"
+_RECOVERY_BLOCKER_DOMAIN = b"tx_trade.live.journal.recovery-blocker.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 _COMMAND_DOMAINS = {
@@ -263,6 +268,17 @@ def _resolution_digest(observation_id: str, resolution_status: str, resolved_at:
             "resolved_at": resolved_at,
         },
     )
+
+
+def _recovery_blocker(kind: str, durable_id: str) -> str:
+    digest = sha256(
+        _RECOVERY_BLOCKER_DOMAIN
+        + b"\x00"
+        + kind.encode("ascii")
+        + b"\x00"
+        + durable_id.encode("ascii")
+    ).hexdigest()
+    return f"recovery:{kind}:{digest}"
 
 
 class _CasMismatch(Exception):
@@ -1642,6 +1658,184 @@ class SqliteLiveOrderJournal:
             except sqlite3.Error as exc:
                 raise _sqlite_failure(exc) from None
 
+    def _load_recovery_blockers(self, account_id: str) -> tuple[str, ...]:
+        connection = self._require_connection()
+        account_blockers: dict[str, set[str]] = {}
+        global_blockers: set[str] = set()
+
+        def add(kind: str, durable_id: str, accounts: set[str]) -> None:
+            blocker = _recovery_blocker(kind, durable_id)
+            if len(accounts) != 1:
+                global_blockers.add(blocker)
+                return
+            account_blockers.setdefault(next(iter(accounts)), set()).add(blocker)
+
+        for row in connection.execute(
+            """SELECT dc.client_command_id, o.account_id
+               FROM live_dispatch_claims dc
+               JOIN live_commands c ON c.client_command_id = dc.client_command_id
+               JOIN live_orders o ON o.client_order_id = c.client_order_id
+               LEFT JOIN live_dispatch_receipts dr
+                 ON dr.client_command_id = dc.client_command_id
+               WHERE dr.client_command_id IS NULL"""
+        ):
+            add("claim", row[0], {row[1]})
+
+        observation_accounts: dict[str, set[str]] = {}
+        for row in connection.execute(
+            """SELECT raw_observation_id, payload, payload_digest
+               FROM live_normalized_events"""
+        ):
+            event = cast(
+                NormalizedBrokerOrderEvent | NormalizedBrokerFillEvent,
+                _decode(
+                    row[1],
+                    row[2],
+                    (NormalizedBrokerOrderEvent, NormalizedBrokerFillEvent),
+                    _EVENT_DOMAIN,
+                ),
+            )
+            observation_accounts.setdefault(row[0], set()).add(event.account_id)
+        for row in connection.execute(
+            """SELECT a.observation_id, o.account_id
+               FROM live_observation_ambiguity a
+               JOIN live_orders o
+                 ON o.client_order_id = a.candidate_client_order_id"""
+        ):
+            observation_accounts.setdefault(row[0], set()).add(row[1])
+
+        for row in connection.execute(
+            """SELECT observation_id, resolution_status
+               FROM live_raw_observations
+               WHERE resolution_status IN ('unresolved', 'conflict', 'ambiguous')"""
+        ):
+            add(
+                f"observation-{row[1]}",
+                row[0],
+                observation_accounts.get(row[0], set()),
+            )
+
+        order_accounts = {
+            row[0]: row[1]
+            for row in connection.execute("SELECT client_order_id, account_id FROM live_orders")
+        }
+        for row in connection.execute(
+            """SELECT requirement_id, client_order_id, observation_id
+               FROM live_reconciliation_requirements
+               WHERE resolved_at IS NULL"""
+        ):
+            accounts: set[str] = set()
+            if row[1] is not None:
+                order_account = order_accounts.get(row[1])
+                if order_account is None:
+                    raise LiveJournalIntegrityError(
+                        "live journal reconciliation requirement is invalid"
+                    )
+                accounts.add(order_account)
+            if row[2] is not None:
+                accounts.update(observation_accounts.get(row[2], set()))
+            add("requirement", str(row[0]), accounts)
+
+        return tuple(sorted(global_blockers | account_blockers.get(account_id, set())))
+
+    def load_account_snapshot(self, account_id: str) -> LocalReconciliationSnapshot:
+        if type(account_id) is not str:
+            raise TypeError("account_id must be a string")
+        if not _IDENTIFIER.fullmatch(account_id):
+            raise ValueError("account_id must be a bounded ASCII identifier")
+        with self._lock, self._operation(), localcontext(Context(prec=34)):
+            try:
+                connection = self._require_connection()
+                connection.execute("BEGIN")
+                try:
+                    self._verify_durable_payloads()
+                    order_rows = connection.execute(
+                        """SELECT client_order_id FROM live_orders
+                           WHERE account_id = ? ORDER BY client_order_id""",
+                        (account_id,),
+                    ).fetchall()
+                    orders = tuple(self._load_order_row(row[0]) for row in order_rows)
+                    if any(order is None for order in orders):
+                        raise LiveJournalIntegrityError("live journal order projection is invalid")
+                    typed_orders = cast(tuple[LiveOrder, ...], orders)
+
+                    fills: list[LiveFill] = []
+                    for row in connection.execute(
+                        """SELECT f.fill_id, f.client_order_id, f.payload,
+                                  f.payload_digest, o.account_id
+                           FROM live_fills f JOIN live_orders o
+                             ON o.client_order_id = f.client_order_id
+                           WHERE o.account_id = ?
+                           ORDER BY f.fill_id""",
+                        (account_id,),
+                    ):
+                        fill = cast(
+                            LiveFill,
+                            _decode(row[2], row[3], LiveFill, _FILL_DOMAIN),
+                        )
+                        if (
+                            row[0] != fill.fill_id
+                            or row[1] != fill.client_order_id
+                            or row[4] != fill.account_id
+                            or fill.account_id != account_id
+                        ):
+                            raise LiveJournalIntegrityError("live journal fill is invalid")
+                        fills.append(fill)
+                    fills.sort(key=lambda fill: (fill.occurred_at, fill.fill_id))
+
+                    as_of = self._now()
+                    latest_item = max(
+                        (
+                            *(order.updated_at for order in typed_orders),
+                            *(fill.occurred_at for fill in fills),
+                        ),
+                        default=None,
+                    )
+                    if latest_item is not None and as_of < latest_item:
+                        raise ValueError("clock predates durable account data")
+
+                    quantities: dict[tuple[str, str], list[Decimal]] = {}
+                    for fill in fills:
+                        key = (fill.strategy_id, fill.instrument_id)
+                        signed = (
+                            fill.quantity
+                            if fill.side is LiveSide.BUY
+                            else fill.quantity.copy_negate()
+                        )
+                        quantities.setdefault(key, []).append(signed)
+                    exact_quantities = {
+                        key: exact_decimal_sum(values) for key, values in quantities.items()
+                    }
+                    blockers = self._load_recovery_blockers(account_id)
+                    attributions = tuple(
+                        StrategyPositionAttribution(
+                            strategy_id,
+                            account_id,
+                            instrument_id,
+                            quantity,
+                            as_of,
+                        )
+                        for (strategy_id, instrument_id), quantity in sorted(
+                            exact_quantities.items()
+                        )
+                        if quantity != 0
+                    )
+                    snapshot = LocalReconciliationSnapshot(
+                        account_id,
+                        typed_orders,
+                        tuple(fills),
+                        attributions,
+                        as_of,
+                        blockers,
+                    )
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+                connection.execute("COMMIT")
+                return snapshot
+            except sqlite3.Error as exc:
+                raise _sqlite_failure(exc) from None
+
     def _load_applied_event_ledger(self) -> AppliedEventLedger:
         connection = self._require_connection()
         dispatch_events: list[AppliedEvent] = []
@@ -1935,7 +2129,16 @@ class SqliteLiveOrderJournal:
                FROM live_fills"""
         ):
             fill = cast(LiveFill, _decode(row[2], row[3], LiveFill, _FILL_DOMAIN))
-            if row[0] != fill.fill_id or row[1] != fill.client_order_id:
+            fill_order = self._load_order_row(row[1])
+            if (
+                row[0] != fill.fill_id
+                or row[1] != fill.client_order_id
+                or fill_order is None
+                or fill.account_id != fill_order.intent.account_id
+                or fill.strategy_id != fill_order.intent.strategy_id
+                or fill.instrument_id != fill_order.intent.instrument_id
+                or fill.side is not fill_order.intent.side
+            ):
                 raise LiveJournalIntegrityError("live journal fill is invalid")
         for row in connection.execute(
             """SELECT requirement_id, client_order_id, observation_id,
