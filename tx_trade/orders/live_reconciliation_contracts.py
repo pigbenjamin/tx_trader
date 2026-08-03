@@ -116,6 +116,7 @@ class LocalReconciliationSnapshot:
     position_attributions: tuple[StrategyPositionAttribution, ...]
     as_of: datetime
     recovery_blockers: tuple[str, ...] = ()
+    journal_sequence: int = 0
 
     def __post_init__(self) -> None:
         _require_identifier(self.account_id, "account_id")
@@ -127,6 +128,10 @@ class LocalReconciliationSnapshot:
             "position_attributions",
         )
         _require_utc(self.as_of, "as_of")
+        if type(self.journal_sequence) is not int:
+            raise TypeError("journal_sequence must be an integer")
+        if self.journal_sequence < 0:
+            raise ValueError("journal_sequence must be nonnegative")
         blockers = _require_exact_tuple(self.recovery_blockers, str, "recovery_blockers")
         for blocker in blockers:
             _require_identifier(blocker, "recovery_blocker")

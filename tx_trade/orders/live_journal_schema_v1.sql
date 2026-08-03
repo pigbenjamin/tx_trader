@@ -1,5 +1,7 @@
 PRAGMA application_id = 1415074890;
-PRAGMA user_version = 2;
+PRAGMA user_version = 1;
+
+BEGIN EXCLUSIVE;
 
 CREATE TABLE live_journal_migrations (
     version INTEGER PRIMARY KEY CHECK (version > 0),
@@ -7,10 +9,10 @@ CREATE TABLE live_journal_migrations (
         CHECK (schema_fingerprint GLOB 'sha256:[0-9a-f]*')
 );
 
-CREATE TABLE "live_journal_identity" (
+CREATE TABLE live_journal_identity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     journal_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version IN (1, 2)),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
     schema_fingerprint TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -142,68 +144,6 @@ CREATE TABLE live_reconciliation_requirements (
     resolved_at TEXT
 );
 
-CREATE TABLE live_reconciliation_commits (
-    commit_id TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL,
-    expected_journal_sequence INTEGER NOT NULL CHECK (expected_journal_sequence >= 0),
-    base_journal_sequence INTEGER NOT NULL CHECK (base_journal_sequence >= 0),
-    snapshot_id TEXT NOT NULL,
-    request_payload BLOB NOT NULL CHECK (length(request_payload) BETWEEN 1 AND 1048576),
-    request_digest TEXT NOT NULL CHECK (request_digest GLOB 'sha256:[0-9a-f]*'),
-    committed_at TEXT NOT NULL,
-    resulting_journal_sequence INTEGER NOT NULL,
-    CHECK (base_journal_sequence = expected_journal_sequence),
-    CHECK (resulting_journal_sequence > base_journal_sequence),
-    UNIQUE (account_id, snapshot_id),
-    UNIQUE (account_id, request_digest),
-    UNIQUE (account_id, resulting_journal_sequence)
-);
-
-CREATE TABLE live_dispatch_claim_resolutions (
-    client_command_id TEXT PRIMARY KEY
-        REFERENCES live_dispatch_claims(client_command_id),
-    commit_id TEXT NOT NULL REFERENCES live_reconciliation_commits(commit_id),
-    expected_claim_token TEXT NOT NULL,
-    expected_claim_version INTEGER NOT NULL CHECK (expected_claim_version > 0),
-    expected_order_version INTEGER NOT NULL CHECK (expected_order_version > 0),
-    expected_precondition_digest TEXT NOT NULL
-        CHECK (expected_precondition_digest GLOB 'sha256:[0-9a-f]*'),
-    resolution_kind TEXT NOT NULL
-        CHECK (resolution_kind IN ('broker_order_confirmed', 'broker_fill_confirmed')),
-    resolved_at TEXT NOT NULL,
-    resolution_digest TEXT NOT NULL
-        CHECK (resolution_digest GLOB 'sha256:[0-9a-f]*')
-);
-
-CREATE TABLE live_observation_reconciliation_resolutions (
-    observation_id TEXT PRIMARY KEY
-        REFERENCES live_raw_observations(observation_id),
-    commit_id TEXT NOT NULL REFERENCES live_reconciliation_commits(commit_id),
-    expected_resolution_status TEXT NOT NULL
-        CHECK (expected_resolution_status IN ('unresolved', 'ambiguous', 'conflict')),
-    expected_precondition_digest TEXT NOT NULL
-        CHECK (expected_precondition_digest GLOB 'sha256:[0-9a-f]*'),
-    normalized_event_id TEXT NOT NULL,
-    resolution_kind TEXT NOT NULL
-        CHECK (resolution_kind IN ('broker_order_confirmed', 'broker_fill_confirmed')),
-    resolved_at TEXT NOT NULL,
-    resolution_digest TEXT NOT NULL
-        CHECK (resolution_digest GLOB 'sha256:[0-9a-f]*')
-);
-
-CREATE TABLE live_reconciliation_requirement_resolutions (
-    requirement_id INTEGER PRIMARY KEY
-        REFERENCES live_reconciliation_requirements(requirement_id),
-    commit_id TEXT NOT NULL REFERENCES live_reconciliation_commits(commit_id),
-    expected_precondition_digest TEXT NOT NULL
-        CHECK (expected_precondition_digest GLOB 'sha256:[0-9a-f]*'),
-    resolution_kind TEXT NOT NULL
-        CHECK (resolution_kind = 'satisfied'),
-    resolved_at TEXT NOT NULL,
-    resolution_digest TEXT NOT NULL
-        CHECK (resolution_digest GLOB 'sha256:[0-9a-f]*')
-);
-
 CREATE INDEX live_orders_account_state_idx
     ON live_orders(account_id, state, client_order_id);
 CREATE INDEX live_commands_order_idx
@@ -213,11 +153,5 @@ CREATE INDEX live_raw_observations_resolution_idx
 CREATE INDEX live_reconciliation_open_idx
     ON live_reconciliation_requirements(created_at, requirement_id)
     WHERE resolved_at IS NULL;
-CREATE INDEX live_reconciliation_commits_account_idx
-    ON live_reconciliation_commits(account_id, committed_at, commit_id);
-CREATE INDEX live_dispatch_claim_resolutions_commit_idx
-    ON live_dispatch_claim_resolutions(commit_id, resolved_at, client_command_id);
-CREATE INDEX live_observation_reconciliation_resolutions_commit_idx
-    ON live_observation_reconciliation_resolutions(commit_id, resolved_at, observation_id);
-CREATE INDEX live_reconciliation_requirement_resolutions_commit_idx
-    ON live_reconciliation_requirement_resolutions(commit_id, resolved_at, requirement_id);
+
+COMMIT;

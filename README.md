@@ -476,3 +476,58 @@ receipt remains outcome-unknown and is never resent automatically. Durable
 reconciliation commit/resolution and its schema migration are a later planning
 item. Any query-only SKCOM adapter and every real-order step still require a
 separate PLAN and explicit authorization.
+
+## Phase 3B-3 durable reconciliation commit
+
+Phase 3B-3 adds an offline durable commit boundary for evidence-backed
+reconciliation and migrates the live journal from SQLite schema v1 to v2. The
+database schema version and payload codec version are intentionally separate:
+new and migrated journals use schema v2, while existing canonical journal
+payloads remain codec v1 and v1 journal data remains readable.
+
+A reconciliation commit is one atomic compare-and-swap over the assessed
+journal sequence, expected order versions, claim tokens and durable target
+preconditions. Reusing a `commit_id` with the identical canonical request
+returns the original durable result; different content is an ID conflict, and
+stale cuts or versions fail closed. Resolution rows are append-only overlays:
+the original claim, observation and requirement evidence is retained. The
+supported resolutions are broker-order or broker-fill confirmation for a
+claim/observation, and `satisfied` for a requirement. They require durable
+evidence provenance, never synthesize a dispatch receipt and never authorize
+redispatch. Recovery validates the overlays and excludes only successfully
+resolved blockers; `may_dispatch` remains `False`.
+
+The v2 implementation deliberately does not commit caller-projected orders:
+any non-empty `order_projections` request returns `UNSUPPORTED_RESOLUTION`.
+A dispatch claim can be resolved only for a NEW command whose local order was
+already durably accepted with no pending command by a broker event, and whose
+existence is then corroborated by an authoritative broker order/fill snapshot.
+
+Run the focused offline contract, migration, repository and recovery gate with:
+
+```powershell
+.\venv_tx_trade_fresh\Scripts\python.exe -B -m pytest `
+    -p no:cacheprovider `
+    --basetemp .\.pytest_tmp\phase3b3 `
+    -o addopts="" `
+    tests\unit\test_live_reconciliation_commit_contracts.py `
+    tests\unit\test_live_journal_v2_schema_sql.py `
+    tests\unit\test_live_journal_v2_migration.py `
+    tests\unit\test_live_journal_reconciliation_commit.py `
+    tests\integration\test_live_reconciliation_commit_fake.py `
+    tests\integration\test_live_order_journal_process_recovery.py `
+    -q
+```
+
+The 2026-08-03 Commander offline quality gate passed: formatter check covered
+149 files, scoped `ruff check tx_trade tests` passed, mypy reported no issues
+in 65 source files, unit tests were `1171 passed, 4 skipped`, integration tests
+were `105 passed, 1 skipped`, and the full default offline suite was
+`1276 passed, 4 skipped, 6 deselected`. These integration tests use offline
+SQLite/fake-broker paths; they do not exercise a real broker integration.
+
+This remains an offline persistence and recovery slice. It adds no production
+broker query adapter, COM/SKCOM initialization, credential or DLL access,
+Reply/Order connection, callback registration, dispatch permission or real
+order operation. Query-only SKCOM integration and every real-order step still
+require a separate plan and explicit authorization.

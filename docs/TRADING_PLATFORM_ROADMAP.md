@@ -502,7 +502,7 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 | Phase 0 專案基線 | 已完成 | 2026-07-25 | 2026-07-27 | fresh Python 3.13.14 環境、依賴、品質檢查與安全測試已驗證 |
 | Phase 1 穩定行情 | 已完成 | 2026-07-26 | 2026-07-28 | 離線驗證與真實 quote-only live smoke 均完成 |
 | Phase 2 Replay/Paper | 已完成 | 2026-07-28 | 2026-07-28 | Phase 2A Replay Runtime 與 Phase 2B-1 至 2B-5 PaperBroker、durable recovery 及 output outbox 已完成 final acceptance |
-| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A contracts、3B-1 durable journal 與 3B-2 fake-only reconciliation 已完成；尚未建立 COM、live query 或送單 |
+| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A contracts、3B-1 durable journal、3B-2 fake-only reconciliation 與 3B-3 durable reconciliation commit/migration 已完成 Commander offline gate；尚未建立 COM、live query 或送單 |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
 | Phase 6 營運強化 | 待開始 |  |  |  |
@@ -560,16 +560,16 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 ## 14. 下一個工作項目
 
 Phase 0、Phase 1 與 Phase 2 已完成。Phase 3A live-order contracts、Phase
-3B-1 SQLite journal 與 Phase 3B-2 fake-only reconciliation 已完成各自的
-worker gate；Phase 3 整體仍在進行中，Commander 的 final quality gate
-另行執行。
+3B-1 SQLite journal 與 Phase 3B-2 fake-only reconciliation 已完成；Phase
+3B-3 durable reconciliation commit/resolution 與 SQLite v1→v2 migration
+已通過 Commander offline quality gate。Phase 3 整體仍在進行中。
 
-Phase 3 的下一個候選 planning item 是 durable reconciliation
-commit/resolution protocol 與 schema migration。現有 3B-2 assessment
-不寫入 broker evidence、不解決 durable requirement 或 dispatch claim，
-也不修改 schema v1；重啟後重新計算，claim 永不自動 resend。任何
-query-only SKCOM adapter、SKCOM Order／full Reply integration 或真單仍
-必須另行完成 PLAN PHASE並取得明確授權。
+Phase 3 的下一個候選 planning item 是 pure authoritative order projector
+與 operator-facing recovery workflow。
+Phase 3B-3 仍不提供 production broker evidence source 或 dispatch
+permission；`may_dispatch=False`，既有 claim 永不自動 resend，也不合成
+receipt。任何 query-only SKCOM adapter、SKCOM Order／full Reply integration
+或真單仍必須另行完成 PLAN PHASE 並取得明確授權。
 
 ## 15. 新工作階段交接清單（2026-07-27）
 
@@ -860,3 +860,48 @@ composition、不讀 live credential、不載入 COM。
 - Next planning candidate is a durable reconciliation commit/resolution
   protocol plus schema migration. Any query-only SKCOM adapter and any real
   order require a separate PLAN and explicit authorization.
+
+### 15.9 Phase 3B-3 durable reconciliation commit/resolution（2026-08-03）
+
+- Added immutable commit requests/results and a single durable commit port.
+  The request binds the account, assessed local journal cut, broker snapshot,
+  expected order versions and the exact claim, observation and requirement
+  targets to one atomic compare-and-swap.
+- Split storage schema evolution from payload encoding. Fresh journals use
+  SQLite schema v2 and existing v1 journals migrate transactionally to the
+  same schema; canonical journal payloads remain codec v1, so v1 payloads and
+  creation identity remain compatible.
+- Added append-only reconciliation commit and resolution overlays. Migration
+  preserves existing authoritative rows rather than rewriting claims,
+  observations or requirements, and caller-owned transaction management can
+  roll the migration back as a unit.
+- An identical retry of a committed `commit_id` reproduces its original
+  durable timestamp and resulting sequence. A changed request is an ID
+  conflict. Journal-sequence, order-version, claim-token, target-status and
+  precondition mismatches fail closed before any partial resolution.
+- Supported evidence-backed outcomes are broker-order/broker-fill confirmation
+  for claims and observations, and `satisfied` for requirements. Resolution
+  never synthesizes a dispatch receipt, never converts transport evidence into
+  broker acceptance and never permits automatic redispatch.
+- The conservative v2 repository does not commit caller-projected orders;
+  non-empty `order_projections` returns `UNSUPPORTED_RESOLUTION`. Claim
+  resolution is limited to a NEW claim whose local order is already durably
+  accepted with no pending command by a broker event, then corroborated by an
+  authoritative broker order/fill snapshot.
+- Recovery validates commit provenance and append-only overlays, retains the
+  complete audit history, and removes only successfully resolved blockers from
+  the pending recovery view. `may_dispatch` remains `False`.
+- Focused offline validation covers commit contracts, fresh-v2/migrated-v1
+  schema equivalence, repository exact-retry/CAS behavior and process recovery.
+- Commander offline quality gate passed: formatter check covered 149 files;
+  scoped `ruff check tx_trade tests` passed; mypy passed over 65 source files;
+  unit tests were `1171 passed, 4 skipped`; offline integration tests were
+  `105 passed, 1 skipped`; and the full default offline suite was
+  `1276 passed, 4 skipped, 6 deselected`.
+- No COM/SKCOM initialization, credential/DLL read, Reply/Order connection,
+  callback, production broker query, dispatch permission or live order was
+  added or exercised. The integration count above is offline/fake-only and is
+  not evidence of real broker integration.
+- Next candidate work is a pure authoritative order projector plus an
+  operator-facing recovery workflow. Production query and every dispatch path
+  remain separately planned and explicitly authorized work.

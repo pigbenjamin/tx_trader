@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -36,6 +37,15 @@ from tx_trade.orders.live_ports import (
 )
 from tx_trade.orders.live_state_machine import advance_local, create_live_order
 from tx_trade.orders.sqlite_live_order_journal import SqliteLiveOrderJournal
+
+from tests.integration.test_live_reconciliation_commit_fake import (
+    ACCOUNT_ID as COMMIT_ACCOUNT_ID,
+    _claim_request as _commit_claim_request,
+    _open as _open_commit_journal,
+)
+from tx_trade.orders.live_reconciliation_commit_contracts import (
+    ReconciliationCommitDisposition,
+)
 
 NOW = datetime(2026, 7, 30, tzinfo=timezone.utc)
 
@@ -261,3 +271,168 @@ os._exit(0)
     assert not verification.pending[0].may_redispatch
     assert not verification.may_dispatch
     assert RecoveryIssueCode.OUTSTANDING_DISPATCH in verification.issues
+
+
+def _run_child(source: str, path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-B", "-c", source, str(path), *arguments],
+        cwd=Path.cwd(),
+        env=os.environ.copy(),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_abrupt_exit_before_or_after_reconciliation_commit_is_transactional(
+    tmp_path: Path,
+) -> None:
+    child = r"""
+import os
+import sys
+
+from tests.integration.test_live_reconciliation_commit_fake import (
+    _claim_request,
+    _open,
+    _register_claim_and_accept,
+)
+from tx_trade.orders.live_journal_contracts import JournalOpenMode
+
+journal = _open(sys.argv[1], JournalOpenMode.CREATE_NEW)
+_register_claim_and_accept(journal)
+request = _claim_request(journal, commit_id="commit-process-integration")
+if sys.argv[2] == "after":
+    result = journal.commit_reconciliation(request)
+    assert result.disposition.value == "committed"
+os._exit(0)
+"""
+
+    for phase in ("before", "after"):
+        path = tmp_path / f"abrupt-commit-{phase}.sqlite3"
+        completed = _run_child(child, path, phase)
+        assert completed.returncode == 0, completed.stderr
+
+        resumed = _open_commit_journal(path, JournalOpenMode.RESUME)
+        recovered = resumed.load_recovery_snapshot()
+        verification = verify_recovery_snapshot(recovered)
+        assert not verification.may_dispatch
+        with sqlite3.connect(path) as connection:
+            sequences = tuple(
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT journal_sequence FROM live_journal_records ORDER BY journal_sequence"
+                )
+            )
+        assert sequences == tuple(range(1, recovered.journal_sequence + 1))
+
+        if phase == "before":
+            assert len(recovered.outstanding_claims) == 1
+            committed = resumed.commit_reconciliation(
+                _commit_claim_request(resumed, commit_id="commit-process-parent")
+            )
+            assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
+        else:
+            assert recovered.outstanding_claims == ()
+            assert verification.readiness is RecoveryReadiness.READY
+            assert resumed.load_account_snapshot(COMMIT_ACCOUNT_ID).recovery_blockers == ()
+
+        after = resumed.load_recovery_snapshot()
+        assert after.outstanding_claims == ()
+        assert all(item.source != "dispatch" for item in after.applied_event_ledger.events)
+        with sqlite3.connect(path) as connection:
+            final_sequences = tuple(
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT journal_sequence FROM live_journal_records ORDER BY journal_sequence"
+                )
+            )
+        assert final_sequences == tuple(range(1, after.journal_sequence + 1))
+        resumed.close()
+
+
+def test_abrupt_exit_at_v1_migration_boundary_recovers_whole_schema(tmp_path: Path) -> None:
+    child = r'''
+from datetime import datetime, timezone
+from hashlib import sha256
+import os
+from pathlib import Path
+import sqlite3
+import sys
+
+from tx_trade.orders.live_journal_codec import encode_journal_value, journal_digest
+from tx_trade.orders.live_journal_contracts import JournalOpenMode, LiveJournalIdentity
+from tx_trade.orders.sqlite_live_order_journal import SqliteLiveOrderJournal
+
+path = Path(sys.argv[1])
+schema_path = Path("tx_trade/orders/live_journal_schema_v1.sql")
+schema = schema_path.read_text(encoding="utf-8")
+fingerprint = f"sha256:{sha256(schema.encode('utf-8')).hexdigest()}"
+created_at = datetime(2026, 8, 3, tzinfo=timezone.utc)
+created_text = created_at.isoformat().replace("+00:00", "Z")
+identity = LiveJournalIdentity("journal-v1-process", 1, fingerprint, created_at)
+payload = encode_journal_value(identity)
+digest = journal_digest("tx_trade.live.journal.identity.v1", payload)
+
+connection = sqlite3.connect(path, isolation_level=None)
+connection.executescript(schema)
+connection.execute("BEGIN IMMEDIATE")
+connection.execute(
+    "INSERT INTO live_journal_migrations(version, schema_fingerprint) VALUES (1, ?)",
+    (fingerprint,),
+)
+connection.execute(
+    """INSERT INTO live_journal_identity(
+           singleton, journal_id, schema_version, schema_fingerprint, created_at
+       ) VALUES (1, ?, 1, ?, ?)""",
+    (identity.journal_id, fingerprint, created_text),
+)
+connection.execute(
+    """INSERT INTO live_journal_records(
+           record_kind, record_id, payload_digest, recorded_at
+       ) VALUES ('identity', ?, ?, ?)""",
+    (identity.journal_id, digest, created_text),
+)
+connection.execute("COMMIT")
+if sys.argv[2] == "after":
+    journal = SqliteLiveOrderJournal(
+        path,
+        JournalOpenMode.RESUME,
+        clock=lambda: datetime(2026, 8, 3, 1, tzinfo=timezone.utc),
+        claim_token_factory=lambda: "unused-migration-claim",
+    )
+    assert journal.load_recovery_snapshot().journal_sequence == 2
+os._exit(0)
+'''
+
+    for phase in ("before", "after"):
+        path = tmp_path / f"migration-{phase}.sqlite3"
+        completed = _run_child(child, path, phase)
+        assert completed.returncode == 0, completed.stderr
+
+        with sqlite3.connect(path) as connection:
+            version_before_resume = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            commit_tables = int(
+                connection.execute(
+                    """SELECT count(*) FROM sqlite_master
+                       WHERE type = 'table' AND name = 'live_reconciliation_commits'"""
+                ).fetchone()[0]
+            )
+        if phase == "before":
+            assert (version_before_resume, commit_tables) == (1, 0)
+        else:
+            assert (version_before_resume, commit_tables) == (2, 1)
+
+        resumed = SqliteLiveOrderJournal(
+            path,
+            JournalOpenMode.RESUME,
+            clock=_clock,
+            claim_token_factory=_claim_token_factory("migration-parent"),
+        )
+        snapshot = resumed.load_recovery_snapshot()
+        assert resumed.identity.schema_version == 1
+        assert snapshot.journal_sequence == 2
+        assert snapshot.orders == ()
+        assert snapshot.outstanding_claims == ()
+        assert not verify_recovery_snapshot(snapshot).may_dispatch
+        resumed.close()

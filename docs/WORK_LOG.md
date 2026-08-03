@@ -655,3 +655,84 @@ Boundaries:
   commit/resolution protocol plus schema migration. Any query-only SKCOM
   adapter and every real-order step require a separate PLAN and explicit
   authorization.
+
+## 2026-08-03: Phase 3B-3 durable reconciliation commit and SQLite v2
+
+Scope:
+
+- Add an offline, atomic persistence boundary for committing an already
+  assessed reconciliation result, plus a SQLite v1→v2 journal migration.
+- Preserve all Phase 3 safety gates: no production broker integration and no
+  dispatch permission.
+
+Design decisions and delivered behavior:
+
+- Database schema version and payload codec version are independent. Fresh and
+  migrated journals use SQLite schema v2; canonical journal payload encoding
+  stays at v1, preserving v1 payload compatibility and existing creation
+  identity.
+- A commit request binds one account to the assessment's durable journal cut,
+  broker snapshot, expected order versions, claim tokens and typed target
+  preconditions. The repository applies them in one transaction or makes no
+  change.
+- Exact retry is keyed by caller-supplied `commit_id` plus the canonical
+  request. An identical retry returns the original durable result, including
+  timestamp and resulting sequence; changed content is an ID conflict. Stale
+  journal sequence, version or target preconditions fail closed.
+- Resolution records are append-only overlays. Existing dispatch claims, raw
+  observations and reconciliation requirements are retained for audit and are
+  not rewritten into invented broker facts.
+- Supported evidence-backed resolutions are broker-order/broker-fill
+  confirmation for a claim or observation, and `satisfied` for a requirement.
+  No dispatch receipt is synthesized. Claim resolution never authorizes resend
+  or changes the invariant that an unresolved outcome is never redispatched.
+- The conservative v2 implementation does not write caller-projected orders;
+  any non-empty `order_projections` request returns `UNSUPPORTED_RESOLUTION`.
+  A claim resolution is limited to a NEW claim whose local order was already
+  durably accepted with no pending command by a broker event, and whose
+  existence is then corroborated by an authoritative broker order/fill
+  snapshot.
+- Recovery validates the migration history, commit request provenance and
+  resolution overlays. Only successfully resolved blockers leave the pending
+  recovery view; `may_dispatch` remains `False`.
+
+Offline validation commands:
+
+```powershell
+.\venv_tx_trade_fresh\Scripts\python.exe -B -m pytest `
+    -p no:cacheprovider `
+    --basetemp .\.pytest_tmp\phase3b3 `
+    -o addopts="" `
+    tests\unit\test_live_reconciliation_commit_contracts.py `
+    tests\unit\test_live_journal_v2_schema_sql.py `
+    tests\unit\test_live_journal_v2_migration.py `
+    tests\unit\test_live_journal_reconciliation_commit.py `
+    tests\integration\test_live_reconciliation_commit_fake.py `
+    tests\integration\test_live_order_journal_process_recovery.py `
+    -q
+```
+
+Validation status:
+
+- Commander offline quality gate passed.
+- Ruff formatter check covered 149 files; scoped `ruff check tx_trade tests`
+  passed; mypy reported no issues in 65 source files.
+- Unit suite: `1171 passed, 4 skipped`.
+- Offline integration suite: `105 passed, 1 skipped`.
+- Full default offline suite: `1276 passed, 4 skipped, 6 deselected`.
+- Repository-wide Ruff still reports three pre-existing errors confined to
+  unmodified root debug scripts; the scoped maintained-code gate above passed.
+- The integration suite used SQLite and fake broker evidence only. It did not
+  connect to or validate a real broker integration.
+
+Explicit exclusions and safety boundary:
+
+- No COM/SKCOM initialization, credential or DLL read, Reply/Order connection,
+  callback registration, production broker query, dispatch permission or real
+  order is enabled or exercised.
+- `may_dispatch=False` remains a diagnostic safety invariant. Durable commit
+  records evidence-backed resolution; it is not permission to dispatch.
+- Query-only SKCOM work, full Reply/Order integration and every real-order
+  smoke require a separate plan and explicit authorization.
+- Next candidate work is a pure authoritative order projector plus an
+  operator-facing recovery workflow.

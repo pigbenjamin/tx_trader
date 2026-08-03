@@ -17,6 +17,9 @@ from typing import Any, Callable, TypeVar, cast, get_args
 from .live_contracts import (
     AmendOrderCommand,
     BrokerCorrelation,
+    BrokerFillObservation,
+    BrokerOpenOrderObservation,
+    BrokerPosition,
     CancelOrderCommand,
     DecreaseOrderCommand,
     DispatchReceipt,
@@ -36,6 +39,9 @@ from .live_contracts import (
     PendingCommandBinding,
     CorrelationStatus,
     BrokerOrderEventType,
+    ReconciliationDiscrepancy,
+    ReconciliationKind,
+    StrategyPositionAttribution,
 )
 from .live_journal_contracts import (
     DurableReconciliationRequirement,
@@ -43,10 +49,39 @@ from .live_journal_contracts import (
     LiveJournalRecoverySnapshot,
     OutstandingDispatchClaim,
 )
-from .live_ports import AmbiguousObservation, RawBrokerObservation
+from .live_ports import (
+    AmbiguousObservation,
+    BrokerFillsSnapshot,
+    BrokerPositionsSnapshot,
+    CompletenessEvidence,
+    EvidenceCompleteness,
+    EvidenceQueryKind,
+    OpenOrdersSnapshot,
+    RawBrokerObservation,
+    ReconciliationResult,
+    ReconciliationStatus,
+)
+from .live_reconciliation_commit_contracts import (
+    ClaimResolution,
+    ClaimResolutionDirective,
+    DurableReconciliationCommitRequest,
+    ExpectedOrderVersion,
+    ObservationResolution,
+    ObservationResolutionDirective,
+    ObservationStatus,
+    RequirementResolution,
+    RequirementResolutionDirective,
+)
+from .live_reconciliation_contracts import (
+    BrokerReconciliationSnapshot,
+    LocalReconciliationSnapshot,
+    ReconciliationAssessment,
+)
 from .live_state_machine import AppliedEvent, AppliedEventLedger
 
-SCHEMA_VERSION = 1
+PAYLOAD_CODEC_VERSION = 1
+# Compatibility for callers which used the old, payload-specific name.
+SCHEMA_VERSION = PAYLOAD_CODEC_VERSION
 MAX_CODEC_PAYLOAD_BYTES = 1_048_576
 MAX_DECIMAL_TEXT_LENGTH = 128
 MAX_DECIMAL_DIGITS = 128
@@ -81,6 +116,24 @@ _DATACLASSES: dict[str, type[object]] = {
         NormalizedBrokerOrderEvent,
         NormalizedBrokerFillEvent,
         LiveFill,
+        BrokerPosition,
+        StrategyPositionAttribution,
+        BrokerOpenOrderObservation,
+        BrokerFillObservation,
+        ReconciliationDiscrepancy,
+        CompletenessEvidence,
+        OpenOrdersSnapshot,
+        BrokerFillsSnapshot,
+        BrokerPositionsSnapshot,
+        ReconciliationResult,
+        LocalReconciliationSnapshot,
+        BrokerReconciliationSnapshot,
+        ReconciliationAssessment,
+        ExpectedOrderVersion,
+        ClaimResolutionDirective,
+        ObservationResolutionDirective,
+        RequirementResolutionDirective,
+        DurableReconciliationCommitRequest,
         RawBrokerObservation,
         AmbiguousObservation,
         AppliedEvent,
@@ -103,6 +156,14 @@ _ENUMS: dict[str, type[Enum]] = {
         LiveFailureCode,
         BrokerOrderEventType,
         CorrelationStatus,
+        ReconciliationKind,
+        EvidenceCompleteness,
+        EvidenceQueryKind,
+        ReconciliationStatus,
+        ClaimResolution,
+        ObservationStatus,
+        ObservationResolution,
+        RequirementResolution,
     )
 }
 
@@ -204,7 +265,7 @@ def encode_journal_value(value: object) -> bytes:
         if not isinstance(root, dict) or "$type" not in root:
             raise LiveJournalCodecError()
         document = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PAYLOAD_CODEC_VERSION,
             "type": root["$type"],
             "value": root["$value"],
         }
@@ -364,7 +425,10 @@ def decode_journal_value(
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise LiveJournalCodecError() from None
         root = _keys(document, {"schema_version", "type", "value"})
-        if root["schema_version"] != SCHEMA_VERSION or type(root["schema_version"]) is not int:
+        if (
+            root["schema_version"] != PAYLOAD_CODEC_VERSION
+            or type(root["schema_version"]) is not int
+        ):
             raise LiveJournalCodecError()
         if type(root["type"]) is not str or root["type"] not in _DATACLASSES:
             raise LiveJournalCodecError()
@@ -402,6 +466,7 @@ __all__ = [
     "MAX_DECIMAL_ABS_EXPONENT",
     "MAX_DECIMAL_DIGITS",
     "MAX_DECIMAL_TEXT_LENGTH",
+    "PAYLOAD_CODEC_VERSION",
     "SCHEMA_VERSION",
     "LiveJournalCodecError",
     "decode_journal_value",

@@ -23,6 +23,7 @@ from typing import Iterator, cast
 from .live_contracts import (
     AmendOrderCommand,
     CancelOrderCommand,
+    CorrelationStatus,
     DecreaseOrderCommand,
     DispatchReceipt,
     FingerprintDomain,
@@ -42,7 +43,6 @@ from .live_contracts import (
 )
 from .live_journal_codec import (
     MAX_CODEC_PAYLOAD_BYTES,
-    SCHEMA_VERSION,
     LiveJournalCodecError,
     decode_journal_value,
     encode_journal_value,
@@ -74,6 +74,14 @@ from .live_ports import (
     RawBrokerObservation,
 )
 from .live_reconciliation_contracts import LocalReconciliationSnapshot, exact_decimal_sum
+from .live_reconciliation import assess_reconciliation
+from .live_reconciliation_commit_contracts import (
+    ClaimResolution,
+    DurableReconciliationCommitRequest,
+    DurableReconciliationCommitResult,
+    ObservationResolution,
+    ReconciliationCommitDisposition,
+)
 from .live_state_machine import (
     AppliedEvent,
     AppliedEventLedger,
@@ -84,6 +92,7 @@ from .live_state_machine import (
 )
 
 APPLICATION_ID = 1_415_074_890
+DATABASE_SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_MAX_MAIN_DATABASE_BYTES = 256 * 1024 * 1024
 
@@ -99,6 +108,15 @@ _RECONCILIATION_DOMAIN = "tx_trade.live.journal.reconciliation.v1"
 _APPLICATION_FACT_DOMAIN = "tx_trade.live.journal.application-fact.v1"
 _RESOLUTION_FACT_DOMAIN = "tx_trade.live.journal.observation-resolution.v1"
 _RECOVERY_BLOCKER_DOMAIN = b"tx_trade.live.journal.recovery-blocker.v1"
+_SCHEMA_MIGRATION_FACT_DOMAIN = "tx_trade.live.journal.schema-migration.v2"
+_COMMIT_REQUEST_DOMAIN = "tx_trade.live.journal.reconciliation-commit-request.v2"
+_COMMIT_FACT_DOMAIN = "tx_trade.live.journal.reconciliation-commit.v2"
+_CLAIM_RESOLUTION_DOMAIN = "tx_trade.live.journal.dispatch-claim-resolution.v2"
+_OBSERVATION_RECONCILIATION_DOMAIN = (
+    "tx_trade.live.journal.observation-reconciliation-resolution.v2"
+)
+_REQUIREMENT_RESOLUTION_DOMAIN = "tx_trade.live.journal.reconciliation-requirement-resolution.v2"
+_SCHEMA_MIGRATION_RECORD_ID = str(DATABASE_SCHEMA_VERSION)
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 _COMMAND_DOMAINS = {
@@ -142,17 +160,31 @@ def _parse_timestamp(value: object) -> datetime:
     return parsed
 
 
-def _schema_material() -> tuple[str, str]:
+def _sql_material(filename: str) -> tuple[str, str]:
     try:
-        raw = Path(__file__).with_name("live_journal_schema.sql").read_text(encoding="utf-8")
+        raw = Path(__file__).with_name(filename).read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         raise LiveJournalIntegrityError("live journal schema is unavailable") from None
     fingerprint = f"sha256:{sha256(raw.encode('utf-8')).hexdigest()}"
     return raw, fingerprint
 
 
-def _expected_schema_signature() -> tuple[tuple[str, str, str], ...]:
-    script, _ = _schema_material()
+def _schema_material() -> tuple[str, str]:
+    return _sql_material("live_journal_schema.sql")
+
+
+def _v1_schema_material() -> tuple[str, str]:
+    return _sql_material("live_journal_schema_v1.sql")
+
+
+def _migration_material() -> str:
+    return _sql_material("live_journal_migration_v1_to_v2.sql")[0]
+
+
+def _expected_schema_signature(
+    version: int = DATABASE_SCHEMA_VERSION,
+) -> tuple[tuple[str, str, str], ...]:
+    script, _ = _schema_material() if version == 2 else _v1_schema_material()
     connection = sqlite3.connect(":memory:", isolation_level=None)
     try:
         connection.executescript(script)
@@ -169,6 +201,21 @@ def _expected_schema_signature() -> tuple[tuple[str, str, str], ...]:
         raise LiveJournalIntegrityError("live journal schema is invalid") from None
     finally:
         connection.close()
+
+
+def _execute_script_in_transaction(connection: sqlite3.Connection, script: str) -> None:
+    """Execute a trusted SQL artifact without sqlite3.executescript's implicit commit."""
+
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            sql = statement.strip()
+            statement = ""
+            if sql:
+                connection.execute(sql)
+    if statement.strip():
+        raise LiveJournalIntegrityError("live journal schema is invalid")
 
 
 def _command_fingerprint(command: LiveCommand) -> str:
@@ -348,7 +395,7 @@ class SqliteLiveOrderJournal:
                 assert journal_id is not None
                 self._initialize(journal_id)
             else:
-                self._validate_schema()
+                self._resume_or_migrate()
             self._identity = self._load_identity()
         except (LiveJournalIntegrityError, LiveJournalCapacityError):
             self._close_after_failure()
@@ -466,9 +513,12 @@ class SqliteLiveOrderJournal:
             connection = sqlite3.connect(uri, uri=True, isolation_level=None)
             connection.row_factory = sqlite3.Row
             self._connection = connection
-            self._validate_schema()
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version not in {1, DATABASE_SCHEMA_VERSION}:
+                raise LiveJournalIntegrityError("live journal schema mismatch")
+            self._validate_schema(version)
             self._identity = self._load_identity()
-            self.load_recovery_snapshot()
+            self._verify_durable_payloads()
         except (sqlite3.Error, OSError):
             raise LiveJournalIntegrityError("live journal failed read-only validation") from None
         finally:
@@ -509,25 +559,76 @@ class SqliteLiveOrderJournal:
 
     def _initialize(self, journal_id: str) -> None:
         script, fingerprint = _schema_material()
+        _, v1_fingerprint = _v1_schema_material()
         connection = self._require_connection()
-        connection.executescript(script)
         created_at = self._now()
-        identity = LiveJournalIdentity(journal_id, SCHEMA_VERSION, fingerprint, created_at)
+        identity = LiveJournalIdentity(journal_id, DATABASE_SCHEMA_VERSION, fingerprint, created_at)
         with self._transaction():
+            _execute_script_in_transaction(connection, script)
             connection.execute(
                 "INSERT INTO live_journal_migrations(version, schema_fingerprint) VALUES (?, ?)",
-                (SCHEMA_VERSION, fingerprint),
+                (1, v1_fingerprint),
+            )
+            connection.execute(
+                "INSERT INTO live_journal_migrations(version, schema_fingerprint) VALUES (?, ?)",
+                (DATABASE_SCHEMA_VERSION, fingerprint),
             )
             connection.execute(
                 """INSERT INTO live_journal_identity(
                        singleton, journal_id, schema_version, schema_fingerprint, created_at
                    ) VALUES (1, ?, ?, ?, ?)""",
-                (journal_id, SCHEMA_VERSION, fingerprint, _timestamp(created_at)),
+                (journal_id, DATABASE_SCHEMA_VERSION, fingerprint, _timestamp(created_at)),
             )
             identity_payload, identity_digest = _encode(identity, _IDENTITY_DOMAIN)
             del identity_payload
             self._append_record("identity", journal_id, identity_digest, created_at)
+            migration_digest = _scalar_digest(
+                _SCHEMA_MIGRATION_FACT_DOMAIN,
+                {
+                    "version": DATABASE_SCHEMA_VERSION,
+                    "from_fingerprint": v1_fingerprint,
+                    "to_fingerprint": fingerprint,
+                    "recorded_at": _timestamp(created_at),
+                },
+            )
+            self._append_record(
+                "schema-migration", _SCHEMA_MIGRATION_RECORD_ID, migration_digest, created_at
+            )
         self._validate_schema()
+
+    def _resume_or_migrate(self) -> None:
+        connection = self._require_connection()
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version == DATABASE_SCHEMA_VERSION:
+            self._validate_schema()
+            return
+        if version != 1:
+            raise LiveJournalIntegrityError("live journal schema mismatch")
+        with self._transaction():
+            self._validate_schema(1)
+            self._identity = self._load_identity()
+            self._verify_durable_payloads()
+            _execute_script_in_transaction(connection, _migration_material())
+            migrated_at = self._now()
+            _, v1_fingerprint = _v1_schema_material()
+            _, fingerprint = _schema_material()
+            migration_digest = _scalar_digest(
+                _SCHEMA_MIGRATION_FACT_DOMAIN,
+                {
+                    "version": DATABASE_SCHEMA_VERSION,
+                    "from_fingerprint": v1_fingerprint,
+                    "to_fingerprint": fingerprint,
+                    "recorded_at": _timestamp(migrated_at),
+                },
+            )
+            self._append_record(
+                "schema-migration",
+                _SCHEMA_MIGRATION_RECORD_ID,
+                migration_digest,
+                migrated_at,
+            )
+            self._validate_schema()
+            self._verify_durable_payloads()
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -555,12 +656,13 @@ class SqliteLiveOrderJournal:
             raise LiveJournalConflictError("claim token is not unique")
         return value
 
-    def _validate_schema(self) -> None:
+    def _validate_schema(self, version: int = DATABASE_SCHEMA_VERSION) -> None:
         connection = self._require_connection()
         _, fingerprint = _schema_material()
+        _, v1_fingerprint = _v1_schema_material()
         if int(connection.execute("PRAGMA application_id").fetchone()[0]) != APPLICATION_ID:
             raise LiveJournalIntegrityError("live journal schema mismatch")
-        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != SCHEMA_VERSION:
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != version:
             raise LiveJournalIntegrityError("live journal schema mismatch")
         quick = connection.execute("PRAGMA quick_check").fetchone()
         if quick is None or quick[0] != "ok":
@@ -570,7 +672,12 @@ class SqliteLiveOrderJournal:
         rows = connection.execute(
             "SELECT version, schema_fingerprint FROM live_journal_migrations ORDER BY version"
         ).fetchall()
-        if [tuple(row) for row in rows] != [(SCHEMA_VERSION, fingerprint)]:
+        expected_history = (
+            [(1, v1_fingerprint)]
+            if version == 1
+            else [(1, v1_fingerprint), (DATABASE_SCHEMA_VERSION, fingerprint)]
+        )
+        if [tuple(row) for row in rows] != expected_history:
             raise LiveJournalIntegrityError("live journal schema mismatch")
         signature = tuple(
             cast(tuple[str, str, str], tuple(row))
@@ -581,7 +688,7 @@ class SqliteLiveOrderJournal:
                    ORDER BY type, name"""
             )
         )
-        if signature != _expected_schema_signature():
+        if signature != _expected_schema_signature(version):
             raise LiveJournalIntegrityError("live journal schema mismatch")
 
     def _load_identity(self) -> LiveJournalIdentity:
@@ -600,7 +707,12 @@ class SqliteLiveOrderJournal:
         except (TypeError, ValueError):
             raise LiveJournalIntegrityError("live journal identity is invalid") from None
         _, fingerprint = _schema_material()
-        if identity.schema_version != SCHEMA_VERSION or identity.schema_fingerprint != fingerprint:
+        _, v1_fingerprint = _v1_schema_material()
+        valid_creation_identity = (identity.schema_version, identity.schema_fingerprint) in {
+            (1, v1_fingerprint),
+            (DATABASE_SCHEMA_VERSION, fingerprint),
+        }
+        if not valid_creation_identity:
             raise LiveJournalIntegrityError("live journal identity is invalid")
         return identity
 
@@ -806,13 +918,16 @@ class SqliteLiveOrderJournal:
         record_id: str,
         payload_digest: str,
         recorded_at: datetime,
-    ) -> None:
-        self._require_connection().execute(
+    ) -> int:
+        cursor = self._require_connection().execute(
             """INSERT INTO live_journal_records(
                    record_kind, record_id, payload_digest, recorded_at
                ) VALUES (?, ?, ?, ?)""",
             (kind, record_id, payload_digest, _timestamp(recorded_at)),
         )
+        if cursor.lastrowid is None:
+            raise LiveJournalIntegrityError("live journal sequence allocation failed")
+        return cursor.lastrowid
 
     def register_new_order(
         self,
@@ -1124,6 +1239,17 @@ class SqliteLiveOrderJournal:
                         return DispatchReceiptRecordResult(
                             receipt.client_command_id,
                             ReceiptRecordDisposition.TOKEN_MISMATCH,
+                            None,
+                        )
+                    resolved_claim = connection.execute(
+                        """SELECT 1 FROM live_dispatch_claim_resolutions
+                           WHERE client_command_id = ?""",
+                        (receipt.client_command_id,),
+                    ).fetchone()
+                    if resolved_claim is not None:
+                        return DispatchReceiptRecordResult(
+                            receipt.client_command_id,
+                            ReceiptRecordDisposition.ID_CONFLICT,
                             None,
                         )
                     prior = connection.execute(
@@ -1677,7 +1803,10 @@ class SqliteLiveOrderJournal:
                JOIN live_orders o ON o.client_order_id = c.client_order_id
                LEFT JOIN live_dispatch_receipts dr
                  ON dr.client_command_id = dc.client_command_id
-               WHERE dr.client_command_id IS NULL"""
+               LEFT JOIN live_dispatch_claim_resolutions dcr
+                 ON dcr.client_command_id = dc.client_command_id
+               WHERE dr.client_command_id IS NULL
+                 AND dcr.client_command_id IS NULL"""
         ):
             add("claim", row[0], {row[1]})
 
@@ -1705,9 +1834,12 @@ class SqliteLiveOrderJournal:
             observation_accounts.setdefault(row[0], set()).add(row[1])
 
         for row in connection.execute(
-            """SELECT observation_id, resolution_status
-               FROM live_raw_observations
-               WHERE resolution_status IN ('unresolved', 'conflict', 'ambiguous')"""
+            """SELECT r.observation_id, r.resolution_status
+               FROM live_raw_observations r
+               LEFT JOIN live_observation_reconciliation_resolutions rr
+                 ON rr.observation_id = r.observation_id
+               WHERE r.resolution_status IN ('unresolved', 'conflict', 'ambiguous')
+                 AND rr.observation_id IS NULL"""
         ):
             add(
                 f"observation-{row[1]}",
@@ -1720,9 +1852,11 @@ class SqliteLiveOrderJournal:
             for row in connection.execute("SELECT client_order_id, account_id FROM live_orders")
         }
         for row in connection.execute(
-            """SELECT requirement_id, client_order_id, observation_id
-               FROM live_reconciliation_requirements
-               WHERE resolved_at IS NULL"""
+            """SELECT r.requirement_id, r.client_order_id, r.observation_id
+               FROM live_reconciliation_requirements r
+               LEFT JOIN live_reconciliation_requirement_resolutions rr
+                 ON rr.requirement_id = r.requirement_id
+               WHERE r.resolved_at IS NULL AND rr.requirement_id IS NULL"""
         ):
             accounts: set[str] = set()
             if row[1] is not None:
@@ -1807,6 +1941,11 @@ class SqliteLiveOrderJournal:
                         key: exact_decimal_sum(values) for key, values in quantities.items()
                     }
                     blockers = self._load_recovery_blockers(account_id)
+                    sequence = int(
+                        connection.execute(
+                            "SELECT coalesce(max(journal_sequence), 0) FROM live_journal_records"
+                        ).fetchone()[0]
+                    )
                     attributions = tuple(
                         StrategyPositionAttribution(
                             strategy_id,
@@ -1827,12 +1966,607 @@ class SqliteLiveOrderJournal:
                         attributions,
                         as_of,
                         blockers,
+                        sequence,
                     )
                 except BaseException:
                     connection.execute("ROLLBACK")
                     raise
                 connection.execute("COMMIT")
                 return snapshot
+            except sqlite3.Error as exc:
+                raise _sqlite_failure(exc) from None
+
+    def commit_reconciliation(
+        self, request: DurableReconciliationCommitRequest
+    ) -> DurableReconciliationCommitResult:
+        """Atomically apply conservative, evidence-backed blocker overlays."""
+
+        if type(request) is not DurableReconciliationCommitRequest:
+            raise TypeError("request must be DurableReconciliationCommitRequest")
+        request_payload, request_digest = _encode(request, _COMMIT_REQUEST_DOMAIN)
+
+        def rejected(
+            disposition: ReconciliationCommitDisposition,
+        ) -> DurableReconciliationCommitResult:
+            return DurableReconciliationCommitResult(
+                request.commit_id, request.account_id, disposition
+            )
+
+        with self._lock, self._operation():
+            try:
+                with self._transaction():
+                    connection = self._require_connection()
+                    self._verify_durable_payloads()
+                    existing = connection.execute(
+                        """SELECT account_id, request_payload, request_digest, committed_at,
+                                  resulting_journal_sequence
+                           FROM live_reconciliation_commits WHERE commit_id = ?""",
+                        (request.commit_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        if (
+                            existing[0] == request.account_id
+                            and existing[1] == request_payload
+                            and existing[2] == request_digest
+                        ):
+                            resolved_claims = tuple(
+                                row[0]
+                                for row in connection.execute(
+                                    """SELECT client_command_id FROM live_dispatch_claim_resolutions
+                                       WHERE commit_id = ? ORDER BY client_command_id""",
+                                    (request.commit_id,),
+                                )
+                            )
+                            resolved_observations = tuple(
+                                row[0]
+                                for row in connection.execute(
+                                    """SELECT observation_id
+                                       FROM live_observation_reconciliation_resolutions
+                                       WHERE commit_id = ? ORDER BY observation_id""",
+                                    (request.commit_id,),
+                                )
+                            )
+                            resolved_requirements = tuple(
+                                int(row[0])
+                                for row in connection.execute(
+                                    """SELECT requirement_id
+                                       FROM live_reconciliation_requirement_resolutions
+                                       WHERE commit_id = ? ORDER BY requirement_id""",
+                                    (request.commit_id,),
+                                )
+                            )
+                            return DurableReconciliationCommitResult(
+                                request.commit_id,
+                                request.account_id,
+                                ReconciliationCommitDisposition.EXACT_RETRY,
+                                _parse_timestamp(existing[3]),
+                                int(existing[4]),
+                                resolved_claims,
+                                resolved_observations,
+                                resolved_requirements,
+                            )
+                        return rejected(ReconciliationCommitDisposition.ID_CONFLICT)
+                    reused = connection.execute(
+                        """SELECT 1 FROM live_reconciliation_commits
+                           WHERE account_id = ? AND (snapshot_id = ? OR request_digest = ?)""",
+                        (
+                            request.account_id,
+                            request.assessment.broker_snapshot.snapshot_id,
+                            request_digest,
+                        ),
+                    ).fetchone()
+                    if reused is not None:
+                        return rejected(ReconciliationCommitDisposition.ID_CONFLICT)
+
+                    assessment = request.assessment
+                    recomputed_assessment = assess_reconciliation(
+                        assessment.local_snapshot,
+                        assessment.broker_snapshot,
+                        assessment.result.reconciled_at,
+                    )
+                    if recomputed_assessment.result != assessment.result:
+                        return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
+                    if not assessment.result.is_authoritative or assessment.result.discrepancies:
+                        return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
+                    if (
+                        assessment.local_snapshot.account_id != request.account_id
+                        or assessment.broker_snapshot.account_id != request.account_id
+                        or assessment.result.account_id != request.account_id
+                        or assessment.local_snapshot.journal_sequence
+                        != request.expected_journal_sequence
+                    ):
+                        return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
+
+                    durable_orders = tuple(
+                        self._load_order_row(row[0])
+                        for row in connection.execute(
+                            """SELECT client_order_id FROM live_orders
+                               WHERE account_id = ? ORDER BY client_order_id""",
+                            (request.account_id,),
+                        )
+                    )
+                    durable_fills = tuple(
+                        cast(LiveFill, _decode(row[0], row[1], LiveFill, _FILL_DOMAIN))
+                        for row in connection.execute(
+                            """SELECT f.payload, f.payload_digest
+                               FROM live_fills f JOIN live_orders o
+                                 ON o.client_order_id = f.client_order_id
+                               WHERE o.account_id = ?
+                               ORDER BY f.payload, f.fill_id""",
+                            (request.account_id,),
+                        )
+                    )
+                    local_orders = tuple(
+                        sorted(
+                            assessment.local_snapshot.orders,
+                            key=lambda item: item.intent.client_order_id,
+                        )
+                    )
+                    local_fills = tuple(
+                        sorted(
+                            assessment.local_snapshot.fills,
+                            key=lambda item: (item.occurred_at, item.fill_id),
+                        )
+                    )
+                    if (
+                        durable_orders != local_orders
+                        or tuple(
+                            sorted(
+                                durable_fills,
+                                key=lambda item: (item.occurred_at, item.fill_id),
+                            )
+                        )
+                        != local_fills
+                        or self._load_recovery_blockers(request.account_id)
+                        != assessment.local_snapshot.recovery_blockers
+                    ):
+                        return rejected(ReconciliationCommitDisposition.STALE_SNAPSHOT)
+
+                    sequence = int(
+                        connection.execute(
+                            "SELECT coalesce(max(journal_sequence), 0) FROM live_journal_records"
+                        ).fetchone()[0]
+                    )
+                    if sequence != request.expected_journal_sequence:
+                        return rejected(ReconciliationCommitDisposition.STALE_SNAPSHOT)
+
+                    if not (
+                        request.claim_resolutions
+                        or request.observation_resolutions
+                        or request.requirement_resolutions
+                        or request.order_projections
+                    ):
+                        return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+                    if request.order_projections:
+                        return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+
+                    expected_versions = {
+                        item.client_order_id: item.version
+                        for item in request.expected_order_versions
+                    }
+                    for order_id, expected_version in expected_versions.items():
+                        row = connection.execute(
+                            "SELECT account_id, version FROM live_orders WHERE client_order_id = ?",
+                            (order_id,),
+                        ).fetchone()
+                        if (
+                            row is None
+                            or row[0] != request.account_id
+                            or int(row[1]) != expected_version
+                        ):
+                            return rejected(ReconciliationCommitDisposition.VERSION_MISMATCH)
+
+                    claim_rows: dict[str, sqlite3.Row] = {}
+                    for row in connection.execute(
+                        """SELECT dc.client_command_id, dc.claim_token, dc.claim_version,
+                                  dc.expected_order_version, c.command_kind, c.client_order_id,
+                                  o.account_id, o.version
+                           FROM live_dispatch_claims dc
+                           JOIN live_commands c ON c.client_command_id = dc.client_command_id
+                           JOIN live_orders o ON o.client_order_id = c.client_order_id
+                           LEFT JOIN live_dispatch_receipts dr
+                             ON dr.client_command_id = dc.client_command_id
+                           LEFT JOIN live_dispatch_claim_resolutions rr
+                             ON rr.client_command_id = dc.client_command_id
+                           WHERE dr.client_command_id IS NULL AND rr.client_command_id IS NULL"""
+                    ):
+                        if row[6] == request.account_id:
+                            claim_rows[row[0]] = row
+                    if set(claim_rows) != {
+                        item.client_command_id for item in request.claim_resolutions
+                    }:
+                        return rejected(ReconciliationCommitDisposition.VERSION_MISMATCH)
+                    claim_directives = {
+                        item.client_command_id: item for item in request.claim_resolutions
+                    }
+                    for command_id, row in claim_rows.items():
+                        directive = claim_directives[command_id]
+                        if (
+                            row[1] != directive.claim_token
+                            or int(row[2]) != int(row[3])
+                            or expected_versions.get(row[5]) != int(row[7])
+                        ):
+                            return rejected(ReconciliationCommitDisposition.VERSION_MISMATCH)
+
+                    observation_accounts: dict[str, set[str]] = {}
+                    normalized_by_observation: dict[
+                        str,
+                        list[
+                            tuple[
+                                NormalizedBrokerOrderEvent | NormalizedBrokerFillEvent,
+                                str,
+                            ]
+                        ],
+                    ] = {}
+                    for row in connection.execute(
+                        """SELECT raw_observation_id, event_id, payload, payload_digest
+                           FROM live_normalized_events"""
+                    ):
+                        event = cast(
+                            NormalizedBrokerOrderEvent | NormalizedBrokerFillEvent,
+                            _decode(
+                                row[2],
+                                row[3],
+                                (NormalizedBrokerOrderEvent, NormalizedBrokerFillEvent),
+                                _EVENT_DOMAIN,
+                            ),
+                        )
+                        observation_accounts.setdefault(row[0], set()).add(event.account_id)
+                        normalized_by_observation.setdefault(row[0], []).append((event, row[1]))
+                    for row in connection.execute(
+                        """SELECT a.observation_id, o.account_id
+                           FROM live_observation_ambiguity a JOIN live_orders o
+                             ON o.client_order_id = a.candidate_client_order_id"""
+                    ):
+                        observation_accounts.setdefault(row[0], set()).add(row[1])
+
+                    open_observations: dict[str, str] = {}
+                    global_observation_blocker = False
+                    for row in connection.execute(
+                        """SELECT r.observation_id, r.resolution_status
+                           FROM live_raw_observations r
+                           LEFT JOIN live_observation_reconciliation_resolutions rr
+                             ON rr.observation_id = r.observation_id
+                           WHERE r.resolution_status IN ('unresolved','conflict','ambiguous')
+                             AND rr.observation_id IS NULL"""
+                    ):
+                        attributed_accounts = observation_accounts.get(row[0], set())
+                        if len(attributed_accounts) != 1:
+                            global_observation_blocker = True
+                        elif request.account_id in attributed_accounts:
+                            open_observations[row[0]] = row[1]
+                    if global_observation_blocker:
+                        return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+                    if set(open_observations) != {
+                        item.observation_id for item in request.observation_resolutions
+                    }:
+                        return rejected(ReconciliationCommitDisposition.VERSION_MISMATCH)
+                    for observation_directive in request.observation_resolutions:
+                        if (
+                            open_observations[observation_directive.observation_id]
+                            != observation_directive.expected_status.value
+                        ):
+                            return rejected(ReconciliationCommitDisposition.VERSION_MISMATCH)
+
+                    open_requirements: dict[int, tuple[str | None, str | None, str, str]] = {}
+                    global_requirement_blocker = False
+                    order_accounts = {
+                        row[0]: row[1]
+                        for row in connection.execute(
+                            "SELECT client_order_id, account_id FROM live_orders"
+                        )
+                    }
+                    for row in connection.execute(
+                        """SELECT r.requirement_id, r.client_order_id, r.observation_id,
+                                  r.reason_code, r.created_at
+                           FROM live_reconciliation_requirements r
+                           LEFT JOIN live_reconciliation_requirement_resolutions rr
+                             ON rr.requirement_id = r.requirement_id
+                           WHERE r.resolved_at IS NULL AND rr.requirement_id IS NULL"""
+                    ):
+                        requirement_accounts: set[str] = set()
+                        if row[1] is not None and row[1] in order_accounts:
+                            requirement_accounts.add(order_accounts[row[1]])
+                        if row[2] is not None:
+                            requirement_accounts.update(observation_accounts.get(row[2], set()))
+                        if len(requirement_accounts) != 1:
+                            global_requirement_blocker = True
+                        elif request.account_id in requirement_accounts:
+                            open_requirements[int(row[0])] = (row[1], row[2], row[3], row[4])
+                    if global_requirement_blocker:
+                        return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+                    if set(open_requirements) != {
+                        item.requirement_id for item in request.requirement_resolutions
+                    }:
+                        return rejected(ReconciliationCommitDisposition.VERSION_MISMATCH)
+
+                    if any(
+                        order.pending_command is not None
+                        for order in (
+                            self._load_order_row(row[0])
+                            for row in connection.execute(
+                                "SELECT client_order_id FROM live_orders WHERE account_id = ?",
+                                (request.account_id,),
+                            )
+                        )
+                        if order is not None
+                    ):
+                        return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+
+                    def matching_broker_evidence(
+                        order: LiveOrder, resolution: ClaimResolution | ObservationResolution
+                    ) -> bool:
+                        values = (
+                            assessment.broker_snapshot.open_orders.orders
+                            if resolution.value == "broker_order_confirmed"
+                            else assessment.broker_snapshot.fills.fills
+                        )
+                        matches = [
+                            item
+                            for item in values
+                            if item.account_id == request.account_id
+                            and item.instrument_id == order.intent.instrument_id
+                            and item.side is order.intent.side
+                            and item.correlation.status is CorrelationStatus.CONFIRMED
+                            and item.correlation.client_order_id == order.intent.client_order_id
+                        ]
+                        return bool(matches)
+
+                    for command_id, row in claim_rows.items():
+                        command = self._load_command(command_id)
+                        order = self._load_order_row(row[5])
+                        if (
+                            type(command) is not NewOrderCommand
+                            or order is None
+                            or order.pending_command is not None
+                            or not matching_broker_evidence(
+                                order, claim_directives[command_id].resolution
+                            )
+                        ):
+                            return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+
+                    observation_orders: dict[str, LiveOrder] = {}
+                    for observation_directive in request.observation_resolutions:
+                        candidates = [
+                            event
+                            for event, event_id in normalized_by_observation.get(
+                                observation_directive.observation_id, []
+                            )
+                            if event_id == observation_directive.normalized_event_id
+                        ]
+                        if len(candidates) != 1:
+                            return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+                        resolution_event = candidates[0]
+                        expected_event_type = (
+                            NormalizedBrokerOrderEvent
+                            if observation_directive.resolution
+                            is ObservationResolution.BROKER_ORDER_CONFIRMED
+                            else NormalizedBrokerFillEvent
+                        )
+                        client_order_id = resolution_event.correlation.client_order_id
+                        order = (
+                            self._load_order_row(client_order_id)
+                            if client_order_id is not None
+                            else None
+                        )
+                        if (
+                            type(resolution_event) is not expected_event_type
+                            or resolution_event.account_id != request.account_id
+                            or resolution_event.correlation.status
+                            is not CorrelationStatus.CONFIRMED
+                            or order is None
+                            or (
+                                type(resolution_event) is NormalizedBrokerFillEvent
+                                and resolution_event.side is not order.intent.side
+                            )
+                            or not matching_broker_evidence(order, observation_directive.resolution)
+                        ):
+                            return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+                        observation_orders[observation_directive.observation_id] = order
+
+                    resolved_claim_orders = {row[5] for row in claim_rows.values()}
+                    resolved_observation_ids = set(open_observations)
+                    for cause_order_id, cause_observation_id, _, _ in open_requirements.values():
+                        if cause_order_id is not None:
+                            outstanding_for_order = {
+                                row[5] for row in claim_rows.values() if row[5] == cause_order_id
+                            }
+                            if (
+                                outstanding_for_order
+                                and cause_order_id not in resolved_claim_orders
+                            ):
+                                return rejected(
+                                    ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION
+                                )
+                        if (
+                            cause_observation_id is not None
+                            and cause_observation_id not in resolved_observation_ids
+                        ):
+                            return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+
+                    committed_at = self._now()
+                    if committed_at < assessment.result.reconciled_at:
+                        return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
+                    target_count = (
+                        len(request.claim_resolutions)
+                        + len(request.observation_resolutions)
+                        + len(request.requirement_resolutions)
+                    )
+                    resulting_sequence = sequence + target_count + 1
+                    connection.execute(
+                        """INSERT INTO live_reconciliation_commits(
+                               commit_id, account_id, expected_journal_sequence,
+                               base_journal_sequence, snapshot_id, request_payload,
+                               request_digest, committed_at, resulting_journal_sequence
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            request.commit_id,
+                            request.account_id,
+                            request.expected_journal_sequence,
+                            sequence,
+                            assessment.broker_snapshot.snapshot_id,
+                            request_payload,
+                            request_digest,
+                            _timestamp(committed_at),
+                            resulting_sequence,
+                        ),
+                    )
+
+                    for directive in request.claim_resolutions:
+                        row = claim_rows[directive.client_command_id]
+                        precondition = _scalar_digest(
+                            _CLAIM_RESOLUTION_DOMAIN,
+                            {
+                                "client_command_id": directive.client_command_id,
+                                "claim_token": row[1],
+                                "claim_version": int(row[2]),
+                                "order_version": int(row[7]),
+                            },
+                        )
+                        resolution_digest = _scalar_digest(
+                            _CLAIM_RESOLUTION_DOMAIN,
+                            {
+                                "commit_id": request.commit_id,
+                                "client_command_id": directive.client_command_id,
+                                "precondition": precondition,
+                                "resolution": directive.resolution.value,
+                                "resolved_at": _timestamp(committed_at),
+                            },
+                        )
+                        connection.execute(
+                            """INSERT INTO live_dispatch_claim_resolutions VALUES
+                               (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                directive.client_command_id,
+                                request.commit_id,
+                                row[1],
+                                int(row[2]),
+                                int(row[7]),
+                                precondition,
+                                directive.resolution.value,
+                                _timestamp(committed_at),
+                                resolution_digest,
+                            ),
+                        )
+                        self._append_record(
+                            "dispatch-claim-resolution",
+                            directive.client_command_id,
+                            resolution_digest,
+                            committed_at,
+                        )
+
+                    for observation_directive in request.observation_resolutions:
+                        precondition = _scalar_digest(
+                            _OBSERVATION_RECONCILIATION_DOMAIN,
+                            {
+                                "observation_id": observation_directive.observation_id,
+                                "status": observation_directive.expected_status.value,
+                                "normalized_event_id": observation_directive.normalized_event_id,
+                            },
+                        )
+                        resolution_digest = _scalar_digest(
+                            _OBSERVATION_RECONCILIATION_DOMAIN,
+                            {
+                                "commit_id": request.commit_id,
+                                "observation_id": observation_directive.observation_id,
+                                "precondition": precondition,
+                                "resolution": observation_directive.resolution.value,
+                                "resolved_at": _timestamp(committed_at),
+                            },
+                        )
+                        connection.execute(
+                            """INSERT INTO live_observation_reconciliation_resolutions VALUES
+                               (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                observation_directive.observation_id,
+                                request.commit_id,
+                                observation_directive.expected_status.value,
+                                precondition,
+                                observation_directive.normalized_event_id,
+                                observation_directive.resolution.value,
+                                _timestamp(committed_at),
+                                resolution_digest,
+                            ),
+                        )
+                        self._append_record(
+                            "observation-reconciliation-resolution",
+                            observation_directive.observation_id,
+                            resolution_digest,
+                            committed_at,
+                        )
+
+                    for requirement_directive in request.requirement_resolutions:
+                        row = open_requirements[requirement_directive.requirement_id]
+                        precondition = _scalar_digest(
+                            _REQUIREMENT_RESOLUTION_DOMAIN,
+                            {
+                                "requirement_id": requirement_directive.requirement_id,
+                                "client_order_id": row[0],
+                                "observation_id": row[1],
+                                "reason_code": row[2],
+                                "created_at": row[3],
+                            },
+                        )
+                        resolution_digest = _scalar_digest(
+                            _REQUIREMENT_RESOLUTION_DOMAIN,
+                            {
+                                "commit_id": request.commit_id,
+                                "requirement_id": requirement_directive.requirement_id,
+                                "precondition": precondition,
+                                "resolution": requirement_directive.resolution.value,
+                                "resolved_at": _timestamp(committed_at),
+                            },
+                        )
+                        connection.execute(
+                            """INSERT INTO live_reconciliation_requirement_resolutions VALUES
+                               (?, ?, ?, ?, ?, ?)""",
+                            (
+                                requirement_directive.requirement_id,
+                                request.commit_id,
+                                precondition,
+                                requirement_directive.resolution.value,
+                                _timestamp(committed_at),
+                                resolution_digest,
+                            ),
+                        )
+                        self._append_record(
+                            "reconciliation-requirement-resolution",
+                            str(requirement_directive.requirement_id),
+                            resolution_digest,
+                            committed_at,
+                        )
+
+                    commit_digest = _scalar_digest(
+                        _COMMIT_FACT_DOMAIN,
+                        {
+                            "commit_id": request.commit_id,
+                            "account_id": request.account_id,
+                            "request_digest": request_digest,
+                            "base_sequence": sequence,
+                            "resulting_sequence": resulting_sequence,
+                            "committed_at": _timestamp(committed_at),
+                        },
+                    )
+                    final_sequence = self._append_record(
+                        "reconciliation-commit",
+                        request.commit_id,
+                        commit_digest,
+                        committed_at,
+                    )
+                    if final_sequence != resulting_sequence:
+                        raise LiveJournalIntegrityError(
+                            "live journal reconciliation sequence is invalid"
+                        )
+                return DurableReconciliationCommitResult(
+                    request.commit_id,
+                    request.account_id,
+                    ReconciliationCommitDisposition.COMMITTED,
+                    committed_at,
+                    resulting_sequence,
+                    tuple(sorted(claim_directives)),
+                    tuple(sorted(open_observations)),
+                    tuple(sorted(open_requirements)),
+                )
             except sqlite3.Error as exc:
                 raise _sqlite_failure(exc) from None
 
@@ -1884,6 +2618,32 @@ class SqliteLiveOrderJournal:
             identity_digest,
             _timestamp(self._identity.created_at),
         )
+        database_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if database_version == DATABASE_SCHEMA_VERSION:
+            migration_record = connection.execute(
+                """SELECT payload_digest, recorded_at FROM live_journal_records
+                   WHERE record_kind = 'schema-migration' AND record_id = ?""",
+                (_SCHEMA_MIGRATION_RECORD_ID,),
+            ).fetchone()
+            if migration_record is None:
+                raise LiveJournalIntegrityError("live journal migration record is missing")
+            _, v1_fingerprint = _v1_schema_material()
+            _, fingerprint = _schema_material()
+            migration_digest = _scalar_digest(
+                _SCHEMA_MIGRATION_FACT_DOMAIN,
+                {
+                    "version": DATABASE_SCHEMA_VERSION,
+                    "from_fingerprint": v1_fingerprint,
+                    "to_fingerprint": fingerprint,
+                    "recorded_at": migration_record[1],
+                },
+            )
+            if migration_record[0] != migration_digest:
+                raise LiveJournalIntegrityError("live journal migration record is invalid")
+            expected_records[("schema-migration", _SCHEMA_MIGRATION_RECORD_ID)] = (
+                migration_digest,
+                migration_record[1],
+            )
         for reservation in connection.execute(
             """SELECT client_order_id, intent_fingerprint
                FROM live_order_id_reservations"""
@@ -2037,6 +2797,24 @@ class SqliteLiveOrderJournal:
                     resolution[1],
                 )
         for row in connection.execute(
+            "SELECT candidate_client_order_id FROM live_observation_ambiguity"
+        ):
+            if type(row[0]) is not str or _IDENTIFIER.fullmatch(row[0]) is None:
+                raise LiveJournalIntegrityError("live journal observation ambiguity is invalid")
+        for row in connection.execute(
+            """SELECT r.observation_id, r.resolution_status,
+                      count(a.candidate_client_order_id)
+               FROM live_raw_observations r
+               LEFT JOIN live_observation_ambiguity a
+                 ON a.observation_id = r.observation_id
+               GROUP BY r.observation_id, r.resolution_status"""
+        ):
+            candidate_count = int(row[2])
+            if (row[1] == "ambiguous" and candidate_count < 2) or (
+                row[1] != "ambiguous" and candidate_count != 0
+            ):
+                raise LiveJournalIntegrityError("live journal observation ambiguity is invalid")
+        for row in connection.execute(
             """SELECT n.source, n.event_id, n.raw_observation_id,
                       n.semantic_fingerprint, n.payload, n.payload_digest,
                       n.received_at, a.client_order_id, a.disposition,
@@ -2155,6 +2933,307 @@ class SqliteLiveOrderJournal:
             payload, digest = _encode(requirement, _RECONCILIATION_DOMAIN)
             del payload
             expected_records[("reconciliation", str(row[0]))] = (digest, row[4])
+        if database_version == DATABASE_SCHEMA_VERSION:
+            commit_requests: dict[str, DurableReconciliationCommitRequest] = {}
+            for row in connection.execute(
+                """SELECT commit_id, account_id, expected_journal_sequence,
+                          base_journal_sequence, snapshot_id, request_payload,
+                          request_digest, committed_at, resulting_journal_sequence
+                   FROM live_reconciliation_commits"""
+            ):
+                request = cast(
+                    DurableReconciliationCommitRequest,
+                    _decode(
+                        row[5],
+                        row[6],
+                        DurableReconciliationCommitRequest,
+                        _COMMIT_REQUEST_DOMAIN,
+                    ),
+                )
+                record = connection.execute(
+                    """SELECT journal_sequence, payload_digest, recorded_at
+                       FROM live_journal_records
+                       WHERE record_kind = 'reconciliation-commit' AND record_id = ?""",
+                    (row[0],),
+                ).fetchone()
+                if (
+                    record is None
+                    or row[0] != request.commit_id
+                    or row[1] != request.account_id
+                    or int(row[2]) != request.expected_journal_sequence
+                    or int(row[3]) != request.expected_journal_sequence
+                    or row[4] != request.assessment.broker_snapshot.snapshot_id
+                    or int(row[8]) != int(record[0])
+                    or row[7] != record[2]
+                ):
+                    raise LiveJournalIntegrityError("live journal reconciliation commit is invalid")
+                commit_digest = _scalar_digest(
+                    _COMMIT_FACT_DOMAIN,
+                    {
+                        "commit_id": row[0],
+                        "account_id": row[1],
+                        "request_digest": row[6],
+                        "base_sequence": int(row[3]),
+                        "resulting_sequence": int(row[8]),
+                        "committed_at": row[7],
+                    },
+                )
+                if record[1] != commit_digest:
+                    raise LiveJournalIntegrityError("live journal reconciliation commit is invalid")
+                expected_records[("reconciliation-commit", row[0])] = (
+                    commit_digest,
+                    row[7],
+                )
+                commit_requests[row[0]] = request
+
+            for commit_id, verified_request in commit_requests.items():
+                requested_claims = {
+                    item.client_command_id for item in verified_request.claim_resolutions
+                }
+                requested_observations = {
+                    item.observation_id for item in verified_request.observation_resolutions
+                }
+                requested_requirements = {
+                    item.requirement_id for item in verified_request.requirement_resolutions
+                }
+                target_count = (
+                    len(requested_claims)
+                    + len(requested_observations)
+                    + len(requested_requirements)
+                )
+                observed_claims = {
+                    row[0]
+                    for row in connection.execute(
+                        """SELECT client_command_id
+                           FROM live_dispatch_claim_resolutions
+                           WHERE commit_id = ?""",
+                        (commit_id,),
+                    )
+                }
+                observed_observations = {
+                    row[0]
+                    for row in connection.execute(
+                        """SELECT observation_id
+                           FROM live_observation_reconciliation_resolutions
+                           WHERE commit_id = ?""",
+                        (commit_id,),
+                    )
+                }
+                observed_requirements = {
+                    int(row[0])
+                    for row in connection.execute(
+                        """SELECT requirement_id
+                           FROM live_reconciliation_requirement_resolutions
+                           WHERE commit_id = ?""",
+                        (commit_id,),
+                    )
+                }
+                commit_row = connection.execute(
+                    """SELECT base_journal_sequence, resulting_journal_sequence
+                       FROM live_reconciliation_commits WHERE commit_id = ?""",
+                    (commit_id,),
+                ).fetchone()
+                if (
+                    commit_row is None
+                    or verified_request.order_projections
+                    or target_count == 0
+                    or requested_claims != observed_claims
+                    or requested_observations != observed_observations
+                    or requested_requirements != observed_requirements
+                    or int(commit_row[0]) != verified_request.expected_journal_sequence
+                    or int(commit_row[1])
+                    != verified_request.expected_journal_sequence + target_count + 1
+                ):
+                    raise LiveJournalIntegrityError(
+                        "live journal reconciliation commit mapping is invalid"
+                    )
+
+            for row in connection.execute(
+                """SELECT r.client_command_id, r.commit_id,
+                          r.expected_claim_token, r.expected_claim_version,
+                          r.expected_order_version, r.expected_precondition_digest,
+                          r.resolution_kind, r.resolved_at, r.resolution_digest,
+                          dc.claim_token, dc.claim_version, c.client_order_id,
+                          o.account_id
+                   FROM live_dispatch_claim_resolutions r
+                   JOIN live_dispatch_claims dc
+                     ON dc.client_command_id = r.client_command_id
+                   JOIN live_commands c ON c.client_command_id = r.client_command_id
+                   JOIN live_orders o ON o.client_order_id = c.client_order_id"""
+            ):
+                stored_request = commit_requests.get(row[1])
+                claim_directive = (
+                    next(
+                        (
+                            item
+                            for item in stored_request.claim_resolutions
+                            if item.client_command_id == row[0]
+                        ),
+                        None,
+                    )
+                    if stored_request is not None
+                    else None
+                )
+                precondition = _scalar_digest(
+                    _CLAIM_RESOLUTION_DOMAIN,
+                    {
+                        "client_command_id": row[0],
+                        "claim_token": row[2],
+                        "claim_version": int(row[3]),
+                        "order_version": int(row[4]),
+                    },
+                )
+                resolution_digest = _scalar_digest(
+                    _CLAIM_RESOLUTION_DOMAIN,
+                    {
+                        "commit_id": row[1],
+                        "client_command_id": row[0],
+                        "precondition": precondition,
+                        "resolution": row[6],
+                        "resolved_at": row[7],
+                    },
+                )
+                if (
+                    stored_request is None
+                    or claim_directive is None
+                    or stored_request.account_id != row[12]
+                    or claim_directive.claim_token != row[2]
+                    or claim_directive.resolution.value != row[6]
+                    or row[2] != row[9]
+                    or int(row[3]) != int(row[10])
+                    or row[5] != precondition
+                    or row[8] != resolution_digest
+                    or connection.execute(
+                        "SELECT 1 FROM live_dispatch_receipts WHERE client_command_id = ?",
+                        (row[0],),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise LiveJournalIntegrityError("live journal claim resolution is invalid")
+                expected_records[("dispatch-claim-resolution", row[0])] = (
+                    resolution_digest,
+                    row[7],
+                )
+
+            for row in connection.execute(
+                """SELECT r.observation_id, r.commit_id,
+                          r.expected_resolution_status,
+                          r.expected_precondition_digest, r.normalized_event_id,
+                          r.resolution_kind, r.resolved_at, r.resolution_digest,
+                          raw.resolution_status
+                   FROM live_observation_reconciliation_resolutions r
+                   JOIN live_raw_observations raw
+                     ON raw.observation_id = r.observation_id"""
+            ):
+                stored_request = commit_requests.get(row[1])
+                observation_directive = (
+                    next(
+                        (
+                            item
+                            for item in stored_request.observation_resolutions
+                            if item.observation_id == row[0]
+                        ),
+                        None,
+                    )
+                    if stored_request is not None
+                    else None
+                )
+                provenance = connection.execute(
+                    """SELECT 1 FROM live_normalized_events
+                       WHERE raw_observation_id = ? AND event_id = ?""",
+                    (row[0], row[4]),
+                ).fetchall()
+                precondition = _scalar_digest(
+                    _OBSERVATION_RECONCILIATION_DOMAIN,
+                    {
+                        "observation_id": row[0],
+                        "status": row[2],
+                        "normalized_event_id": row[4],
+                    },
+                )
+                resolution_digest = _scalar_digest(
+                    _OBSERVATION_RECONCILIATION_DOMAIN,
+                    {
+                        "commit_id": row[1],
+                        "observation_id": row[0],
+                        "precondition": precondition,
+                        "resolution": row[5],
+                        "resolved_at": row[6],
+                    },
+                )
+                if (
+                    observation_directive is None
+                    or observation_directive.expected_status.value != row[2]
+                    or observation_directive.normalized_event_id != row[4]
+                    or observation_directive.resolution.value != row[5]
+                    or row[8] != row[2]
+                    or len(provenance) != 1
+                    or row[3] != precondition
+                    or row[7] != resolution_digest
+                ):
+                    raise LiveJournalIntegrityError(
+                        "live journal observation reconciliation resolution is invalid"
+                    )
+                expected_records[("observation-reconciliation-resolution", row[0])] = (
+                    resolution_digest,
+                    row[6],
+                )
+
+            for row in connection.execute(
+                """SELECT rr.requirement_id, rr.commit_id,
+                          rr.expected_precondition_digest, rr.resolution_kind,
+                          rr.resolved_at, rr.resolution_digest,
+                          r.client_order_id, r.observation_id, r.reason_code, r.created_at
+                   FROM live_reconciliation_requirement_resolutions rr
+                   JOIN live_reconciliation_requirements r
+                     ON r.requirement_id = rr.requirement_id"""
+            ):
+                stored_request = commit_requests.get(row[1])
+                requirement_directive = (
+                    next(
+                        (
+                            item
+                            for item in stored_request.requirement_resolutions
+                            if item.requirement_id == int(row[0])
+                        ),
+                        None,
+                    )
+                    if stored_request is not None
+                    else None
+                )
+                precondition = _scalar_digest(
+                    _REQUIREMENT_RESOLUTION_DOMAIN,
+                    {
+                        "requirement_id": int(row[0]),
+                        "client_order_id": row[6],
+                        "observation_id": row[7],
+                        "reason_code": row[8],
+                        "created_at": row[9],
+                    },
+                )
+                resolution_digest = _scalar_digest(
+                    _REQUIREMENT_RESOLUTION_DOMAIN,
+                    {
+                        "commit_id": row[1],
+                        "requirement_id": int(row[0]),
+                        "precondition": precondition,
+                        "resolution": row[3],
+                        "resolved_at": row[4],
+                    },
+                )
+                if (
+                    requirement_directive is None
+                    or requirement_directive.resolution.value != row[3]
+                    or row[2] != precondition
+                    or row[5] != resolution_digest
+                ):
+                    raise LiveJournalIntegrityError(
+                        "live journal requirement resolution is invalid"
+                    )
+                expected_records[("reconciliation-requirement-resolution", str(row[0]))] = (
+                    resolution_digest,
+                    row[4],
+                )
         actual_records = {
             (row[0], row[1]): (row[2], row[3])
             for row in connection.execute(
@@ -2164,6 +3243,23 @@ class SqliteLiveOrderJournal:
         }
         if actual_records != expected_records:
             raise LiveJournalIntegrityError("live journal record mapping is invalid")
+        sequence_row = connection.execute(
+            "SELECT count(*), min(journal_sequence), max(journal_sequence) FROM live_journal_records"
+        ).fetchone()
+        count = int(sequence_row[0])
+        minimum = int(sequence_row[1] or 0)
+        maximum = int(sequence_row[2] or 0)
+        sqlite_sequence = connection.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'live_journal_records'"
+        ).fetchone()
+        if (
+            count != len(expected_records)
+            or minimum != 1
+            or maximum != count
+            or sqlite_sequence is None
+            or int(sqlite_sequence[0]) != maximum
+        ):
+            raise LiveJournalIntegrityError("live journal sequence is not contiguous")
 
     def load_recovery_snapshot(self) -> LiveJournalRecoverySnapshot:
         with self._lock, self._operation():
@@ -2189,7 +3285,10 @@ class SqliteLiveOrderJournal:
                          ON c.client_command_id = dc.client_command_id
                        LEFT JOIN live_dispatch_receipts dr
                          ON dr.client_command_id = dc.client_command_id
+                       LEFT JOIN live_dispatch_claim_resolutions dcr
+                         ON dcr.client_command_id = dc.client_command_id
                        WHERE dr.client_command_id IS NULL
+                         AND dcr.client_command_id IS NULL
                        ORDER BY dc.claimed_at, dc.client_command_id"""
                 ):
                     command = cast(
@@ -2223,9 +3322,12 @@ class SqliteLiveOrderJournal:
                         _decode(row[0], row[1], RawBrokerObservation, _RAW_DOMAIN),
                     )
                     for row in connection.execute(
-                        """SELECT payload, payload_digest FROM live_raw_observations
-                           WHERE resolution_status = 'unresolved'
-                           ORDER BY received_at, observation_id"""
+                        """SELECT r.payload, r.payload_digest FROM live_raw_observations r
+                           LEFT JOIN live_observation_reconciliation_resolutions rr
+                             ON rr.observation_id = r.observation_id
+                           WHERE r.resolution_status = 'unresolved'
+                             AND rr.observation_id IS NULL
+                           ORDER BY r.received_at, r.observation_id"""
                     )
                 )
                 conflicts = tuple(
@@ -2234,23 +3336,32 @@ class SqliteLiveOrderJournal:
                         _decode(row[0], row[1], RawBrokerObservation, _RAW_DOMAIN),
                     )
                     for row in connection.execute(
-                        """SELECT payload, payload_digest FROM live_raw_observations
-                           WHERE resolution_status = 'conflict'
-                           ORDER BY received_at, observation_id"""
+                        """SELECT r.payload, r.payload_digest FROM live_raw_observations r
+                           LEFT JOIN live_observation_reconciliation_resolutions rr
+                             ON rr.observation_id = r.observation_id
+                           WHERE r.resolution_status = 'conflict'
+                             AND rr.observation_id IS NULL
+                           ORDER BY r.received_at, r.observation_id"""
                     )
                 )
                 ambiguous_by_id: dict[str, list[str]] = {}
                 for row in connection.execute(
-                    """SELECT observation_id, candidate_client_order_id
-                       FROM live_observation_ambiguity
-                       ORDER BY observation_id, candidate_client_order_id"""
+                    """SELECT a.observation_id, a.candidate_client_order_id
+                       FROM live_observation_ambiguity a
+                       LEFT JOIN live_observation_reconciliation_resolutions rr
+                         ON rr.observation_id = a.observation_id
+                       WHERE rr.observation_id IS NULL
+                       ORDER BY a.observation_id, a.candidate_client_order_id"""
                 ):
                     ambiguous_by_id.setdefault(row[0], []).append(row[1])
                 ambiguous: list[AmbiguousObservation] = []
                 for observation_id, candidates in ambiguous_by_id.items():
                     row = connection.execute(
-                        """SELECT payload, payload_digest FROM live_raw_observations
-                           WHERE observation_id = ? AND resolution_status = 'ambiguous'""",
+                        """SELECT r.payload, r.payload_digest FROM live_raw_observations r
+                           LEFT JOIN live_observation_reconciliation_resolutions rr
+                             ON rr.observation_id = r.observation_id
+                           WHERE r.observation_id = ? AND r.resolution_status = 'ambiguous'
+                             AND rr.observation_id IS NULL""",
                         (observation_id,),
                     ).fetchone()
                     if row is None:
@@ -2269,11 +3380,13 @@ class SqliteLiveOrderJournal:
                         row[2],
                     )
                     for row in connection.execute(
-                        """SELECT requirement_id, client_order_id, observation_id,
-                                  reason_code, created_at
-                           FROM live_reconciliation_requirements
-                           WHERE resolved_at IS NULL
-                           ORDER BY requirement_id"""
+                        """SELECT r.requirement_id, r.client_order_id, r.observation_id,
+                                  r.reason_code, r.created_at
+                           FROM live_reconciliation_requirements r
+                           LEFT JOIN live_reconciliation_requirement_resolutions rr
+                             ON rr.requirement_id = r.requirement_id
+                           WHERE r.resolved_at IS NULL AND rr.requirement_id IS NULL
+                           ORDER BY r.requirement_id"""
                     )
                 )
                 sequence_row = connection.execute(
@@ -2287,7 +3400,7 @@ class SqliteLiveOrderJournal:
                     """SELECT seq FROM sqlite_sequence
                        WHERE name = 'live_journal_records'"""
                 ).fetchone()
-                expected_count = 1 + sum(
+                expected_count = 2 + sum(
                     int(connection.execute(query).fetchone()[0])
                     for query in (
                         "SELECT count(*) FROM live_order_id_reservations",
@@ -2299,6 +3412,10 @@ class SqliteLiveOrderJournal:
                            WHERE resolution_status != 'unresolved'""",
                         "SELECT count(*) FROM live_normalized_events",
                         "SELECT count(*) FROM live_reconciliation_requirements",
+                        "SELECT count(*) FROM live_reconciliation_commits",
+                        "SELECT count(*) FROM live_dispatch_claim_resolutions",
+                        "SELECT count(*) FROM live_observation_reconciliation_resolutions",
+                        "SELECT count(*) FROM live_reconciliation_requirement_resolutions",
                     )
                 )
                 kinds = {
@@ -2309,6 +3426,7 @@ class SqliteLiveOrderJournal:
                 }
                 expected_kinds = {
                     "identity",
+                    "schema-migration",
                     "order",
                     "command",
                     "dispatch-claim",
@@ -2317,6 +3435,10 @@ class SqliteLiveOrderJournal:
                     "observation-resolution",
                     "normalized-application",
                     "reconciliation",
+                    "reconciliation-commit",
+                    "dispatch-claim-resolution",
+                    "observation-reconciliation-resolution",
+                    "reconciliation-requirement-resolution",
                 }
                 if (
                     count < 1
