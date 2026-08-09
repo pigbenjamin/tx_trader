@@ -531,3 +531,42 @@ broker query adapter, COM/SKCOM initialization, credential or DLL access,
 Reply/Order connection, callback registration, dispatch permission or real
 order operation. Query-only SKCOM integration and every real-order step still
 require a separate plan and explicit authorization.
+
+## Phase 3B-4 authoritative recovery projection
+
+Phase 3B-4 adds one deliberately narrow, offline recovery path. A pure
+projector can produce an `ACCEPTED` order only when a recomputed authoritative
+assessment contains exactly one unique confirmed, complete working open-order
+observation for an existing zero-fill `SUBMISSION_UNKNOWN` or `RECONCILING`
+order with its exact pending `NEW` command. Account, client order, instrument,
+side, total and remaining quantity, limit price and observation time must all
+match; correlated fills, duplicates, incomplete evidence and every unsupported
+state fail closed.
+
+The SQLite journal commits that canonical projection and the matching dispatch
+claim resolution in one compare-and-swap transaction. It advances the order
+exactly once, clears the pending command, retains the original evidence and
+claim audit trail, and does not create a receipt, broker event, fill, broker ID
+or dispatch permission. Exact retries reproduce the original projections and
+write nothing. Recovery verifies the stored request, projection history and
+claim-resolution mapping before excluding the resolved blocker.
+
+The operator-facing workflow in this slice is also pure and offline: it plans
+recovery actions and builds typed commit requests from supplied immutable
+inputs. It does not inspect a production journal, query a broker or accept
+operator JSON evidence. `may_dispatch` remains `False`, and no automatic resend
+or real dispatch path exists.
+
+The 2026-08-04 Commander gate passed: formatter check covered 163 files,
+scoped Ruff passed, mypy reported no issues in 69 source files, import guards
+were `45 passed`, unit tests were `1270 passed, 4 skipped`, integration tests
+were `114 passed, 1 skipped`, and the full default offline suite was
+`1384 passed, 4 skipped, 6 deselected`. All integration coverage here uses
+offline/fake SQLite and broker evidence.
+
+Phase 3 remains in progress. Production read-only journal inspection, a trusted
+assessment source, an authorized operator/audit workflow (likely requiring
+schema v3), query-only broker integration and every real-order operation remain
+separately planned and gated. This slice adds no COM/SKCOM initialization,
+credential or DLL access, broker query adapter, Reply/Order connection, live
+callback, production CLI or real-order authorization.

@@ -82,6 +82,8 @@ from .live_reconciliation_commit_contracts import (
     ObservationResolution,
     ReconciliationCommitDisposition,
 )
+from .live_reconciliation_projection import project_authoritative_orders
+from .live_reconciliation_projection_contracts import OrderProjectionDisposition
 from .live_state_machine import (
     AppliedEvent,
     AppliedEventLedger,
@@ -2044,6 +2046,7 @@ class SqliteLiveOrderJournal:
                                 resolved_claims,
                                 resolved_observations,
                                 resolved_requirements,
+                                request.order_projections,
                             )
                         return rejected(ReconciliationCommitDisposition.ID_CONFLICT)
                     reused = connection.execute(
@@ -2064,9 +2067,7 @@ class SqliteLiveOrderJournal:
                         assessment.broker_snapshot,
                         assessment.result.reconciled_at,
                     )
-                    if recomputed_assessment.result != assessment.result:
-                        return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
-                    if not assessment.result.is_authoritative or assessment.result.discrepancies:
+                    if recomputed_assessment != assessment:
                         return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
                     if (
                         assessment.local_snapshot.account_id != request.account_id
@@ -2074,6 +2075,25 @@ class SqliteLiveOrderJournal:
                         or assessment.result.account_id != request.account_id
                         or assessment.local_snapshot.journal_sequence
                         != request.expected_journal_sequence
+                    ):
+                        return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
+                    projection_plan = project_authoritative_orders(assessment)
+                    if projection_plan.disposition is OrderProjectionDisposition.READY:
+                        if (
+                            request.expected_order_versions
+                            != projection_plan.expected_order_versions
+                            or request.order_projections != projection_plan.projected_orders
+                        ):
+                            return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
+                    elif request.order_projections:
+                        return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
+                    if (
+                        not request.order_projections
+                        and projection_plan.disposition is OrderProjectionDisposition.READY
+                    ):
+                        return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
+                    if not request.order_projections and (
+                        not assessment.result.is_authoritative or assessment.result.discrepancies
                     ):
                         return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
 
@@ -2137,9 +2157,6 @@ class SqliteLiveOrderJournal:
                         or request.order_projections
                     ):
                         return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
-                    if request.order_projections:
-                        return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
-
                     expected_versions = {
                         item.client_order_id: item.version
                         for item in request.expected_order_versions
@@ -2179,6 +2196,22 @@ class SqliteLiveOrderJournal:
                     claim_directives = {
                         item.client_command_id: item for item in request.claim_resolutions
                     }
+                    for projected_order in request.order_projections:
+                        projection_current_order = self._load_order_row(
+                            projected_order.intent.client_order_id
+                        )
+                        projected_command_id = (
+                            projection_current_order.pending_command.client_command_id
+                            if projection_current_order is not None
+                            and projection_current_order.pending_command is not None
+                            else None
+                        )
+                        if (
+                            projected_command_id is None
+                            or projected_command_id not in claim_rows
+                            or projected_command_id not in claim_directives
+                        ):
+                            return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
                     for command_id, row in claim_rows.items():
                         directive = claim_directives[command_id]
                         if (
@@ -2280,16 +2313,23 @@ class SqliteLiveOrderJournal:
                     }:
                         return rejected(ReconciliationCommitDisposition.VERSION_MISMATCH)
 
-                    if any(
-                        order.pending_command is not None
-                        for order in (
-                            self._load_order_row(row[0])
-                            for row in connection.execute(
-                                "SELECT client_order_id FROM live_orders WHERE account_id = ?",
-                                (request.account_id,),
-                            )
+                    projection_by_order = {
+                        order.intent.client_order_id: order for order in request.order_projections
+                    }
+                    durable_account_orders = {
+                        row[0]: self._load_order_row(row[0])
+                        for row in connection.execute(
+                            "SELECT client_order_id FROM live_orders WHERE account_id = ?",
+                            (request.account_id,),
                         )
-                        if order is not None
+                    }
+                    final_account_orders = {
+                        order_id: projection_by_order.get(order_id, order)
+                        for order_id, order in durable_account_orders.items()
+                    }
+                    if any(
+                        order is not None and order.pending_command is not None
+                        for order in final_account_orders.values()
                     ):
                         return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
 
@@ -2314,13 +2354,35 @@ class SqliteLiveOrderJournal:
 
                     for command_id, row in claim_rows.items():
                         command = self._load_command(command_id)
-                        order = self._load_order_row(row[5])
+                        claim_current_order = self._load_order_row(row[5])
+                        claim_projected_order = projection_by_order.get(row[5])
+                        evidence_order = claim_projected_order or claim_current_order
                         if (
                             type(command) is not NewOrderCommand
-                            or order is None
-                            or order.pending_command is not None
+                            or claim_current_order is None
+                            or evidence_order is None
+                            or (
+                                claim_projected_order is None
+                                and claim_current_order.pending_command is not None
+                            )
+                            or (
+                                claim_projected_order is not None
+                                and (
+                                    claim_current_order.pending_command is None
+                                    or claim_current_order.pending_command.command != command
+                                    or claim_projected_order.intent != claim_current_order.intent
+                                    or claim_projected_order.version
+                                    != claim_current_order.version + 1
+                                    or claim_projected_order.state is not LiveOrderState.ACCEPTED
+                                    or claim_projected_order.pending_command is not None
+                                    or claim_projected_order.filled_quantity != 0
+                                    or claim_projected_order.remaining_quantity
+                                    != claim_current_order.total_quantity
+                                    or claim_projected_order.average_fill_price is not None
+                                )
+                            )
                             or not matching_broker_evidence(
-                                order, claim_directives[command_id].resolution
+                                evidence_order, claim_directives[command_id].resolution
                             )
                         ):
                             return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
@@ -2393,6 +2455,13 @@ class SqliteLiveOrderJournal:
                         + len(request.requirement_resolutions)
                     )
                     resulting_sequence = sequence + target_count + 1
+
+                    for projected_order in request.order_projections:
+                        expected_version = expected_versions[projected_order.intent.client_order_id]
+                        if not self._write_order(projected_order, expected_version):
+                            raise LiveJournalIntegrityError(
+                                "live journal reconciliation projection write failed"
+                            )
                     connection.execute(
                         """INSERT INTO live_reconciliation_commits(
                                commit_id, account_id, expected_journal_sequence,
@@ -2566,6 +2635,7 @@ class SqliteLiveOrderJournal:
                     tuple(sorted(claim_directives)),
                     tuple(sorted(open_observations)),
                     tuple(sorted(open_requirements)),
+                    request.order_projections,
                 )
             except sqlite3.Error as exc:
                 raise _sqlite_failure(exc) from None
@@ -2666,6 +2736,7 @@ class SqliteLiveOrderJournal:
                     order.intent.client_order_id != reservation[0]
                     or row[0] != order.version
                     or order.intent != current.intent
+                    or row[3] != _timestamp(order.updated_at)
                 ):
                     raise LiveJournalIntegrityError("live journal order history is invalid")
                 versions.append(row[0])
@@ -2984,6 +3055,106 @@ class SqliteLiveOrderJournal:
                     commit_digest,
                     row[7],
                 )
+                recomputed_assessment = assess_reconciliation(
+                    request.assessment.local_snapshot,
+                    request.assessment.broker_snapshot,
+                    request.assessment.result.reconciled_at,
+                )
+                if recomputed_assessment != request.assessment:
+                    raise LiveJournalIntegrityError(
+                        "live journal reconciliation projection is invalid"
+                    )
+                projection_plan = project_authoritative_orders(request.assessment)
+                if request.order_projections:
+                    if (
+                        projection_plan.disposition is not OrderProjectionDisposition.READY
+                        or request.expected_order_versions
+                        != projection_plan.expected_order_versions
+                        or request.order_projections != projection_plan.projected_orders
+                    ):
+                        raise LiveJournalIntegrityError(
+                            "live journal reconciliation projection is invalid"
+                        )
+                    local_by_order = {
+                        order.intent.client_order_id: order
+                        for order in request.assessment.local_snapshot.orders
+                    }
+                    expected_by_order = {
+                        item.client_order_id: item.version
+                        for item in request.expected_order_versions
+                    }
+                    requested_claim_ids = {
+                        item.client_command_id for item in request.claim_resolutions
+                    }
+                    claim_directives_by_id = {
+                        item.client_command_id: item for item in request.claim_resolutions
+                    }
+                    for projected_order in request.order_projections:
+                        order_id = projected_order.intent.client_order_id
+                        expected_version = expected_by_order[order_id]
+                        prior_order = self._load_history_order(order_id, expected_version)
+                        projection_row = connection.execute(
+                            """SELECT payload, payload_digest FROM live_order_history
+                               WHERE client_order_id = ? AND order_version = ?""",
+                            (order_id, projected_order.version),
+                        ).fetchone()
+                        projection_payload, projection_digest = _encode(
+                            projected_order, _ORDER_DOMAIN
+                        )
+                        pending_command_id = (
+                            prior_order.pending_command.client_command_id
+                            if prior_order is not None and prior_order.pending_command is not None
+                            else None
+                        )
+                        claim_directive = (
+                            claim_directives_by_id.get(pending_command_id)
+                            if pending_command_id is not None
+                            else None
+                        )
+                        version_audit = (
+                            connection.execute(
+                                """SELECT r.expected_order_version,
+                                          dc.expected_order_version, dc.claim_version
+                                   FROM live_dispatch_claim_resolutions r
+                                   JOIN live_dispatch_claims dc
+                                     ON dc.client_command_id = r.client_command_id
+                                   WHERE r.client_command_id = ? AND r.commit_id = ?""",
+                                (pending_command_id, request.commit_id),
+                            ).fetchone()
+                            if pending_command_id is not None
+                            else None
+                        )
+                        if (
+                            prior_order is None
+                            or prior_order.pending_command is None
+                            or type(prior_order.pending_command.command) is not NewOrderCommand
+                            or pending_command_id not in requested_claim_ids
+                            or claim_directive is None
+                            or claim_directive.resolution
+                            is not ClaimResolution.BROKER_ORDER_CONFIRMED
+                            or version_audit is None
+                            or any(int(value) != expected_version for value in version_audit)
+                            or prior_order != local_by_order.get(order_id)
+                            or prior_order.intent != projected_order.intent
+                            or projected_order.version != expected_version + 1
+                            or projection_row is None
+                            or projection_row[0] != projection_payload
+                            or projection_row[1] != projection_digest
+                        ):
+                            raise LiveJournalIntegrityError(
+                                "live journal reconciliation projection history is invalid"
+                            )
+                elif projection_plan.disposition is OrderProjectionDisposition.READY:
+                    raise LiveJournalIntegrityError(
+                        "live journal reconciliation projection is missing"
+                    )
+                elif (
+                    not request.assessment.result.is_authoritative
+                    or request.assessment.result.discrepancies
+                ):
+                    raise LiveJournalIntegrityError(
+                        "live journal reconciliation assessment is invalid"
+                    )
                 commit_requests[row[0]] = request
 
             for commit_id, verified_request in commit_requests.items():
@@ -3035,8 +3206,7 @@ class SqliteLiveOrderJournal:
                 ).fetchone()
                 if (
                     commit_row is None
-                    or verified_request.order_projections
-                    or target_count == 0
+                    or (target_count == 0 and not verified_request.order_projections)
                     or requested_claims != observed_claims
                     or requested_observations != observed_observations
                     or requested_requirements != observed_requirements

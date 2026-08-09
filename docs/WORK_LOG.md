@@ -736,3 +736,54 @@ Explicit exclusions and safety boundary:
   smoke require a separate plan and explicit authorization.
 - Next candidate work is a pure authoritative order projector plus an
   operator-facing recovery workflow.
+
+## 2026-08-04: Phase 3B-4 authoritative recovery projection
+
+Scope and completed safe slice:
+
+- Added a pure authoritative order projector for the single supported recovery
+  case: an existing zero-fill `SUBMISSION_UNKNOWN` or `RECONCILING` order with
+  its exact pending `NEW` command and one unique confirmed complete working
+  broker open-order observation.
+- The evidence must match account, client order ID, instrument, side, total and
+  remaining quantity, limit price and time. Remaining must equal total, and no
+  correlated fill may exist. Every other state/evidence shape fails closed.
+- The canonical projection advances the durable order exactly once to
+  `ACCEPTED`, clears the pending command and sets `accepted_at` and `updated_at`
+  to the broker observation time while preserving intent and zero-fill values.
+- Added pure offline operator recovery planning and typed request building.
+  It consumes explicit immutable inputs only and performs no production
+  journal inspection, broker query or operator JSON evidence ingestion.
+- Extended the SQLite v2 repository to atomically compare the assessed journal
+  cut, order version, pending NEW command, claim token, authoritative plan and
+  matching claim resolution; then persist projection history, claim overlay
+  and reconciliation commit as one transaction.
+- Exact retry returns the original timestamp, sequence and projected order with
+  no write. Durable resume recomputes the projector and verifies projection
+  history plus the projection-to-claim-resolution mapping. Tampered, missing or
+  projection-only repaired records fail closed.
+- Projection creates no dispatch receipt, normalized broker event, fill,
+  broker ID, clock, UUID or permission. Recovery removes the resolved blocker,
+  but `may_dispatch=False` and the command cannot be resent automatically.
+
+Commander validation status:
+
+- Ruff formatter check covered 163 files; scoped Ruff passed.
+- Mypy reported no issues in 69 source files.
+- Import guards: `45 passed`.
+- Unit suite: `1270 passed, 4 skipped`.
+- Offline integration suite: `114 passed, 1 skipped`.
+- Full default offline suite: `1384 passed, 4 skipped, 6 deselected`.
+- Tests used offline/fake SQLite and broker evidence only.
+
+Explicit exclusions and remaining Phase 3 work:
+
+- No COM/SKCOM initialization, credential/DLL access, broker query adapter,
+  Reply/Order connection, live callback, receipt/event/fill synthesis,
+  automatic resend, production CLI, real dispatch or real order was added or
+  exercised.
+- Production read-only journal inspection, a trusted assessment source,
+  authorized operator/audit persistence (likely schema v3), query-only broker
+  integration and every real-order step remain deferred and separately gated.
+- Phase 3 remains in progress; Phase 3B-4 completes only this offline safe
+  projection and recovery-planning slice.
