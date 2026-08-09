@@ -502,7 +502,7 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 | Phase 0 專案基線 | 已完成 | 2026-07-25 | 2026-07-27 | fresh Python 3.13.14 環境、依賴、品質檢查與安全測試已驗證 |
 | Phase 1 穩定行情 | 已完成 | 2026-07-26 | 2026-07-28 | 離線驗證與真實 quote-only live smoke 均完成 |
 | Phase 2 Replay/Paper | 已完成 | 2026-07-28 | 2026-07-28 | Phase 2A Replay Runtime 與 Phase 2B-1 至 2B-5 PaperBroker、durable recovery 及 output outbox 已完成 final acceptance |
-| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A、3B-1 至 3B-4 offline safe slices 已完成 Commander gate；尚未建立 production inspect、trusted assessment source、COM、live query 或送單 |
+| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A、3B-1 至 3B-5 safe slices 已完成 Commander gate；尚未建立 trusted assessment source、COM、live query 或送單 |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
 | Phase 6 營運強化 | 待開始 |  |  |  |
@@ -560,17 +560,19 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 ## 14. 下一個工作項目
 
 Phase 0、Phase 1 與 Phase 2 已完成。Phase 3A live-order contracts、Phase
-3B-1 SQLite journal 與 Phase 3B-2 fake-only reconciliation 已完成；Phase
-3B-3 durable reconciliation commit/resolution 與 SQLite v1→v2 migration、
-以及 3B-4 authoritative recovery projection/operator planning safe slice
-已通過 Commander offline quality gate。Phase 3 整體仍在進行中。
+3B-1 SQLite journal、3B-2 fake-only reconciliation、3B-3 durable
+reconciliation commit/resolution 與 SQLite v1→v2 migration、3B-4
+authoritative recovery projection/operator planning，以及 3B-5 production
+read-only journal inspection library slice 已通過 Commander quality gate。
+Phase 3 整體仍在進行中。
 
-Phase 3 的後續 planning items 是 production read-only journal inspection、
-trusted assessment source、具授權與 audit 的 operator workflow（預期可能
-需要 schema v3），以及 query-only broker integration。Phase 3B-4 仍不提供
-production broker evidence source 或 dispatch permission；`may_dispatch=False`，
-既有 claim 永不自動 resend，也不合成 receipt/event/fill。任何 SKCOM
-Order／full Reply integration 或真單仍必須另行完成 PLAN PHASE 並取得明確授權。
+Phase 3 的後續 planning items 是 safe WAL snapshot/copy protocol（如有需
+要）、output-only CLI composition、trusted assessment source、具授權與 audit
+的 schema 工作，以及 query-only broker integration。Phase 3B-5 不提供
+trusted broker evidence source 或 dispatch/commit permission；
+`may_dispatch=False`、`commit_allowed=False`，既有 claim 永不自動 resend，
+也不合成 receipt/event/fill。任何 SKCOM Order／full Reply integration 或真
+單仍必須另行完成 PLAN PHASE 並取得明確授權。
 
 ## 15. 新工作階段交接清單（2026-07-27）
 
@@ -946,3 +948,41 @@ composition、不讀 live credential、不載入 COM。
   assessment source, authorized operator/audit persistence (likely schema v3),
   query-only broker integration and every real-order step remain deferred and
   separately gated.
+
+### 15.11 Phase 3B-5 production read-only journal inspection（2026-08-09）
+
+- Added the one-shot library API
+  `inspect_sqlite_live_order_journal(path, account_id=...)`; it never returns a
+  writable journal object. SQLite authorizers restrict both bounded read
+  stages.
+- Reports are strict frozen/redacted values with deterministic ordering and
+  digest, selected-account versus journal-global blocker attribution, bounded
+  opaque targets and sanitized public errors. Both `may_dispatch=False` and
+  `commit_allowed=False` are invariant.
+- The supported source is exactly a clean-close journal without `-wal`, `-shm`
+  or `-journal`. Any complete or partial sidecar is rejected as
+  `ACTIVE_OR_UNCLEAN_SOURCE` before connect; the database then opens with
+  `mode=ro&immutable=1&cache=private`.
+- This boundary was intentionally narrowed because empirical tests showed that
+  plain `mode=ro` could mutate existing SHM bytes. WAL inspection is not
+  claimed safe without a future explicit snapshot/copy protocol.
+- A short source transaction performs only bounded serialization and binds the
+  SQLite serialized bytes to the verified descriptor digest. Those bytes are
+  then loaded into an isolated in-memory connection, where a separate
+  transaction runs every substantive schema, durable-payload and report query
+  against the sealed image. A final descriptor hash check still detects source
+  changes during inspection.
+- Schema v1 is validated and returns exactly `SCHEMA_UPGRADE_REQUIRED`; it is
+  never migrated and no v2 query is issued. Schema v2 must pass complete
+  durable-payload verification before the deterministic report is built.
+- Commander gate passed: formatter check covered 172 files; Ruff passed; mypy
+  passed over 72 source files; unit tests were `1363 passed, 4 skipped`;
+  offline integration tests were `119 passed, 1 deselected`; and the full
+  default offline suite was `1482 passed, 4 skipped, 6 deselected`.
+- This slice adds no CLI, JSON evidence/input, trusted assessment source,
+  operator authorization/audit, broker query, COM/SKCOM, credentials/DLL,
+  dispatch/resend/receipt/event/fill synthesis or real order.
+- Phase 3 remains in progress. Next planning items include a safe WAL
+  snapshot/copy protocol if desired, output-only CLI composition, a trusted
+  assessment source, authorization/audit schema work and query-only broker
+  integration.

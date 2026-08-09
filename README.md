@@ -570,3 +570,50 @@ schema v3), query-only broker integration and every real-order operation remain
 separately planned and gated. This slice adds no COM/SKCOM initialization,
 credential or DLL access, broker query adapter, Reply/Order connection, live
 callback, production CLI or real-order authorization.
+
+## Phase 3B-5 production read-only journal inspection
+
+Phase 3B-5 adds the one-shot library API
+`inspect_sqlite_live_order_journal(path, account_id=...)`. It returns a strict,
+frozen and redacted deterministic report, attributes recovery blockers to the
+selected account or to journal-global state, and exposes only bounded opaque
+target identifiers. Public failures use stable sanitized codes and messages.
+The inspector installs SQLite authorizers for two bounded read stages and never
+exposes a writable journal object. Every report keeps
+`may_dispatch=False` and `commit_allowed=False`.
+
+The supported source boundary is intentionally exact: only a cleanly closed
+journal with no `-wal`, `-shm` or `-journal` sidecar is accepted. Any complete
+or partial sidecar is classified as `ACTIVE_OR_UNCLEAN_SOURCE` before SQLite is
+connected. The main database is then opened with
+`mode=ro&immutable=1&cache=private`. This boundary was narrowed after empirical
+testing showed that plain `mode=ro` could mutate existing SHM bytes; safe WAL
+inspection therefore requires a separately designed snapshot/copy protocol.
+
+Before any substantive inspection, a short source transaction performs only
+bounded serialization and binds the SQLite serialized bytes to the already
+verified descriptor digest. Those verified bytes are then loaded into an
+isolated in-memory connection, where a separate transaction runs all
+substantive schema, durable-payload and report queries against the sealed image.
+A final descriptor hash check still rejects any source change observed during
+inspection.
+
+Schema v1 is validated only far enough to return
+`SCHEMA_UPGRADE_REQUIRED`; inspection never migrates it or executes v2 queries.
+For schema v2, the inspector verifies the complete durable payload before
+building the canonical report. Integrity failures fail closed without leaking
+account IDs, durable IDs, tokens, raw evidence, paths or SQLite diagnostics.
+
+The Phase 3B-5 Commander gate passed: formatter check covered 172 files, Ruff
+passed, mypy reported no issues in 72 source files, unit tests were
+`1363 passed, 4 skipped`, offline integration tests were
+`119 passed, 1 deselected`, and the full default offline suite was
+`1482 passed, 4 skipped, 6 deselected`.
+
+Phase 3 remains in progress. This slice adds no CLI, JSON evidence/input,
+trusted assessment source, operator authorization/audit workflow, broker query,
+COM/SKCOM integration, credential or DLL access, dispatch, resend,
+receipt/event/fill synthesis or real order. Next planning items include a safe
+WAL snapshot/copy protocol if desired, output-only CLI composition, a trusted
+assessment source, authorization/audit schema work and query-only broker
+integration.

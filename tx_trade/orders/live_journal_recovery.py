@@ -20,11 +20,16 @@ from .live_journal_codec import (
     journal_digest,
 )
 from .live_journal_contracts import (
+    DurableReconciliationRequirement,
+    LiveJournalIdentity,
     LiveJournalRecoverySnapshot,
     OutstandingDispatchClaim,
 )
+from .live_ports import AmbiguousObservation, RawBrokerObservation
+from .live_state_machine import AppliedEvent, AppliedEventLedger
 
 _FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _PROJECTION_DOMAIN = "tx_trade.live.order.projection.v1"
 
 
@@ -161,6 +166,67 @@ def _verify_projection(order: LiveOrder) -> ProjectionVerification | None:
         )
     except (LiveJournalCodecError, TypeError, ValueError):
         return None
+
+
+def _round_trips_as_single_record(value: object) -> bool:
+    """Validate one durable component without imposing a limit on its aggregate view."""
+
+    try:
+        payload = encode_journal_value(value)
+        decoded = decode_journal_value(payload, type(value))
+        return decoded == value and encode_journal_value(decoded) == payload
+    except (LiveJournalCodecError, TypeError, ValueError):
+        return False
+
+
+def _ambiguous_components_are_canonical(ambiguous: AmbiguousObservation) -> bool:
+    candidates = ambiguous.candidate_client_order_ids
+    return (
+        type(ambiguous.observation) is RawBrokerObservation
+        and _round_trips_as_single_record(ambiguous.observation)
+        and type(candidates) is tuple
+        and len(candidates) >= 2
+        and all(
+            type(candidate) is str and _IDENTIFIER.fullmatch(candidate) for candidate in candidates
+        )
+        and len(set(candidates)) == len(candidates)
+        and candidates == tuple(sorted(candidates))
+    )
+
+
+def _snapshot_components_are_canonical(snapshot: LiveJournalRecoverySnapshot) -> bool:
+    collections: tuple[tuple[object, type[object]], ...] = (
+        (snapshot.orders, LiveOrder),
+        (snapshot.outstanding_claims, OutstandingDispatchClaim),
+        (snapshot.unresolved_observations, RawBrokerObservation),
+        (snapshot.conflict_observations, RawBrokerObservation),
+        (snapshot.ambiguous_observations, AmbiguousObservation),
+        (snapshot.reconciliation_requirements, DurableReconciliationRequirement),
+    )
+    if (
+        type(snapshot.identity) is not LiveJournalIdentity
+        or type(snapshot.applied_event_ledger) is not AppliedEventLedger
+        or type(snapshot.applied_event_ledger.events) is not tuple
+        or any(type(event) is not AppliedEvent for event in snapshot.applied_event_ledger.events)
+        or type(snapshot.journal_sequence) is not int
+        or snapshot.journal_sequence < 1
+        or any(
+            type(values) is not tuple or any(type(item) is not expected for item in values)
+            for values, expected in collections
+        )
+    ):
+        return False
+    components = (
+        snapshot.identity,
+        *snapshot.outstanding_claims,
+        *snapshot.unresolved_observations,
+        *snapshot.conflict_observations,
+        *snapshot.reconciliation_requirements,
+        *snapshot.applied_event_ledger.events,
+    )
+    return all(_round_trips_as_single_record(item) for item in components) and all(
+        _ambiguous_components_are_canonical(item) for item in snapshot.ambiguous_observations
+    )
 
 
 def verify_recovery_snapshot(snapshot: LiveJournalRecoverySnapshot) -> RecoveryVerification:
@@ -307,14 +373,9 @@ def verify_recovery_snapshot(snapshot: LiveJournalRecoverySnapshot) -> RecoveryV
         ):
             _append_once(issues, RecoveryIssueCode.REQUIREMENT_OBSERVATION_MISMATCH)
 
-    # A canonical snapshot round-trip also checks the identity, observations,
-    # ledger and their nested contracts.  It is verification only: no I/O.
-    try:
-        payload = encode_journal_value(snapshot)
-        decoded = decode_journal_value(payload, LiveJournalRecoverySnapshot)
-        if decoded != snapshot or encode_journal_value(decoded) != payload:
-            _append_once(issues, RecoveryIssueCode.PROJECTION_INVALID)
-    except (LiveJournalCodecError, TypeError, ValueError):
+    # Validate each durable record independently.  The codec's 1 MiB ceiling is
+    # a per-record persistence limit, not a limit on this aggregate recovery view.
+    if not _snapshot_components_are_canonical(snapshot):
         _append_once(issues, RecoveryIssueCode.PROJECTION_INVALID)
 
     pending_results: list[PendingRecovery] = []

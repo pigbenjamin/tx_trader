@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pytest
+
 from tx_trade.orders.live_contracts import (
     FingerprintDomain,
     LiveOrderIntent,
@@ -20,6 +22,11 @@ from tx_trade.orders.live_journal_contracts import (
     LiveJournalIdentity,
     LiveJournalRecoverySnapshot,
     OutstandingDispatchClaim,
+)
+from tx_trade.orders.live_journal_codec import (
+    MAX_CODEC_PAYLOAD_BYTES,
+    LiveJournalCodecError,
+    encode_journal_value,
 )
 from tx_trade.orders.live_journal_recovery import (
     PendingRecoveryKind,
@@ -299,3 +306,77 @@ def test_projection_roundtrip_failure_blocks_without_exposing_value() -> None:
     assert result.readiness is RecoveryReadiness.BLOCKED
     assert RecoveryIssueCode.PROJECTION_INVALID in result.issues
     assert "account-1" not in repr(result)
+
+
+def test_large_valid_aggregate_snapshot_is_not_projection_invalid() -> None:
+    opaque_payload = b"aggregate-secret" + b"x" * 20_000
+    observations = tuple(
+        RawBrokerObservation(
+            f"observation-{index}",
+            "reply",
+            1,
+            index + 1,
+            NOW,
+            opaque_payload,
+        )
+        for index in range(64)
+    )
+    snapshot = _snapshot(unresolved=observations)
+
+    assert all(len(encode_journal_value(item)) < MAX_CODEC_PAYLOAD_BYTES for item in observations)
+    with pytest.raises(LiveJournalCodecError):
+        encode_journal_value(snapshot)
+
+    result = verify_recovery_snapshot(snapshot)
+
+    assert result.readiness is RecoveryReadiness.RECONCILIATION_REQUIRED
+    assert RecoveryIssueCode.UNRESOLVED_OBSERVATION in result.issues
+    assert RecoveryIssueCode.PROJECTION_INVALID not in result.issues
+
+
+def test_large_ambiguous_aggregate_uses_raw_record_granularity() -> None:
+    order_ids = tuple(f"order-{index:04d}-" + "x" * 117 for index in range(1000))
+    orders = tuple(create_live_order(_intent(order_id)) for order_id in order_ids)
+    observation = RawBrokerObservation(
+        "large-ambiguous-observation",
+        "reply",
+        1,
+        1,
+        NOW,
+        b"opaque-secret" + b"x" * 700_000,
+    )
+    ambiguous = AmbiguousObservation(observation, order_ids)
+    snapshot = _snapshot(orders=orders, ambiguous=(ambiguous,))
+
+    assert len(encode_journal_value(observation)) < MAX_CODEC_PAYLOAD_BYTES
+    with pytest.raises(LiveJournalCodecError):
+        encode_journal_value(ambiguous)
+
+    result = verify_recovery_snapshot(snapshot)
+
+    assert result.readiness is RecoveryReadiness.RECONCILIATION_REQUIRED
+    assert RecoveryIssueCode.AMBIGUOUS_OBSERVATION in result.issues
+    assert RecoveryIssueCode.UNKNOWN_AMBIGUITY_CANDIDATE not in result.issues
+    assert RecoveryIssueCode.PROJECTION_INVALID not in result.issues
+
+
+@pytest.mark.parametrize(
+    "candidates",
+    (
+        ("order-b", "order-a"),
+        ("order-a", "contains space"),
+        ["order-a", "order-b"],
+    ),
+)
+def test_forged_noncanonical_ambiguous_candidates_fail_closed(candidates: object) -> None:
+    orders = (
+        create_live_order(_intent("order-a")),
+        create_live_order(_intent("order-b")),
+    )
+    ambiguous = AmbiguousObservation(_observation(), ("order-a", "order-b"))
+    object.__setattr__(ambiguous, "candidate_client_order_ids", candidates)
+
+    result = verify_recovery_snapshot(_snapshot(orders=orders, ambiguous=(ambiguous,)))
+
+    assert result.readiness is RecoveryReadiness.BLOCKED
+    assert RecoveryIssueCode.PROJECTION_INVALID in result.issues

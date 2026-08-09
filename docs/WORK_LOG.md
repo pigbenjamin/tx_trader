@@ -787,3 +787,58 @@ Explicit exclusions and remaining Phase 3 work:
   integration and every real-order step remain deferred and separately gated.
 - Phase 3 remains in progress; Phase 3B-4 completes only this offline safe
   projection and recovery-planning slice.
+
+## 2026-08-09: Phase 3B-5 production read-only journal inspection
+
+Scope and completed safe slice:
+
+- Added the one-shot library API
+  `inspect_sqlite_live_order_journal(path, account_id=...)`. It returns a
+  strict frozen/redacted deterministic report and never exposes a writable
+  journal object.
+- Reports distinguish selected-account recovery work from journal-global
+  blockers, use bounded opaque target identifiers, and expose only sanitized
+  failure codes/messages. SQLite authorizers constrain both bounded read
+  stages.
+- The accepted source boundary is exactly a cleanly closed journal with no
+  `-wal`, `-shm` or `-journal`. Any complete or partial sidecar returns
+  `ACTIVE_OR_UNCLEAN_SOURCE` before SQLite connect. The main database opens as
+  `mode=ro&immutable=1&cache=private`.
+- The boundary was narrowed after empirical testing found that plain
+  `mode=ro` could mutate existing SHM bytes. This slice therefore makes no
+  claim that a live or WAL-backed journal can be inspected safely in place.
+- A short source transaction performs only bounded serialization and binds the
+  SQLite serialized bytes to the verified descriptor digest. Those bytes are
+  loaded into an isolated in-memory connection, where a separate transaction
+  runs every substantive schema, durable-payload and report query against the
+  sealed image. A final descriptor hash check still detects source changes.
+- Schema v1 receives validation only and returns
+  `SCHEMA_UPGRADE_REQUIRED`; the inspector performs no migration and issues no
+  v2 query against it. Schema v2 must verify its complete durable payload
+  before building the canonical report.
+- Every returned report has `may_dispatch=False` and
+  `commit_allowed=False`.
+
+Commander validation status:
+
+- Ruff formatter check covered 172 files; Ruff passed.
+- Mypy reported no issues in 72 source files.
+- Unit suite: `1363 passed, 4 skipped`.
+- Offline integration suite: `119 passed, 1 deselected`.
+- Full default offline suite: `1482 passed, 4 skipped, 6 deselected`.
+- The initial system-Python Ruff command failed because Ruff was not installed;
+  rerunning with the project virtual environment passed. Initial pytest setup
+  errors came from a missing nested `--basetemp` parent; after creating a
+  dedicated parent directory, all suites passed. Pytest cache permission
+  warnings did not affect the results.
+
+Explicit exclusions and remaining Phase 3 work:
+
+- No CLI, JSON evidence/input, trusted assessment source, operator
+  authorization/audit, broker query, COM/SKCOM initialization, credential/DLL
+  access, dispatch, resend, receipt/event/fill synthesis or real order was
+  added or exercised.
+- Phase 3 remains in progress. Next planning items include a safe WAL
+  snapshot/copy protocol if desired, output-only CLI composition, a trusted
+  assessment source, authorization/audit schema work and query-only broker
+  integration.

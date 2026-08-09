@@ -18,6 +18,7 @@ PHASE3A_MODULES = (
 )
 RUNTIME_PERSISTENCE_MODULES = frozenset(
     {
+        "tx_trade.orders.sqlite_live_journal_inspection",
         "tx_trade.orders.sqlite_live_order_journal",
     }
 )

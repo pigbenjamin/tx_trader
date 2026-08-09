@@ -98,6 +98,8 @@ DATABASE_SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_MAX_MAIN_DATABASE_BYTES = 256 * 1024 * 1024
 
+_SQLITE_CONNECT = sqlite3.connect
+
 _ORDER_DOMAIN = "tx_trade.live.journal.order.v1"
 _IDENTITY_DOMAIN = "tx_trade.live.journal.identity.v1"
 _COMMAND_DOMAIN = "tx_trade.live.journal.command.v1"
@@ -187,7 +189,10 @@ def _expected_schema_signature(
     version: int = DATABASE_SCHEMA_VERSION,
 ) -> tuple[tuple[str, str, str], ...]:
     script, _ = _schema_material() if version == 2 else _v1_schema_material()
-    connection = sqlite3.connect(":memory:", isolation_level=None)
+    # Schema material is checked in an isolated in-memory database.  Retaining
+    # the stdlib constructor keeps source-connection auditing scoped to the
+    # actual journal connection.
+    connection = _SQLITE_CONNECT(":memory:", isolation_level=None)
     try:
         connection.executescript(script)
         return tuple(
@@ -1786,17 +1791,14 @@ class SqliteLiveOrderJournal:
             except sqlite3.Error as exc:
                 raise _sqlite_failure(exc) from None
 
-    def _load_recovery_blockers(self, account_id: str) -> tuple[str, ...]:
+    def _load_recovery_blocker_attributions(
+        self,
+    ) -> tuple[tuple[str, str, frozenset[str]], ...]:
         connection = self._require_connection()
-        account_blockers: dict[str, set[str]] = {}
-        global_blockers: set[str] = set()
+        attributions: list[tuple[str, str, frozenset[str]]] = []
 
         def add(kind: str, durable_id: str, accounts: set[str]) -> None:
-            blocker = _recovery_blocker(kind, durable_id)
-            if len(accounts) != 1:
-                global_blockers.add(blocker)
-                return
-            account_blockers.setdefault(next(iter(accounts)), set()).add(blocker)
+            attributions.append((kind, durable_id, frozenset(accounts)))
 
         for row in connection.execute(
             """SELECT dc.client_command_id, o.account_id
@@ -1872,7 +1874,32 @@ class SqliteLiveOrderJournal:
                 accounts.update(observation_accounts.get(row[2], set()))
             add("requirement", str(row[0]), accounts)
 
-        return tuple(sorted(global_blockers | account_blockers.get(account_id, set())))
+        return tuple(attributions)
+
+    def _load_recovery_blockers(self, account_id: str) -> tuple[str, ...]:
+        blockers = {
+            _recovery_blocker(kind, durable_id)
+            for kind, durable_id, accounts in self._load_recovery_blocker_attributions()
+            if len(accounts) != 1 or account_id in accounts
+        }
+        return tuple(sorted(blockers))
+
+    def _load_inspection_recovery_issue_codes(self, account_id: str) -> tuple[str, ...]:
+        issue_by_kind = {
+            "observation-unresolved": "unresolved_observation",
+            "observation-conflict": "conflict_observation",
+            "observation-ambiguous": "ambiguous_observation",
+            "requirement": "durable_reconciliation_requirement",
+        }
+        issues: set[str] = set()
+        for kind, _, accounts in self._load_recovery_blocker_attributions():
+            if kind == "claim":
+                continue
+            if len(accounts) != 1:
+                issues.add("global_recovery_blocker")
+            elif account_id in accounts:
+                issues.add(issue_by_kind[kind])
+        return tuple(sorted(issues))
 
     def load_account_snapshot(self, account_id: str) -> LocalReconciliationSnapshot:
         if type(account_id) is not str:
@@ -3633,6 +3660,39 @@ class SqliteLiveOrderJournal:
                 )
             except sqlite3.Error as exc:
                 raise _sqlite_failure(exc) from None
+
+
+def _load_read_only_inspection_payload(
+    connection: sqlite3.Connection,
+    account_id: str,
+    database_schema_version: int,
+) -> tuple[
+    LiveJournalIdentity,
+    int,
+    LiveJournalRecoverySnapshot | None,
+    tuple[str, ...],
+]:
+    """Reuse the journal verifier/hydrator without exposing a journal instance."""
+
+    journal = object.__new__(SqliteLiveOrderJournal)
+    journal._path = Path(":memory:")
+    journal._lock = RLock()
+    journal._closed = False
+    journal._poisoned = False
+    journal._connection = connection
+    journal._validate_schema(database_schema_version)
+    identity = journal._load_identity()
+    journal._identity = identity
+    if database_schema_version == 1:
+        journal._verify_durable_payloads()
+        sequence_row = connection.execute(
+            "SELECT max(journal_sequence) FROM live_journal_records"
+        ).fetchone()
+        sequence = int(sequence_row[0] or 0)
+        return identity, sequence, None, ()
+    snapshot = journal.load_recovery_snapshot()
+    issue_codes = journal._load_inspection_recovery_issue_codes(account_id)
+    return identity, snapshot.journal_sequence, snapshot, issue_codes
 
 
 __all__ = [
