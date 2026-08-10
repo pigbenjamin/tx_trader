@@ -8,16 +8,17 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
-from tx_trade.orders.live_journal_codec import encode_journal_value, journal_digest
-from tx_trade.orders.live_journal_contracts import JournalOpenMode, LiveJournalIdentity
+from tx_trade.orders.live_journal_contracts import JournalOpenMode
 from tx_trade.orders.live_ports import RawBrokerObservation
 from tx_trade.orders.sqlite_live_order_journal import SqliteLiveOrderJournal
 
 from tests.support.live_journal_inspection_scenarios import (
     NOW,
+    create_frozen_v1,
     create_v2_with_claim,
 )
 
@@ -27,6 +28,8 @@ CLAIM_CANARY = "claim-token-process-canary"
 DURABLE_ID_CANARY = "durable-id-process-canary"
 RAW_PAYLOAD_CANARY = "raw-payload-process-canary"
 PATH_CANARY = "path-process-canary"
+FROZEN_V1_IDENTITY_CANARY = "journal-v1"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 _CHILD = r"""
 import importlib.abc
@@ -103,6 +106,8 @@ print(json.dumps(output, sort_keys=True, separators=(",", ":")))
 
 
 def _run_inspection(path: Path, *, poison: bool = False) -> tuple[dict[str, object], str]:
+    child_environment = os.environ.copy()
+    child_environment["PYTHONPATH"] = str(REPOSITORY_ROOT)
     completed = subprocess.run(
         [
             sys.executable,
@@ -113,8 +118,8 @@ def _run_inspection(path: Path, *, poison: bool = False) -> tuple[dict[str, obje
             ACCOUNT_CANARY,
             "poison" if poison else "plain",
         ],
-        cwd=Path.cwd(),
-        env=os.environ.copy(),
+        cwd=REPOSITORY_ROOT,
+        env=child_environment,
         check=False,
         capture_output=True,
         text=True,
@@ -180,35 +185,35 @@ def _create_v2(path: Path) -> None:
 
 
 def _create_v1(path: Path) -> None:
-    schema_path = Path("tx_trade/orders/live_journal_schema_v1.sql")
-    schema = schema_path.read_text(encoding="utf-8")
-    fingerprint = f"sha256:{sha256(schema.encode('utf-8')).hexdigest()}"
-    created_at = datetime(2026, 8, 9, tzinfo=timezone.utc)
-    created_text = created_at.isoformat().replace("+00:00", "Z")
-    identity = LiveJournalIdentity(DURABLE_ID_CANARY, 1, fingerprint, created_at)
-    payload = encode_journal_value(identity)
-    digest = journal_digest("tx_trade.live.journal.identity.v1", payload)
+    create_frozen_v1(path)
 
-    with sqlite3.connect(path, isolation_level=None) as connection:
-        connection.executescript(schema)
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "INSERT INTO live_journal_migrations(version, schema_fingerprint) VALUES (1, ?)",
-            (fingerprint,),
-        )
-        connection.execute(
-            """INSERT INTO live_journal_identity(
-                   singleton, journal_id, schema_version, schema_fingerprint, created_at
-               ) VALUES (1, ?, 1, ?, ?)""",
-            (identity.journal_id, fingerprint, created_text),
-        )
-        connection.execute(
-            """INSERT INTO live_journal_records(
-                   record_kind, record_id, payload_digest, recorded_at
-               ) VALUES ('identity', ?, ?, ?)""",
-            (identity.journal_id, digest, created_text),
-        )
-        connection.execute("COMMIT")
+
+def test_fresh_process_inspection_is_independent_of_parent_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        directory = Path(temporary_directory).resolve()
+        assert directory != REPOSITORY_ROOT
+        assert REPOSITORY_ROOT not in directory.parents
+        v1_path = directory / "fresh-process-v1.sqlite3"
+        v2_path = directory / "fresh-process-v2.sqlite3"
+        _create_v1(v1_path)
+        _create_v2(v2_path)
+        before = _snapshot(directory)
+        with monkeypatch.context() as cwd_patch:
+            cwd_patch.chdir(directory)
+            v1_result, v1_output = _run_inspection(v1_path, poison=True)
+            v2_result, v2_output = _run_inspection(v2_path, poison=True)
+
+        assert v1_result["database_schema_version"] == 1
+        assert v1_result["disposition"] == "schema_upgrade_required"
+        assert v2_result["database_schema_version"] == 2
+        assert v2_result["disposition"] == "recovery_required"
+        assert _snapshot(directory) == before
+        assert set(before) == {v1_path.name, v2_path.name}
+        _assert_no_canaries(v1_output, v1_path)
+        assert FROZEN_V1_IDENTITY_CANARY not in v1_output
+        _assert_no_canaries(v2_output, v2_path)
 
 
 def test_fresh_process_clean_v2_is_deterministic_and_read_only(tmp_path: Path) -> None:
@@ -252,6 +257,7 @@ def test_fresh_process_v1_requires_upgrade_without_migrating(tmp_path: Path) -> 
             "SELECT 1 FROM sqlite_master WHERE name = 'live_reconciliation_commits'"
         ).fetchone()
     _assert_no_canaries(output, path)
+    assert FROZEN_V1_IDENTITY_CANARY not in output
 
 
 def test_quiescent_complete_wal_pair_fails_closed_without_mutation(tmp_path: Path) -> None:

@@ -502,7 +502,7 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 | Phase 0 專案基線 | 已完成 | 2026-07-25 | 2026-07-27 | fresh Python 3.13.14 環境、依賴、品質檢查與安全測試已驗證 |
 | Phase 1 穩定行情 | 已完成 | 2026-07-26 | 2026-07-28 | 離線驗證與真實 quote-only live smoke 均完成 |
 | Phase 2 Replay/Paper | 已完成 | 2026-07-28 | 2026-07-28 | Phase 2A Replay Runtime 與 Phase 2B-1 至 2B-5 PaperBroker、durable recovery 及 output outbox 已完成 final acceptance |
-| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A、3B-1 至 3B-5 safe slices 已完成 Commander gate；尚未建立 trusted assessment source、COM、live query 或送單 |
+| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A、3B-1 至 3B-5 及 3B-5.1 inspection hardening 已完成 Commander gate；尚未建立 CLI、trusted assessment source、COM、live query 或送單 |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
 | Phase 6 營運強化 | 待開始 |  |  |  |
@@ -562,14 +562,15 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 Phase 0、Phase 1 與 Phase 2 已完成。Phase 3A live-order contracts、Phase
 3B-1 SQLite journal、3B-2 fake-only reconciliation、3B-3 durable
 reconciliation commit/resolution 與 SQLite v1→v2 migration、3B-4
-authoritative recovery projection/operator planning，以及 3B-5 production
-read-only journal inspection library slice 已通過 Commander quality gate。
-Phase 3 整體仍在進行中。
+authoritative recovery projection/operator planning、3B-5 production
+read-only journal inspection library slice，以及 3B-5.1 inspection hardening
+已通過 Commander quality gate。Phase 3 整體仍在進行中。
 
-Phase 3 的後續 planning items 是 safe WAL snapshot/copy protocol（如有需
-要）、output-only CLI composition、trusted assessment source、具授權與 audit
-的 schema 工作，以及 query-only broker integration。Phase 3B-5 不提供
-trusted broker evidence source 或 dispatch/commit permission；
+下一個 functional slice 是 output-only CLI composition；trusted assessment
+source、具授權與 audit 的 schema 工作及 query-only broker integration 仍須
+另行規劃。Performance batch/stream/RSS benchmarking 與 safe WAL
+snapshot/copy protocol 維持 deferred。Phase 3B-5.1 不提供 trusted broker
+evidence source 或 dispatch/commit permission；
 `may_dispatch=False`、`commit_allowed=False`，既有 claim 永不自動 resend，
 也不合成 receipt/event/fill。任何 SKCOM Order／full Reply integration 或真
 單仍必須另行完成 PLAN PHASE 並取得明確授權。
@@ -986,3 +987,39 @@ composition、不讀 live credential、不載入 COM。
   snapshot/copy protocol if desired, output-only CLI composition, a trusted
   assessment source, authorization/audit schema work and query-only broker
   integration.
+
+### 15.12 Phase 3B-5.1 inspection hardening（2026-08-10）
+
+- Added strict resource ceilings without changing the inspection contract:
+  64 MiB each for the main database and serialized image, 25,000 total durable
+  rows, and a deterministic SQLite progress budget checked every 1,000 virtual
+  machine opcodes with at most 100,000 callbacks.
+- Resource-limit and `MemoryError` failures are sanitized as
+  `CAPACITY_EXCEEDED`. A changed final descriptor hash still takes precedence
+  as `SOURCE_CHANGED`.
+- Replaced the inspector's `object.__new__` journal construction with a normal
+  connection-bound read-only reader and stateless path helpers. The caller owns
+  its transaction and connection; the writable journal preserves its existing
+  lifecycle and poisoning behavior.
+- Tests now cover the complete SQLite authorizer deny/allow behavior matrix,
+  all 16 account-attribution cases, deterministic query growth and
+  fresh processes launched by a parent running outside the repository.
+- The ambiguity matrix now retains normalized provenance and candidate history,
+  resolves through the public reconciliation commit path and includes a
+  mutation proof. The durable verifier accepts `UNRESOLVED` applications for a
+  valid ambiguous raw observation without weakening the existing candidate or
+  applied/conflict invariants.
+- Ambiguous reconciliation now requires the canonical resolution event to
+  reference a durable candidate during both commit and reopen verification.
+  Progress callbacks stop at the documented boundary, and cleanup/final-scan
+  `MemoryError` retains `CAPACITY_EXCEEDED` precedence below `SOURCE_CHANGED`.
+- Final Commander gates passed: formatter check covered 172 source/test files;
+  Ruff passed; mypy passed over 72 source files; focused tests were
+  `150 passed`; unit tests were `1451 passed, 4 skipped`; offline integration
+  tests were `122 passed, 1 deselected`; and the full default offline suite was
+  `1573 passed, 4 skipped, 6 deselected`.
+- The clean-close/no-sidecar and sealed-image design remains unchanged. This
+  hardening adds no CLI, WAL snapshot/copy, schema migration, broker/COM,
+  credentials, dispatch/resend, receipt/event/fill synthesis or real order.
+- The next planned functional slice remains the output-only CLI. Performance
+  batch/stream/RSS benchmarking and a safe WAL snapshot remain deferred.

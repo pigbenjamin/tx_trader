@@ -617,3 +617,43 @@ receipt/event/fill synthesis or real order. Next planning items include a safe
 WAL snapshot/copy protocol if desired, output-only CLI composition, a trusted
 assessment source, authorization/audit schema work and query-only broker
 integration.
+
+## Phase 3B-5.1 inspection hardening (2026-08-10)
+
+Phase 3B-5.1 hardens the existing inspection library without expanding its
+functional scope. Both the main database and serialized image are limited to
+64 MiB, the total durable-row budget is 25,000, and SQLite work is bounded by a
+deterministic progress handler checked every 1,000 virtual-machine opcodes with
+a maximum of 100,000 callbacks. Resource-limit and `MemoryError` paths expose
+only the sanitized `CAPACITY_EXCEEDED` failure; if the final descriptor hash
+also detects a changed source, `SOURCE_CHANGED` retains precedence.
+
+The durable inspection reader is now a normal connection-bound read-only
+object with stateless path helpers. The inspector no longer constructs a
+journal through `object.__new__`: its caller owns the connection and
+transaction. The writable journal keeps its existing connection lifecycle and
+poisoning semantics.
+
+Hardening coverage includes the complete SQLite authorizer deny/allow behavior
+matrix, all 16 account-attribution cases, a deterministic query-growth gate,
+and fresh-process tests whose parent runner starts outside the repository.
+The attribution matrix preserves genuine ambiguous history and
+resolves it through the public reconciliation commit path; the durable
+verifier now accepts the corresponding `UNRESOLVED` application while retaining
+the two-candidate ambiguity requirement. Resolution events must also identify
+an actual durable ambiguity candidate; non-candidate events are rejected with
+zero writes and forged durable resolutions fail closed on reopen. Progress and
+cleanup fault paths preserve the documented callback and `MemoryError`
+precedence boundaries. The final Commander gate passed:
+formatter check covered 172 source/test files, Ruff passed, mypy reported no
+issues in 72 source files, focused tests were `150 passed`, unit tests were
+`1451 passed, 4 skipped`, offline integration tests were
+`122 passed, 1 deselected`, and the full default offline suite was
+`1573 passed, 4 skipped, 6 deselected`.
+
+The clean-close/no-sidecar and sealed-image boundaries remain unchanged. This
+hardening adds no CLI, WAL snapshot/copy, schema migration, broker or COM
+integration, credential access, dispatch, resend, receipt/event/fill synthesis
+or real order. The next planned functional slice remains the output-only CLI;
+performance batch/stream/RSS benchmarking and a safe WAL snapshot remain
+deferred.

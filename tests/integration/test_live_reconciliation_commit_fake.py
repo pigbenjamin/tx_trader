@@ -4,6 +4,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+import shutil
+import sqlite3
 
 import pytest
 
@@ -24,7 +26,11 @@ from tx_trade.orders.live_contracts import (
     PendingCommandBinding,
     payload_fingerprint,
 )
-from tx_trade.orders.live_journal_contracts import JournalOpenMode, intent_fingerprint
+from tx_trade.orders.live_journal_contracts import (
+    JournalOpenMode,
+    LiveJournalIntegrityError,
+    intent_fingerprint,
+)
 from tx_trade.orders.live_journal_recovery import RecoveryReadiness, verify_recovery_snapshot
 from tx_trade.orders.live_ports import (
     BrokerFillsSnapshot,
@@ -33,6 +39,7 @@ from tx_trade.orders.live_ports import (
     DispatchClaimDisposition,
     EvidenceCompleteness,
     EvidenceQueryKind,
+    EventApplicationDisposition,
     JournalAppendDisposition,
     OpenOrdersSnapshot,
     RawBrokerObservation,
@@ -52,6 +59,7 @@ from tx_trade.orders.live_reconciliation_commit_contracts import (
 )
 from tx_trade.orders.live_reconciliation_contracts import BrokerReconciliationSnapshot
 from tx_trade.orders.live_state_machine import advance_local, create_live_order
+from tx_trade.orders import sqlite_live_order_journal as journal_module
 from tx_trade.orders.sqlite_live_order_journal import SqliteLiveOrderJournal
 
 CREATED_AT = datetime(2026, 8, 3, 1, tzinfo=timezone.utc)
@@ -62,6 +70,10 @@ ORDER_ID = "order-commit-integration"
 COMMAND_ID = "command-commit-integration"
 CLAIM_TOKEN = "claim-commit-integration"
 SNAPSHOT_ID = "snapshot-commit-integration"
+CANDIDATE_ORDER_ID = "order-commit-ambiguity-candidate"
+CANDIDATE_COMMAND_ID = "command-commit-ambiguity-candidate"
+NON_CANDIDATE_ORDER_ID = "order-commit-ambiguity-non-candidate"
+NON_CANDIDATE_COMMAND_ID = "command-commit-ambiguity-non-candidate"
 
 
 class FixedClock:
@@ -141,10 +153,12 @@ def _broker_snapshot(
     completeness: EvidenceCompleteness = EvidenceCompleteness.COMPLETE,
     observed_at: datetime = SNAPSHOT_AT,
     snapshot_id: str = SNAPSHOT_ID,
+    include_candidate: bool = False,
+    include_non_candidate: bool = False,
 ) -> BrokerReconciliationSnapshot:
-    orders: tuple[BrokerOpenOrderObservation, ...] = ()
+    order_items: list[BrokerOpenOrderObservation] = []
     if include_order:
-        orders = (
+        order_items.append(
             BrokerOpenOrderObservation(
                 "broker-open-commit-integration",
                 ACCOUNT_ID,
@@ -162,8 +176,51 @@ def _broker_snapshot(
                     client_order_id=ORDER_ID,
                 ),
                 SNAPSHOT_AT,
-            ),
+            )
         )
+    if include_candidate:
+        order_items.append(
+            BrokerOpenOrderObservation(
+                "broker-open-commit-ambiguity-candidate",
+                ACCOUNT_ID,
+                "TXF-202608",
+                LiveSide.BUY,
+                Decimal("1"),
+                Decimal("1"),
+                Decimal("22001"),
+                BrokerCorrelation(
+                    1,
+                    3,
+                    CorrelationStatus.CONFIRMED,
+                    ACCEPTED_AT + timedelta(seconds=2),
+                    broker_order_sequence="broker-sequence-commit-ambiguity-candidate",
+                    client_order_id=CANDIDATE_ORDER_ID,
+                ),
+                SNAPSHOT_AT,
+            )
+        )
+    if include_non_candidate:
+        order_items.append(
+            BrokerOpenOrderObservation(
+                "broker-open-commit-ambiguity-non-candidate",
+                ACCOUNT_ID,
+                "TXF-202608",
+                LiveSide.BUY,
+                Decimal("1"),
+                Decimal("1"),
+                Decimal("22002"),
+                BrokerCorrelation(
+                    1,
+                    5,
+                    CorrelationStatus.CONFIRMED,
+                    ACCEPTED_AT + timedelta(seconds=4),
+                    broker_order_sequence="broker-sequence-commit-ambiguity-non-candidate",
+                    client_order_id=NON_CANDIDATE_ORDER_ID,
+                ),
+                SNAPSHOT_AT,
+            )
+        )
+    orders = tuple(order_items)
     return BrokerReconciliationSnapshot(
         snapshot_id,
         ACCOUNT_ID,
@@ -249,6 +306,115 @@ def _register_claim_and_accept(
     assert applied.order.state is LiveOrderState.ACCEPTED
     assert applied.order.pending_command is None
     return command, applied.order
+
+
+def _register_and_accept_ambiguity_candidate(
+    journal: SqliteLiveOrderJournal,
+    *,
+    order_id: str = CANDIDATE_ORDER_ID,
+    command_id: str = CANDIDATE_COMMAND_ID,
+    adapter_sequence: int = 3,
+    limit_price: Decimal = Decimal("22001"),
+) -> LiveOrder:
+    accepted_at = ACCEPTED_AT + timedelta(seconds=adapter_sequence - 1)
+    intent = LiveOrderIntent(
+        strategy_id="strategy-commit-integration",
+        client_order_id=order_id,
+        account_id=ACCOUNT_ID,
+        instrument_id="TXF-202608",
+        side=LiveSide.BUY,
+        quantity=Decimal("1"),
+        order_type=LiveOrderType.LIMIT,
+        limit_price=limit_price,
+        time_in_force=LiveTimeInForce.DAY,
+        day_trade=False,
+        created_at=CREATED_AT,
+    )
+    command = NewOrderCommand(command_id, intent, CREATED_AT + timedelta(seconds=1))
+    order = create_live_order(intent)
+    order = advance_local(order, LiveOrderState.VALIDATED, CREATED_AT + timedelta(milliseconds=1))
+    order = advance_local(
+        order,
+        LiveOrderState.SUBMITTING,
+        command.requested_at,
+        PendingCommandBinding(
+            command,
+            payload_fingerprint(command, FingerprintDomain.NEW_COMMAND_V1),
+        ),
+    )
+    journal.register_new_order(
+        command,
+        order,
+        intent_fingerprint=intent_fingerprint(command.intent),
+    )
+    raw = RawBrokerObservation(
+        f"raw-accepted-{order_id}",
+        "fake-broker-reply",
+        1,
+        adapter_sequence,
+        accepted_at,
+        b"accepted-ambiguity-candidate",
+    )
+    assert journal.append_raw_observation(raw).disposition is JournalAppendDisposition.APPENDED
+    event = NormalizedBrokerOrderEvent(
+        f"event-accepted-{order_id}",
+        ACCOUNT_ID,
+        "TXF-202608",
+        BrokerOrderEventType.NEW_ACCEPTED,
+        accepted_at,
+        1,
+        adapter_sequence,
+        BrokerCorrelation(
+            1,
+            adapter_sequence,
+            CorrelationStatus.CONFIRMED,
+            accepted_at,
+            broker_order_sequence=f"broker-sequence-{order_id}",
+            client_order_id=order_id,
+        ),
+    )
+    applied = journal.apply_normalized_event(
+        event,
+        raw_observation_id=raw.observation_id,
+        expected_order_version=order.version,
+    )
+    assert applied.order is not None
+    assert applied.order.state is LiveOrderState.ACCEPTED
+    return applied.order
+
+
+def _convert_conflict_to_ambiguity(
+    path: Path,
+    *,
+    observation_id: str,
+    recorded_at: datetime,
+) -> None:
+    timestamp = recorded_at.isoformat().replace("+00:00", "Z")
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE live_raw_observations SET resolution_status = 'ambiguous' "
+            "WHERE observation_id = ? AND resolution_status = 'conflict'",
+            (observation_id,),
+        )
+        connection.executemany(
+            "INSERT INTO live_observation_ambiguity VALUES (?, ?, 1)",
+            (
+                (observation_id, ORDER_ID),
+                (observation_id, CANDIDATE_ORDER_ID),
+            ),
+        )
+        connection.execute(
+            """UPDATE live_journal_records SET payload_digest = ?
+               WHERE record_kind = 'observation-resolution' AND record_id = ?""",
+            (
+                journal_module._resolution_digest(observation_id, "ambiguous", timestamp),
+                observation_id,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _assessment(journal: SqliteLiveOrderJournal, snapshot: BrokerReconciliationSnapshot):
@@ -561,3 +727,289 @@ def test_conflict_observation_and_requirement_must_be_resolved_together(tmp_path
     assert not verification.may_dispatch
     assert resumed.load_account_snapshot(ACCOUNT_ID).recovery_blockers == ()
     resumed.close()
+
+
+def test_ambiguous_observation_with_normalized_provenance_can_be_committed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ambiguity-resolution.sqlite3"
+    journal = _open(path, JournalOpenMode.CREATE_NEW)
+    _, accepted = _register_claim_and_accept(journal)
+    claim_request = _claim_request(journal, commit_id="commit-ambiguity-precondition-claim")
+    assert journal.commit_reconciliation(claim_request).disposition is (
+        ReconciliationCommitDisposition.COMMITTED
+    )
+    candidate = _register_and_accept_ambiguity_candidate(journal)
+    non_candidate = _register_and_accept_ambiguity_candidate(
+        journal,
+        order_id=NON_CANDIDATE_ORDER_ID,
+        command_id=NON_CANDIDATE_COMMAND_ID,
+        adapter_sequence=5,
+        limit_price=Decimal("22002"),
+    )
+
+    ambiguous_at = ACCEPTED_AT + timedelta(seconds=3)
+    raw = RawBrokerObservation(
+        "raw-ambiguous-commit-integration",
+        "fake-broker-reply",
+        1,
+        4,
+        ambiguous_at,
+        b"ambiguous-order-correlation",
+    )
+    assert journal.append_raw_observation(raw).disposition is JournalAppendDisposition.APPENDED
+    event = NormalizedBrokerOrderEvent(
+        "event-ambiguous-commit-integration",
+        ACCOUNT_ID,
+        "TXF-DIFFERENT",
+        BrokerOrderEventType.NEW_ACCEPTED,
+        ambiguous_at,
+        1,
+        4,
+        BrokerCorrelation(
+            1,
+            4,
+            CorrelationStatus.CONFIRMED,
+            ambiguous_at,
+            broker_order_sequence="broker-ambiguous-commit-integration",
+            client_order_id=ORDER_ID,
+        ),
+    )
+    application = journal.apply_normalized_event(
+        event,
+        raw_observation_id=raw.observation_id,
+        expected_order_version=accepted.version,
+    )
+    assert application.disposition is EventApplicationDisposition.UNRESOLVED
+    before_fixture = journal.load_recovery_snapshot()
+    assert len(before_fixture.reconciliation_requirements) == 1
+    requirement_id = before_fixture.reconciliation_requirements[0].requirement_id
+    journal.close()
+
+    _convert_conflict_to_ambiguity(
+        path,
+        observation_id=raw.observation_id,
+        recorded_at=ambiguous_at,
+    )
+
+    resumed = _open(path, JournalOpenMode.RESUME)
+    blocked = resumed.load_recovery_snapshot()
+    assert len(blocked.ambiguous_observations) == 1
+    assert blocked.ambiguous_observations[0].observation == raw
+    assert blocked.ambiguous_observations[0].candidate_client_order_ids == (
+        CANDIDATE_ORDER_ID,
+        ORDER_ID,
+    )
+    assert tuple(item.requirement_id for item in blocked.reconciliation_requirements) == (
+        requirement_id,
+    )
+
+    assessment = _assessment(
+        resumed,
+        _broker_snapshot(
+            include_candidate=True,
+            include_non_candidate=True,
+            snapshot_id="snapshot-ambiguity-commit-integration",
+        ),
+    )
+    assert assessment.result.is_authoritative
+    assert assessment.result.discrepancies == ()
+    request = DurableReconciliationCommitRequest(
+        "commit-ambiguity-integration",
+        ACCOUNT_ID,
+        assessment,
+        assessment.local_snapshot.journal_sequence,
+        expected_order_versions=(
+            ExpectedOrderVersion(ORDER_ID, accepted.version),
+            ExpectedOrderVersion(CANDIDATE_ORDER_ID, candidate.version),
+            ExpectedOrderVersion(NON_CANDIDATE_ORDER_ID, non_candidate.version),
+        ),
+        observation_resolutions=(
+            ObservationResolutionDirective(
+                raw.observation_id,
+                ObservationStatus.AMBIGUOUS,
+                event.event_id,
+                ObservationResolution.BROKER_ORDER_CONFIRMED,
+            ),
+        ),
+        requirement_resolutions=(
+            RequirementResolutionDirective(
+                requirement_id,
+                RequirementResolution.SATISFIED,
+            ),
+        ),
+    )
+    committed = resumed.commit_reconciliation(request)
+    assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
+    assert committed.resolved_observation_ids == (raw.observation_id,)
+    assert committed.resolved_requirement_ids == (requirement_id,)
+    resumed.close()
+
+    forged_path = tmp_path / "ambiguity-resolution-forged.sqlite3"
+    shutil.copyfile(path, forged_path)
+    forged_connection = sqlite3.connect(forged_path)
+    try:
+        forged_connection.execute(
+            """UPDATE live_observation_ambiguity SET candidate_client_order_id = ?
+               WHERE observation_id = ? AND candidate_client_order_id = ?""",
+            (NON_CANDIDATE_ORDER_ID, raw.observation_id, ORDER_ID),
+        )
+        forged_connection.commit()
+    finally:
+        forged_connection.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        observation_resolution = connection.execute(
+            """SELECT commit_id, expected_resolution_status, normalized_event_id
+               FROM live_observation_reconciliation_resolutions
+               WHERE observation_id = ?""",
+            (raw.observation_id,),
+        ).fetchone()
+        requirement_resolution = connection.execute(
+            """SELECT commit_id FROM live_reconciliation_requirement_resolutions
+               WHERE requirement_id = ?""",
+            (requirement_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert observation_resolution == (
+        request.commit_id,
+        ObservationStatus.AMBIGUOUS.value,
+        event.event_id,
+    )
+    assert requirement_resolution == (request.commit_id,)
+
+    reopened = _open(path, JournalOpenMode.RESUME)
+    recovered = reopened.load_recovery_snapshot()
+    verification = verify_recovery_snapshot(recovered)
+    assert recovered.ambiguous_observations == ()
+    assert recovered.reconciliation_requirements == ()
+    assert verification.readiness is RecoveryReadiness.READY
+    assert not verification.may_dispatch
+    assert reopened.load_account_snapshot(ACCOUNT_ID).recovery_blockers == ()
+    reopened.close()
+
+    with pytest.raises(LiveJournalIntegrityError):
+        _open(forged_path, JournalOpenMode.RESUME)
+
+
+def test_ambiguous_resolution_rejects_normalized_event_for_non_candidate(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ambiguity-non-candidate.sqlite3"
+    journal = _open(path, JournalOpenMode.CREATE_NEW)
+    _, accepted = _register_claim_and_accept(journal)
+    claim_request = _claim_request(journal, commit_id="commit-non-candidate-precondition")
+    assert journal.commit_reconciliation(claim_request).disposition is (
+        ReconciliationCommitDisposition.COMMITTED
+    )
+    candidate = _register_and_accept_ambiguity_candidate(journal)
+    non_candidate = _register_and_accept_ambiguity_candidate(
+        journal,
+        order_id=NON_CANDIDATE_ORDER_ID,
+        command_id=NON_CANDIDATE_COMMAND_ID,
+        adapter_sequence=5,
+        limit_price=Decimal("22002"),
+    )
+
+    ambiguous_at = ACCEPTED_AT + timedelta(seconds=5)
+    raw = RawBrokerObservation(
+        "raw-ambiguous-non-candidate-integration",
+        "fake-broker-reply",
+        1,
+        6,
+        ambiguous_at,
+        b"ambiguous-non-candidate-correlation",
+    )
+    assert journal.append_raw_observation(raw).disposition is JournalAppendDisposition.APPENDED
+    event = NormalizedBrokerOrderEvent(
+        "event-ambiguous-non-candidate-integration",
+        ACCOUNT_ID,
+        "TXF-DIFFERENT",
+        BrokerOrderEventType.NEW_ACCEPTED,
+        ambiguous_at,
+        1,
+        6,
+        BrokerCorrelation(
+            1,
+            6,
+            CorrelationStatus.CONFIRMED,
+            ambiguous_at,
+            broker_order_sequence="broker-ambiguous-non-candidate-integration",
+            client_order_id=NON_CANDIDATE_ORDER_ID,
+        ),
+    )
+    application = journal.apply_normalized_event(
+        event,
+        raw_observation_id=raw.observation_id,
+        expected_order_version=non_candidate.version,
+    )
+    assert application.disposition is EventApplicationDisposition.UNRESOLVED
+    requirement_id = journal.load_recovery_snapshot().reconciliation_requirements[0].requirement_id
+    journal.close()
+
+    _convert_conflict_to_ambiguity(
+        path,
+        observation_id=raw.observation_id,
+        recorded_at=ambiguous_at,
+    )
+    resumed = _open(path, JournalOpenMode.RESUME)
+    assessment = _assessment(
+        resumed,
+        _broker_snapshot(
+            include_candidate=True,
+            include_non_candidate=True,
+            snapshot_id="snapshot-ambiguity-non-candidate-integration",
+        ),
+    )
+    request = DurableReconciliationCommitRequest(
+        "commit-ambiguity-non-candidate-integration",
+        ACCOUNT_ID,
+        assessment,
+        assessment.local_snapshot.journal_sequence,
+        expected_order_versions=(
+            ExpectedOrderVersion(ORDER_ID, accepted.version),
+            ExpectedOrderVersion(CANDIDATE_ORDER_ID, candidate.version),
+            ExpectedOrderVersion(NON_CANDIDATE_ORDER_ID, non_candidate.version),
+        ),
+        observation_resolutions=(
+            ObservationResolutionDirective(
+                raw.observation_id,
+                ObservationStatus.AMBIGUOUS,
+                event.event_id,
+                ObservationResolution.BROKER_ORDER_CONFIRMED,
+            ),
+        ),
+        requirement_resolutions=(
+            RequirementResolutionDirective(
+                requirement_id,
+                RequirementResolution.SATISFIED,
+            ),
+        ),
+    )
+    before = resumed.load_recovery_snapshot()
+
+    rejected = resumed.commit_reconciliation(request)
+    after = resumed.load_recovery_snapshot()
+    resumed.close()
+
+    assert rejected.disposition is ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION
+    assert after == before
+    assert after.journal_sequence == request.expected_journal_sequence
+    connection = sqlite3.connect(path)
+    try:
+        durable_writes = tuple(
+            connection.execute(
+                """SELECT
+                       (SELECT count(*) FROM live_reconciliation_commits WHERE commit_id = ?),
+                       (SELECT count(*) FROM live_observation_reconciliation_resolutions
+                          WHERE observation_id = ?),
+                       (SELECT count(*) FROM live_reconciliation_requirement_resolutions
+                          WHERE requirement_id = ?)""",
+                (request.commit_id, raw.observation_id, requirement_id),
+            ).fetchone()
+        )
+    finally:
+        connection.close()
+    assert durable_writes == (0, 0, 0)

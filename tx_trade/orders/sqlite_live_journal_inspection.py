@@ -24,17 +24,46 @@ from .live_journal_inspection_contracts import (
     LiveJournalInspectionReport as _InspectionReport,
 )
 from .sqlite_live_order_journal import (
+    _ConnectionBoundLiveJournalReader,
     DATABASE_SCHEMA_VERSION as _DATABASE_SCHEMA_VERSION,
-    SqliteLiveOrderJournal as _SqliteLiveOrderJournal,
-    _load_read_only_inspection_payload,
+    _unsafe_regular_file,
+    _verify_reserved_path_identity,
+    _verify_trusted_local_parent,
 )
 
-MAX_INSPECTION_MAIN_DATABASE_BYTES = 256 * 1024 * 1024
-MAX_INSPECTION_SIDECAR_BYTES = 256 * 1024 * 1024
+MAX_INSPECTION_MAIN_DATABASE_BYTES = 64 * 1024 * 1024
+MAX_INSPECTION_SERIALIZED_DATABASE_BYTES = 64 * 1024 * 1024
+MAX_INSPECTION_SIDECAR_BYTES = 64 * 1024 * 1024
+MAX_INSPECTION_TOTAL_ROWS = 25_000
+INSPECTION_PROGRESS_OPCODE_INTERVAL = 1_000
+MAX_INSPECTION_PROGRESS_CALLBACKS = 100_000
 
 _SQLITE_CONNECT = sqlite3.connect
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_V1_DURABLE_TABLES = (
+    "live_journal_migrations",
+    "live_journal_identity",
+    "live_journal_records",
+    "live_order_id_reservations",
+    "live_orders",
+    "live_order_history",
+    "live_commands",
+    "live_dispatch_claims",
+    "live_dispatch_receipts",
+    "live_raw_observations",
+    "live_normalized_events",
+    "live_event_applications",
+    "live_fills",
+    "live_observation_ambiguity",
+    "live_reconciliation_requirements",
+)
+_V2_DURABLE_TABLES = _V1_DURABLE_TABLES + (
+    "live_reconciliation_commits",
+    "live_dispatch_claim_resolutions",
+    "live_observation_reconciliation_resolutions",
+    "live_reconciliation_requirement_resolutions",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +111,7 @@ def _snapshot_file(
         return None
     except OSError:
         raise _failure(_FailureCode.SOURCE_UNAVAILABLE) from None
-    if _SqliteLiveOrderJournal._unsafe_file(value):
+    if _unsafe_regular_file(value):
         raise _failure(_FailureCode.ACTIVE_OR_UNCLEAN_SOURCE)
     if value.st_size > maximum_bytes:
         raise _failure(_FailureCode.CAPACITY_EXCEEDED)
@@ -97,7 +126,7 @@ def _snapshot_file(
             raise _failure(_FailureCode.SOURCE_UNAVAILABLE) from None
     try:
         descriptor_stat = os.fstat(descriptor)
-        if _SqliteLiveOrderJournal._unsafe_file(descriptor_stat) or (
+        if _unsafe_regular_file(descriptor_stat) or (
             descriptor_stat.st_dev,
             descriptor_stat.st_ino,
         ) != (value.st_dev, value.st_ino):
@@ -119,7 +148,9 @@ def _snapshot_file(
         if owned_descriptor is not None:
             try:
                 os.close(owned_descriptor)
-            except OSError:
+            except MemoryError:
+                raise
+            except Exception:
                 pass
     return _FileSnapshot(
         value.st_dev,
@@ -211,11 +242,41 @@ def _install_authorizer(connection: sqlite3.Connection) -> None:
                 if first is not None and first.lower() in getter_pragmas and second is None
                 else sqlite3.SQLITE_DENY
             )
-        if action == sqlite3.SQLITE_FUNCTION and second == "load_extension":
+        if (
+            action == sqlite3.SQLITE_FUNCTION
+            and second is not None
+            and second.lower() == "load_extension"
+        ):
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
     connection.set_authorizer(authorize)
+
+
+def _install_progress_budget(connection: sqlite3.Connection) -> None:
+    callbacks = 0
+
+    def progress() -> int:
+        nonlocal callbacks
+        callbacks += 1
+        return int(callbacks >= MAX_INSPECTION_PROGRESS_CALLBACKS)
+
+    connection.set_progress_handler(progress, INSPECTION_PROGRESS_OPCODE_INTERVAL)
+
+
+def _enforce_total_row_budget(
+    connection: sqlite3.Connection,
+    database_schema_version: int,
+) -> None:
+    tables = _V1_DURABLE_TABLES if database_schema_version == 1 else _V2_DURABLE_TABLES
+    total = 0
+    for table in tables:
+        row = connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()
+        if row is None or type(row[0]) is not int or row[0] < 0:
+            raise _failure(_FailureCode.INTEGRITY_FAILURE)
+        total += row[0]
+        if total > MAX_INSPECTION_TOTAL_ROWS:
+            raise _failure(_FailureCode.CAPACITY_EXCEEDED)
 
 
 def _sqlite_failure_code(exc: sqlite3.Error) -> _FailureCode:
@@ -224,7 +285,7 @@ def _sqlite_failure_code(exc: sqlite3.Error) -> _FailureCode:
         primary = code & 0xFF
         if primary in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
             return _FailureCode.ACTIVE_OR_UNCLEAN_SOURCE
-        if primary == sqlite3.SQLITE_FULL:
+        if primary in {sqlite3.SQLITE_FULL, sqlite3.SQLITE_INTERRUPT}:
             return _FailureCode.CAPACITY_EXCEEDED
     return _FailureCode.INTEGRITY_FAILURE
 
@@ -248,7 +309,7 @@ def _bind_connection_to_reserved_source(
         ):
             raise _failure(_FailureCode.INTEGRITY_FAILURE)
         serialized_size = page_count * page_size
-        if serialized_size > MAX_INSPECTION_MAIN_DATABASE_BYTES:
+        if serialized_size > MAX_INSPECTION_SERIALIZED_DATABASE_BYTES:
             raise _failure(_FailureCode.CAPACITY_EXCEEDED)
         if serialized_size != reserved.size:
             raise _failure(_FailureCode.SOURCE_CHANGED)
@@ -259,16 +320,29 @@ def _bind_connection_to_reserved_source(
         raise _failure(_FailureCode.CAPACITY_EXCEEDED) from None
     except (AttributeError, OverflowError, sqlite3.Error):
         raise _failure(_FailureCode.INTEGRITY_FAILURE) from None
-    if (
-        len(serialized) != reserved.size
-        or f"sha256:{sha256(serialized).hexdigest()}" != reserved.content_digest
-    ):
+    if len(serialized) > MAX_INSPECTION_SERIALIZED_DATABASE_BYTES:
+        raise _failure(_FailureCode.CAPACITY_EXCEEDED)
+    if len(serialized) != reserved.size:
+        raise _failure(_FailureCode.SOURCE_CHANGED)
+    if f"sha256:{sha256(serialized).hexdigest()}" != reserved.content_digest:
         raise _failure(_FailureCode.SOURCE_CHANGED)
     return serialized
 
 
 def _open_isolated_inspection_connection(serialized: bytes) -> sqlite3.Connection:
     connection: sqlite3.Connection | None = None
+
+    def close_failed_connection() -> bool:
+        if connection is None:
+            return False
+        try:
+            connection.close()
+        except MemoryError:
+            return True
+        except Exception:
+            pass
+        return False
+
     try:
         if (
             len(serialized) < 100
@@ -284,22 +358,26 @@ def _open_isolated_inspection_connection(serialized: bytes) -> sqlite3.Connectio
         isolated_image[18] = 1
         isolated_image[19] = 1
         connection = _SQLITE_CONNECT(":memory:", isolation_level=None)
-        connection.deserialize(bytes(isolated_image), name="main")
+        connection.deserialize(isolated_image, name="main")
         connection.row_factory = sqlite3.Row
         _install_authorizer(connection)
+        _install_progress_budget(connection)
         connection.execute("BEGIN")
         return connection
     except MemoryError:
-        if connection is not None:
-            connection.close()
+        close_failed_connection()
         raise _failure(_FailureCode.CAPACITY_EXCEEDED) from None
-    except (AttributeError, OverflowError, sqlite3.Error):
-        if connection is not None:
-            connection.close()
+    except sqlite3.Error as exc:
+        if close_failed_connection():
+            raise _failure(_FailureCode.CAPACITY_EXCEEDED) from None
+        raise _failure(_sqlite_failure_code(exc)) from None
+    except (AttributeError, OverflowError):
+        if close_failed_connection():
+            raise _failure(_FailureCode.CAPACITY_EXCEEDED) from None
         raise _failure(_FailureCode.INTEGRITY_FAILURE) from None
 
 
-def inspect_sqlite_live_order_journal(
+def _inspect_sqlite_live_order_journal(
     path: str | Path,
     *,
     account_id: str,
@@ -323,10 +401,8 @@ def inspect_sqlite_live_order_journal(
     primary_error: _LiveJournalInspectionError | None = None
     report: _InspectionReport | None = None
     try:
-        path_validator = object.__new__(_SqliteLiveOrderJournal)
-        path_validator._path = source
         try:
-            path_validator._verify_trusted_parent()
+            _verify_trusted_local_parent(source)
         except _LiveJournalIntegrityError:
             raise _failure(_FailureCode.INVALID_REQUEST) from None
         try:
@@ -335,7 +411,7 @@ def inspect_sqlite_live_order_journal(
             raise _failure(_FailureCode.SOURCE_UNAVAILABLE) from None
         except OSError:
             raise _failure(_FailureCode.SOURCE_UNAVAILABLE) from None
-        if _SqliteLiveOrderJournal._unsafe_file(main_stat):
+        if _unsafe_regular_file(main_stat):
             raise _failure(_FailureCode.INVALID_REQUEST)
         if main_stat.st_size > MAX_INSPECTION_MAIN_DATABASE_BYTES:
             raise _failure(_FailureCode.CAPACITY_EXCEEDED)
@@ -346,7 +422,7 @@ def inspect_sqlite_live_order_journal(
         except OSError:
             raise _failure(_FailureCode.SOURCE_UNAVAILABLE) from None
         try:
-            path_validator._verify_path_identity(descriptor)
+            _verify_reserved_path_identity(source, descriptor)
             resolved = source.resolve(strict=True)
         except (OSError, _LiveJournalIntegrityError):
             raise _failure(_FailureCode.INVALID_REQUEST) from None
@@ -386,30 +462,31 @@ def inspect_sqlite_live_order_journal(
         version = int(inspection_connection.execute("PRAGMA user_version").fetchone()[0])
         if version not in {1, _DATABASE_SCHEMA_VERSION}:
             raise _failure(_FailureCode.INTEGRITY_FAILURE)
-        identity, sequence, snapshot, raw_issue_codes = _load_read_only_inspection_payload(
-            inspection_connection,
-            account_id,
-            version,
-        )
+        reader = _ConnectionBoundLiveJournalReader(inspection_connection)
+        reader.validate_schema(version)
+        _enforce_total_row_budget(inspection_connection, version)
+        payload = reader.load(account_id, version)
         if version == 1:
             report = _build_schema_upgrade_report(
-                identity,
+                payload.identity,
                 account_id,
                 database_schema_version=version,
-                journal_sequence=sequence,
+                journal_sequence=payload.journal_sequence,
             )
         else:
-            if snapshot is None:
+            if payload.snapshot is None:
                 raise _failure(_FailureCode.INTEGRITY_FAILURE)
-            issue_codes = tuple(_IssueCode(code) for code in raw_issue_codes)
+            issue_codes = tuple(_IssueCode(code) for code in payload.issue_codes)
             report = _build_live_journal_inspection_report(
-                snapshot,
+                payload.snapshot,
                 account_id,
                 database_schema_version=version,
                 scoped_issue_codes=issue_codes,
             )
     except _LiveJournalInspectionError as exc:
         primary_error = exc
+    except MemoryError:
+        primary_error = _failure(_FailureCode.CAPACITY_EXCEEDED)
     except _LiveJournalCapacityError:
         primary_error = _failure(_FailureCode.CAPACITY_EXCEEDED)
     except (_LiveJournalIntegrityError, TypeError, ValueError):
@@ -422,21 +499,33 @@ def inspect_sqlite_live_order_journal(
         if inspection_connection is not None:
             try:
                 inspection_connection.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
+            except Exception as exc:
+                if isinstance(exc, MemoryError):
+                    primary_error = _failure(_FailureCode.CAPACITY_EXCEEDED)
+                elif primary_error is None:
+                    primary_error = _failure(_FailureCode.INTEGRITY_FAILURE)
             try:
                 inspection_connection.close()
-            except sqlite3.Error:
-                pass
+            except Exception as exc:
+                if isinstance(exc, MemoryError):
+                    primary_error = _failure(_FailureCode.CAPACITY_EXCEEDED)
+                elif primary_error is None:
+                    primary_error = _failure(_FailureCode.INTEGRITY_FAILURE)
         if source_connection is not None:
             try:
                 source_connection.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
+            except Exception as exc:
+                if isinstance(exc, MemoryError):
+                    primary_error = _failure(_FailureCode.CAPACITY_EXCEEDED)
+                elif primary_error is None:
+                    primary_error = _failure(_FailureCode.INTEGRITY_FAILURE)
             try:
                 source_connection.close()
-            except sqlite3.Error:
-                pass
+            except Exception as exc:
+                if isinstance(exc, MemoryError):
+                    primary_error = _failure(_FailureCode.CAPACITY_EXCEEDED)
+                elif primary_error is None:
+                    primary_error = _failure(_FailureCode.INTEGRITY_FAILURE)
         changed = False
         if before is not None:
             try:
@@ -444,11 +533,18 @@ def inspect_sqlite_live_order_journal(
                 changed = _snapshot_source(source, descriptor) != before
             except _LiveJournalInspectionError:
                 changed = True
+            except MemoryError:
+                primary_error = _failure(_FailureCode.CAPACITY_EXCEEDED)
+            except Exception:
+                changed = True
         if descriptor is not None:
             try:
                 os.close(descriptor)
-            except OSError:
-                pass
+            except Exception as exc:
+                if isinstance(exc, MemoryError):
+                    primary_error = _failure(_FailureCode.CAPACITY_EXCEEDED)
+                elif primary_error is None:
+                    primary_error = _failure(_FailureCode.INTEGRITY_FAILURE)
         if changed:
             primary_error = _failure(_FailureCode.SOURCE_CHANGED)
 
@@ -459,8 +555,23 @@ def inspect_sqlite_live_order_journal(
     return report
 
 
+def inspect_sqlite_live_order_journal(
+    path: str | Path,
+    *,
+    account_id: str,
+) -> _InspectionReport:
+    try:
+        return _inspect_sqlite_live_order_journal(path, account_id=account_id)
+    except MemoryError:
+        raise _failure(_FailureCode.CAPACITY_EXCEEDED) from None
+
+
 __all__ = [
+    "INSPECTION_PROGRESS_OPCODE_INTERVAL",
     "MAX_INSPECTION_MAIN_DATABASE_BYTES",
+    "MAX_INSPECTION_PROGRESS_CALLBACKS",
+    "MAX_INSPECTION_SERIALIZED_DATABASE_BYTES",
     "MAX_INSPECTION_SIDECAR_BYTES",
+    "MAX_INSPECTION_TOTAL_ROWS",
     "inspect_sqlite_live_order_journal",
 ]

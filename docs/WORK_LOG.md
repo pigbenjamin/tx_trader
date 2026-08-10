@@ -842,3 +842,65 @@ Explicit exclusions and remaining Phase 3 work:
   snapshot/copy protocol if desired, output-only CLI composition, a trusted
   assessment source, authorization/audit schema work and query-only broker
   integration.
+
+## 2026-08-10: Phase 3B-5.1 inspection hardening
+
+Completed hardening:
+
+- Enforced 64 MiB limits for both the main database and serialized image, a
+  25,000-row total durable-payload ceiling, and a deterministic SQLite progress
+  budget with a 1,000-opcode interval and at most 100,000 callbacks.
+- All resource-limit and `MemoryError` failures are sanitized as
+  `CAPACITY_EXCEEDED`; a changed source found by the final descriptor hash
+  remains the higher-precedence `SOURCE_CHANGED` result.
+- Added a normal connection-bound read-only reader and stateless path helpers.
+  Inspection no longer uses `object.__new__`; its caller owns the transaction
+  and connection, while the writable journal retains its lifecycle and
+  poisoning semantics.
+- Added complete SQLite authorizer deny/allow behavior coverage, a 16-case
+  account-attribution matrix, a deterministic query-growth gate and
+  fresh-process tests launched by a parent outside the repository.
+- Corrected the attribution fixtures so resolved ambiguity retains two
+  candidates and normalized provenance, then resolves through the public
+  reconciliation commit path. The durable verifier now accepts the legal
+  `UNRESOLVED`-application/ambiguous-raw combination while preserving the
+  existing fail-closed ambiguity cardinality and disposition checks.
+- Added candidate-membership enforcement to both public reconciliation commit
+  and durable reopen verification. A same-account non-candidate event is
+  rejected before writes; forged candidate history fails closed on resume.
+- Tightened the progress-handler boundary and cleanup/final-revalidation
+  `MemoryError` precedence so the documented capacity classification holds
+  even when an earlier integrity error already exists.
+
+Commander validation status:
+
+- Ruff formatter check covered 172 source/test files; Ruff passed.
+- Mypy reported no issues in 72 source files.
+- Focused hardening gate: `150 passed`.
+- Unit suite: `1451 passed, 4 skipped`.
+- Offline integration suite: `122 passed, 1 deselected`.
+- Full default offline suite: `1573 passed, 4 skipped, 6 deselected`.
+
+Validation diagnostics:
+
+- Account-attribution tests initially hit a system-temporary-directory sandbox
+  denial. An accidentally created unauthorized `.pytest_attribution_tmp/`
+  directory was precisely removed and confirmed absent.
+- Fresh-process tests briefly observed a concurrently missing symbol while the
+  shared interface was settling; they passed after the interface stabilized.
+- The first Commander unit run reached 97% before its 120-second outer command
+  timeout; the same suite passed when rerun with a 300-second allowance. No
+  test failure remains.
+- A focused cleanup-fault run first encountered the known system pytest-temp
+  permission denial; rerunning with an isolated permitted temp base passed all
+  98 cases. No product assertion failed.
+
+Boundaries and next work:
+
+- Clean-close/no-sidecar admission, descriptor-bound serialized bytes and the
+  isolated sealed-image transaction remain unchanged.
+- No CLI, WAL snapshot/copy, schema migration, broker/COM integration,
+  credentials, dispatch/resend, receipt/event/fill synthesis or real order was
+  added.
+- The next planned functional slice remains the output-only CLI. Performance
+  batch/stream/RSS benchmarking and a safe WAL snapshot remain deferred.

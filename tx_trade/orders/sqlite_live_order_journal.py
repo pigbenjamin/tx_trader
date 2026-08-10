@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Context, Decimal, localcontext
 from hashlib import sha256
@@ -80,6 +81,7 @@ from .live_reconciliation_commit_contracts import (
     DurableReconciliationCommitRequest,
     DurableReconciliationCommitResult,
     ObservationResolution,
+    ObservationStatus,
     ReconciliationCommitDisposition,
 )
 from .live_reconciliation_projection import project_authoritative_orders
@@ -339,6 +341,50 @@ class _CasMismatch(Exception):
     pass
 
 
+def _unsafe_regular_file(value: os.stat_result) -> bool:
+    reparse = bool(
+        getattr(value, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+    return (
+        stat.S_ISLNK(value.st_mode)
+        or not stat.S_ISREG(value.st_mode)
+        or value.st_nlink != 1
+        or reparse
+    )
+
+
+def _verify_trusted_local_parent(path: Path) -> None:
+    try:
+        parent = path.parent
+        parent_stat = os.lstat(parent)
+        if (
+            stat.S_ISLNK(parent_stat.st_mode)
+            or not stat.S_ISDIR(parent_stat.st_mode)
+            or bool(
+                getattr(parent_stat, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            )
+            or parent.resolve(strict=True) != parent.absolute()
+        ):
+            raise LiveJournalIntegrityError("live journal requires a trusted local directory")
+    except OSError:
+        raise LiveJournalIntegrityError("live journal requires a trusted local directory") from None
+
+
+def _verify_reserved_path_identity(path: Path, descriptor: int) -> None:
+    try:
+        reserved = os.fstat(descriptor)
+        current = os.lstat(path)
+    except OSError:
+        raise LiveJournalIntegrityError("live journal path changed") from None
+    if (
+        _unsafe_regular_file(current)
+        or _unsafe_regular_file(reserved)
+        or (reserved.st_dev, reserved.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise LiveJournalIntegrityError("live journal path changed")
+
+
 class SqliteLiveOrderJournal:
     """One-connection, transactionally fenced live-order journal.
 
@@ -454,49 +500,14 @@ class SqliteLiveOrderJournal:
             raise LiveJournalIntegrityError("live journal could not be opened") from None
 
     def _verify_path_identity(self, descriptor: int) -> None:
-        try:
-            reserved = os.fstat(descriptor)
-            current = os.lstat(self._path)
-        except OSError:
-            raise LiveJournalIntegrityError("live journal path changed") from None
-        if (
-            self._unsafe_file(current)
-            or self._unsafe_file(reserved)
-            or (reserved.st_dev, reserved.st_ino) != (current.st_dev, current.st_ino)
-        ):
-            raise LiveJournalIntegrityError("live journal path changed")
+        _verify_reserved_path_identity(self._path, descriptor)
 
     @staticmethod
     def _unsafe_file(value: os.stat_result) -> bool:
-        reparse = bool(
-            getattr(value, "st_file_attributes", 0)
-            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        )
-        return (
-            stat.S_ISLNK(value.st_mode)
-            or not stat.S_ISREG(value.st_mode)
-            or value.st_nlink != 1
-            or reparse
-        )
+        return _unsafe_regular_file(value)
 
     def _verify_trusted_parent(self) -> None:
-        try:
-            parent = self._path.parent
-            parent_stat = os.lstat(parent)
-            if (
-                stat.S_ISLNK(parent_stat.st_mode)
-                or not stat.S_ISDIR(parent_stat.st_mode)
-                or bool(
-                    getattr(parent_stat, "st_file_attributes", 0)
-                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-                )
-                or parent.resolve(strict=True) != parent.absolute()
-            ):
-                raise LiveJournalIntegrityError("live journal requires a trusted local directory")
-        except OSError:
-            raise LiveJournalIntegrityError(
-                "live journal requires a trusted local directory"
-            ) from None
+        _verify_trusted_local_parent(self._path)
 
     def _verify_sidecars(self) -> None:
         for suffix in ("-wal", "-shm", "-journal"):
@@ -2445,6 +2456,19 @@ class SqliteLiveOrderJournal:
                             is not CorrelationStatus.CONFIRMED
                             or order is None
                             or (
+                                observation_directive.expected_status is ObservationStatus.AMBIGUOUS
+                                and connection.execute(
+                                    """SELECT 1 FROM live_observation_ambiguity
+                                       WHERE observation_id = ?
+                                         AND candidate_client_order_id = ?""",
+                                    (
+                                        observation_directive.observation_id,
+                                        client_order_id,
+                                    ),
+                                ).fetchone()
+                                is None
+                            )
+                            or (
                                 type(resolution_event) is NormalizedBrokerFillEvent
                                 and resolution_event.side is not order.intent.side
                             )
@@ -2979,7 +3003,7 @@ class SqliteLiveOrderJournal:
                     row[8] == EventApplicationDisposition.UNRESOLVED.value
                     and (
                         raw is None
-                        or raw[3] not in {"unresolved", "conflict"}
+                        or raw[3] not in {"unresolved", "conflict", "ambiguous"}
                         or (raw[3] == "conflict" and conflict_requirement is None)
                     )
                 )
@@ -3336,10 +3360,37 @@ class SqliteLiveOrderJournal:
                     else None
                 )
                 provenance = connection.execute(
-                    """SELECT 1 FROM live_normalized_events
+                    """SELECT payload, payload_digest FROM live_normalized_events
                        WHERE raw_observation_id = ? AND event_id = ?""",
                     (row[0], row[4]),
                 ).fetchall()
+                resolution_event = (
+                    cast(
+                        NormalizedBrokerOrderEvent | NormalizedBrokerFillEvent,
+                        _decode(
+                            provenance[0][0],
+                            provenance[0][1],
+                            (NormalizedBrokerOrderEvent, NormalizedBrokerFillEvent),
+                            _EVENT_DOMAIN,
+                        ),
+                    )
+                    if len(provenance) == 1
+                    else None
+                )
+                ambiguity_candidate_matches = row[2] != ObservationStatus.AMBIGUOUS.value or (
+                    resolution_event is not None
+                    and resolution_event.correlation.client_order_id is not None
+                    and connection.execute(
+                        """SELECT 1 FROM live_observation_ambiguity
+                               WHERE observation_id = ?
+                                 AND candidate_client_order_id = ?""",
+                        (
+                            row[0],
+                            resolution_event.correlation.client_order_id,
+                        ),
+                    ).fetchone()
+                    is not None
+                )
                 precondition = _scalar_digest(
                     _OBSERVATION_RECONCILIATION_DOMAIN,
                     {
@@ -3365,6 +3416,7 @@ class SqliteLiveOrderJournal:
                     or observation_directive.resolution.value != row[5]
                     or row[8] != row[2]
                     or len(provenance) != 1
+                    or not ambiguity_candidate_matches
                     or row[3] != precondition
                     or row[7] != resolution_digest
                 ):
@@ -3662,37 +3714,79 @@ class SqliteLiveOrderJournal:
                 raise _sqlite_failure(exc) from None
 
 
-def _load_read_only_inspection_payload(
-    connection: sqlite3.Connection,
-    account_id: str,
-    database_schema_version: int,
-) -> tuple[
-    LiveJournalIdentity,
-    int,
-    LiveJournalRecoverySnapshot | None,
-    tuple[str, ...],
-]:
-    """Reuse the journal verifier/hydrator without exposing a journal instance."""
+@dataclass(frozen=True, slots=True)
+class _ReadOnlyLiveJournalPayload:
+    identity: LiveJournalIdentity
+    journal_sequence: int
+    snapshot: LiveJournalRecoverySnapshot | None
+    issue_codes: tuple[str, ...]
 
-    journal = object.__new__(SqliteLiveOrderJournal)
-    journal._path = Path(":memory:")
-    journal._lock = RLock()
-    journal._closed = False
-    journal._poisoned = False
-    journal._connection = connection
-    journal._validate_schema(database_schema_version)
-    identity = journal._load_identity()
-    journal._identity = identity
-    if database_schema_version == 1:
-        journal._verify_durable_payloads()
-        sequence_row = connection.execute(
-            "SELECT max(journal_sequence) FROM live_journal_records"
-        ).fetchone()
-        sequence = int(sequence_row[0] or 0)
-        return identity, sequence, None, ()
-    snapshot = journal.load_recovery_snapshot()
-    issue_codes = journal._load_inspection_recovery_issue_codes(account_id)
-    return identity, snapshot.journal_sequence, snapshot, issue_codes
+
+class _ConnectionBoundJournalReadView(SqliteLiveOrderJournal):
+    """Normally constructed view that shares the journal's read implementation."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        if not isinstance(connection, sqlite3.Connection):
+            raise TypeError("connection must be sqlite3.Connection")
+        self._path = Path(":memory:")
+        self._lock = RLock()
+        self._closed = False
+        self._poisoned = False
+        self._connection = connection
+
+    @contextmanager
+    def _operation(self) -> Iterator[None]:
+        self._ensure_open()
+        yield
+
+
+class _ConnectionBoundLiveJournalReader:
+    """Read-only facade over a caller-owned SQLite connection."""
+
+    __slots__ = ("_connection", "_view")
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        if not isinstance(connection, sqlite3.Connection):
+            raise TypeError("connection must be sqlite3.Connection")
+        self._connection = connection
+        self._view = _ConnectionBoundJournalReadView(connection)
+
+    def validate_schema(self, database_schema_version: int) -> None:
+        if database_schema_version not in {1, DATABASE_SCHEMA_VERSION}:
+            raise ValueError("database_schema_version is unsupported")
+        self._view._validate_schema(database_schema_version)
+
+    def load(
+        self,
+        account_id: str,
+        database_schema_version: int,
+    ) -> _ReadOnlyLiveJournalPayload:
+        if type(account_id) is not str or not _IDENTIFIER.fullmatch(account_id):
+            raise ValueError("account_id must be a bounded ASCII identifier")
+        if database_schema_version not in {1, DATABASE_SCHEMA_VERSION}:
+            raise ValueError("database_schema_version is unsupported")
+        view = self._view
+        self.validate_schema(database_schema_version)
+        identity = view._load_identity()
+        view._identity = identity
+        if database_schema_version == 1:
+            view._verify_durable_payloads()
+            sequence_row = self._connection.execute(
+                "SELECT max(journal_sequence) FROM live_journal_records"
+            ).fetchone()
+            return _ReadOnlyLiveJournalPayload(
+                identity,
+                int(sequence_row[0] or 0),
+                None,
+                (),
+            )
+        snapshot = view.load_recovery_snapshot()
+        return _ReadOnlyLiveJournalPayload(
+            identity,
+            snapshot.journal_sequence,
+            snapshot,
+            view._load_inspection_recovery_issue_codes(account_id),
+        )
 
 
 __all__ = [
