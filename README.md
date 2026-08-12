@@ -657,3 +657,78 @@ integration, credential access, dispatch, resend, receipt/event/fill synthesis
 or real order. The next planned functional slice remains the output-only CLI;
 performance batch/stream/RSS benchmarking and a safe WAL snapshot remain
 deferred.
+
+## Phase 3B-5.2 output-only live-journal inspection CLI (2026-08-11)
+
+Phase 3B-5.2 exposes the hardened read-only inspector through one output-only
+module command:
+
+```text
+python -B -m tx_trade.live_journal_inspection_cli --journal PATH --account-id ID
+```
+
+This source-tree command is supported only with a trusted Python
+interpreter/virtual environment, a trusted current working directory, and a
+trusted, explicitly controlled `PYTHONPATH` and Python startup environment. Run
+it from the repository root in this currently non-packaged repository; from a
+trusted repo-external working directory, set `PYTHONPATH` explicitly to the
+absolute trusted repository path. `-B` only disables bytecode writes; it is not
+an isolation option. An untrusted current directory, `PYTHONPATH`,
+`sitecustomize`/other startup customization, or shadow package is outside the
+CLI security boundary and must not be used.
+
+The CLI read-only, redaction, no-application-environment-input, and
+no-side-effect guarantees begin only after that trusted Python bootstrap. From
+that point, the command accepts no stdin or JSON evidence input and performs no
+migration, reconciliation commit, broker/COM operation, credential or DLL
+access, dispatch/resend, order/reply synthesis, or journal mutation. If a
+trusted installable distribution is provided in the future, the production
+recommendation is isolated mode:
+
+```text
+python -I -B -m tx_trade.live_journal_inspection_cli --journal PATH --account-id ID
+```
+
+This repository is not currently packaged or installable, and `-I` does not
+make the module importable directly from this source tree.
+
+Successful inspection output is exactly one canonical, ASCII, single-line JSON
+document with `output_schema_version=1`, capped at 256 KiB. Its public allowlist
+redacts account IDs, paths and raw durable IDs; recovery targets use bounded
+opaque IDs. `inspection_digest` and target IDs identify inspection content and
+targets only: they are not authentication tokens. Every report keeps
+`may_dispatch=false` and `commit_allowed=false`.
+
+The frozen process exit mapping is:
+
+- `0`: `ready_no_action`
+- `2`: invalid CLI request
+- `10`: `recovery_required`
+- `11`: `schema_upgrade_required`
+- `12`: `account_not_found`
+- `13`: `blocked_integrity_failure`
+- `20`: typed inspection, internal, or output failure
+
+`--help` also returns `0`, but exits without producing an inspection report.
+All exit codes are diagnostic only and never authorize dispatch or a
+reconciliation commit. Automation must require and validate the versioned
+canonical report rather than treating exit status alone as authorization; a
+valid report still contains `may_dispatch=false` and `commit_allowed=false`.
+
+Current Commander evidence is: format check covered 175 files; Ruff passed;
+mypy passed over 73 source files; the focused CLI gate was `89 passed`; unit
+tests were `1520 passed, 4 skipped`; and offline integration tests were
+`136 passed, 1 deselected`. The final full suite passed with
+`1656 passed, 4 skipped, 6 deselected` in 224.53 seconds. The pytest cache
+warning is limited to the environmental Windows `.pytest_cache` ACL; runs using
+isolated basetemps succeeded.
+
+Phase 3B-5.2 implementation, final correctness fix, and Commander final
+full-suite validation are complete. The correctness, security/permissions, and
+tests/maintainability final delta reviews are complete; no open
+BLOCKER/HIGH/MEDIUM/LOW findings remain, and all reviewers recommend merge. The
+Phase 3B-5.2 Commander quality gate is complete; no commit or merge is claimed.
+Phase 3 remains in progress. The next planned functional slice is the existing
+roadmap item for a trusted assessment source; authorization/audit schema work,
+query-only broker integration, performance benchmarking and a safe WAL
+snapshot/copy protocol remain separately planned or deferred.

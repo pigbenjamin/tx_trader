@@ -502,7 +502,7 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 | Phase 0 專案基線 | 已完成 | 2026-07-25 | 2026-07-27 | fresh Python 3.13.14 環境、依賴、品質檢查與安全測試已驗證 |
 | Phase 1 穩定行情 | 已完成 | 2026-07-26 | 2026-07-28 | 離線驗證與真實 quote-only live smoke 均完成 |
 | Phase 2 Replay/Paper | 已完成 | 2026-07-28 | 2026-07-28 | Phase 2A Replay Runtime 與 Phase 2B-1 至 2B-5 PaperBroker、durable recovery 及 output outbox 已完成 final acceptance |
-| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A、3B-1 至 3B-5 及 3B-5.1 inspection hardening 已完成 Commander gate；尚未建立 CLI、trusted assessment source、COM、live query 或送單 |
+| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A、3B-1 至 3B-5.2 已通過 Commander quality gate；尚未建立 trusted assessment source、COM、live query 或送單 |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
 | Phase 6 營運強化 | 待開始 |  |  |  |
@@ -563,13 +563,13 @@ Phase 0、Phase 1 與 Phase 2 已完成。Phase 3A live-order contracts、Phase
 3B-1 SQLite journal、3B-2 fake-only reconciliation、3B-3 durable
 reconciliation commit/resolution 與 SQLite v1→v2 migration、3B-4
 authoritative recovery projection/operator planning、3B-5 production
-read-only journal inspection library slice，以及 3B-5.1 inspection hardening
-已通過 Commander quality gate。Phase 3 整體仍在進行中。
+read-only journal inspection library slice、3B-5.1 inspection hardening，以及
+3B-5.2 output-only CLI 已通過 Commander quality gate。Phase 3 整體仍在進行中。
 
-下一個 functional slice 是 output-only CLI composition；trusted assessment
-source、具授權與 audit 的 schema 工作及 query-only broker integration 仍須
+下一個 functional slice 是既有 roadmap 中的 trusted assessment source；
+具授權與 audit 的 schema 工作及 query-only broker integration 仍須
 另行規劃。Performance batch/stream/RSS benchmarking 與 safe WAL
-snapshot/copy protocol 維持 deferred。Phase 3B-5.1 不提供 trusted broker
+snapshot/copy protocol 維持 deferred。Phase 3B-5.2 不提供 trusted broker
 evidence source 或 dispatch/commit permission；
 `may_dispatch=False`、`commit_allowed=False`，既有 claim 永不自動 resend，
 也不合成 receipt/event/fill。任何 SKCOM Order／full Reply integration 或真
@@ -1023,3 +1023,54 @@ composition、不讀 live credential、不載入 COM。
   credentials, dispatch/resend, receipt/event/fill synthesis or real order.
 - The next planned functional slice remains the output-only CLI. Performance
   batch/stream/RSS benchmarking and a safe WAL snapshot remain deferred.
+
+### 15.13 Phase 3B-5.2 output-only live-journal inspection CLI（2026-08-11）
+
+- Added the output-only entry point with the exact invocation
+  `python -B -m tx_trade.live_journal_inspection_cli --journal PATH --account-id ID`.
+  Source-tree use is supported only with a trusted interpreter/venv, trusted
+  current working directory, and trusted, explicitly controlled `PYTHONPATH`
+  and Python startup environment. Run it from the repository root, or from a
+  trusted external directory with the absolute trusted repository path set
+  explicitly on `PYTHONPATH`. `-B` only disables bytecode writes and is not
+  isolation; untrusted CWD/`PYTHONPATH`, `sitecustomize` or other startup
+  customization, and shadow packages are outside the CLI security boundary
+  and must not be used.
+- For a future trusted installed distribution, the isolated-mode production
+  recommendation is
+  `python -I -B -m tx_trade.live_journal_inspection_cli --journal PATH --account-id ID`.
+  This repository is currently non-packaged and not installable; `-I` does not
+  make this module available directly from the source tree.
+- The process emits canonical ASCII single-line JSON with
+  `output_schema_version=1` and a 256 KiB cap. The explicit public allowlist
+  redacts account IDs, paths and raw durable IDs; target IDs are bounded and
+  opaque. Neither target IDs nor `inspection_digest` are authentication tokens.
+- The frozen exit mapping is `0` `ready_no_action`, `2` invalid CLI request,
+  `10` `recovery_required`, `11` `schema_upgrade_required`, `12`
+  `account_not_found`, `13` `blocked_integrity_failure`, and `20` typed
+  inspection/internal/output failure. `--help` also returns `0` without an
+  inspection report. Exit codes are diagnostic only and never authorize
+  dispatch or commit. Automation must validate the versioned canonical report,
+  which still has `may_dispatch=false` and `commit_allowed=false`.
+- Only after trusted Python bootstrap, the CLI application is read-only and
+  output-only, takes no application environment input, accepts no stdin or JSON
+  evidence input, and performs no migration, reconciliation commit, journal
+  mutation, broker/COM operation, credential or DLL access, dispatch/resend, or
+  order/reply synthesis. Every report preserves `may_dispatch=false` and
+  `commit_allowed=false`.
+- Current Commander evidence: format check covered 175 files; Ruff passed;
+  mypy passed over 73 source files; the focused gate was `89 passed`; unit tests
+  were `1520 passed, 4 skipped`; and offline integration tests were
+  `136 passed, 1 deselected`. The final full suite passed with
+  `1656 passed, 4 skipped, 6 deselected` in 224.53 seconds. The pytest cache
+  warning is only the environmental Windows `.pytest_cache` ACL;
+  isolated-basetemp runs succeeded.
+- Phase 3B-5.2 implementation, final correctness fix, and Commander final
+  full-suite validation are complete. The correctness, security/permissions,
+  and tests/maintainability final delta reviews are complete; no open
+  BLOCKER/HIGH/MEDIUM/LOW findings remain, and all reviewers recommend merge.
+  The Phase 3B-5.2 Commander quality gate is complete; no commit or merge is
+  claimed. Phase 3 remains in progress. The next planned functional slice is
+  the already documented trusted assessment source. Authorization/audit schema
+  work, query-only broker integration, performance benchmarking and safe WAL
+  snapshot/copy remain separately gated or deferred.

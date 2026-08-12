@@ -904,3 +904,70 @@ Boundaries and next work:
   added.
 - The next planned functional slice remains the output-only CLI. Performance
   batch/stream/RSS benchmarking and a safe WAL snapshot remain deferred.
+
+## 2026-08-11: Phase 3B-5.2 output-only live-journal inspection CLI
+
+Completed implementation:
+
+- Added the exact operator invocation:
+  `python -B -m tx_trade.live_journal_inspection_cli --journal PATH --account-id ID`.
+  Source-tree use is supported only with a trusted interpreter/venv, trusted
+  current working directory, and trusted, explicitly controlled `PYTHONPATH`
+  and Python startup environment. Run it from the repository root, or from a
+  trusted external directory with the absolute trusted repository path set
+  explicitly on `PYTHONPATH`. `-B` only disables bytecode writes and is not
+  isolation; untrusted CWD/`PYTHONPATH`, `sitecustomize` or other startup
+  customization, and shadow packages are outside the CLI security boundary
+  and must not be used.
+- For a future trusted installed distribution, the isolated-mode production
+  recommendation is
+  `python -I -B -m tx_trade.live_journal_inspection_cli --journal PATH --account-id ID`.
+  This repository is currently non-packaged and not installable; `-I` does not
+  make this module available directly from the source tree.
+- Frozen the public output contract as canonical ASCII single-line JSON with
+  `output_schema_version=1` and a 256 KiB cap. The allowlisted document redacts
+  account IDs, paths and raw durable IDs and exposes only bounded opaque target
+  IDs. `inspection_digest` and target IDs are content/target identifiers, not
+  authentication tokens.
+- Frozen exit codes as `0` `ready_no_action`, `2` invalid CLI request, `10`
+  `recovery_required`, `11` `schema_upgrade_required`, `12`
+  `account_not_found`, `13` `blocked_integrity_failure`, and `20` typed
+  inspection/internal/output failure. `--help` also returns `0` without an
+  inspection report. Exit codes are diagnostic only and never authorize
+  dispatch or commit. Automation must validate the versioned canonical report,
+  which still has `may_dispatch=false` and `commit_allowed=false`.
+
+Safety boundaries:
+
+- Only after trusted Python bootstrap, the CLI application is output-only and
+  read-only, takes no application environment input, accepts neither stdin nor
+  JSON evidence input, and performs no migration, reconciliation commit,
+  journal mutation, broker/COM operation, credential or DLL access,
+  dispatch/resend, or order/reply synthesis.
+- The existing clean-close/no-sidecar and sealed-image inspection boundary is
+  unchanged. Every result preserves `may_dispatch=false` and
+  `commit_allowed=false`.
+
+Commander validation status:
+
+- Format check covered 175 files; Ruff passed.
+- Mypy passed over 73 source files.
+- Focused Phase 3B-5.2 gate: `89 passed`.
+- Unit suite: `1520 passed, 4 skipped`.
+- Offline integration suite: `136 passed, 1 deselected`.
+- Final full suite: `1656 passed, 4 skipped, 6 deselected` in 224.53 seconds.
+- The pytest cache warning is environmental and limited to the Windows
+  `.pytest_cache` ACL. Validation with isolated basetemps succeeded.
+
+Status and next work:
+
+- Phase 3B-5.2 implementation, final correctness fix, and Commander final
+  full-suite validation are complete. The correctness, security/permissions,
+  and tests/maintainability final delta reviews are complete; no open
+  BLOCKER/HIGH/MEDIUM/LOW findings remain, and all reviewers recommend merge.
+  The Phase 3B-5.2 Commander quality gate is complete; no commit or merge is
+  claimed. Phase 3 remains in progress.
+- The next planned functional slice remains the existing roadmap item for a
+  trusted assessment source. Authorization/audit schema work, query-only broker
+  integration, performance batch/stream/RSS benchmarking and safe WAL
+  snapshot/copy remain separately gated or deferred.
