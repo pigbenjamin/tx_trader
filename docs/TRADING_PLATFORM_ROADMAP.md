@@ -502,7 +502,7 @@ SKOrderLib/SKReplyLib，不註冊 Order/Reply callback，不連接真實委託�
 | Phase 0 專案基線 | 已完成 | 2026-07-25 | 2026-07-27 | fresh Python 3.13.14 環境、依賴、品質檢查與安全測試已驗證 |
 | Phase 1 穩定行情 | 已完成 | 2026-07-26 | 2026-07-28 | 離線驗證與真實 quote-only live smoke 均完成 |
 | Phase 2 Replay/Paper | 已完成 | 2026-07-28 | 2026-07-28 | Phase 2A Replay Runtime 與 Phase 2B-1 至 2B-5 PaperBroker、durable recovery 及 output outbox 已完成 final acceptance |
-| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A、3B-1 至 3B-5.2 已通過 Commander quality gate；尚未建立 trusted assessment source、COM、live query 或送單 |
+| Phase 3 委託與回報 | 進行中 | 2026-07-29 |  | Phase 3A、3B-1 至 3B-5.2 已通過 Commander quality gate；trusted assessment source 的 implementation、final LOW missing-slot fix、所有 validation 與 reviewer gate 已完成，無 open findings；尚未建立 COM、live query 或送單 |
 | Phase 4 集中式風控 | 待開始 |  |  |  |
 | Phase 5 多策略介面 | 待開始 |  |  |  |
 | Phase 6 營運強化 | 待開始 |  |  |  |
@@ -566,11 +566,15 @@ authoritative recovery projection/operator planning、3B-5 production
 read-only journal inspection library slice、3B-5.1 inspection hardening，以及
 3B-5.2 output-only CLI 已通過 Commander quality gate。Phase 3 整體仍在進行中。
 
-下一個 functional slice 是既有 roadmap 中的 trusted assessment source；
-具授權與 audit 的 schema 工作及 query-only broker integration 仍須
+既有 roadmap 中的 trusted assessment source 已完成 implementation、
+final LOW missing-slot fix、security/test hardening、所有 validation 與 final
+reviewer gate；無 open BLOCKER/HIGH/MEDIUM/LOW findings，所有 reviewers 均
+recommend merge；此 slice 已 commit，但尚未 merge。`SOURCE_CHANGED` semantic
+refinement 僅保留為 optional deferred work。目前未選定下一個 functional
+slice。具授權與 audit 的 schema 工作及 query-only broker integration 仍須
 另行規劃。Performance batch/stream/RSS benchmarking 與 safe WAL
-snapshot/copy protocol 維持 deferred。Phase 3B-5.2 不提供 trusted broker
-evidence source 或 dispatch/commit permission；
+snapshot/copy protocol 維持 deferred。Trusted assessment source 不提供 source
+authentication 或 dispatch/commit permission；
 `may_dispatch=False`、`commit_allowed=False`，既有 claim 永不自動 resend，
 也不合成 receipt/event/fill。任何 SKCOM Order／full Reply integration 或真
 單仍必須另行完成 PLAN PHASE 並取得明確授權。
@@ -1074,3 +1078,49 @@ composition、不讀 live credential、不載入 COM。
   the already documented trusted assessment source. Authorization/audit schema
   work, query-only broker integration, performance benchmarking and safe WAL
   snapshot/copy remain separately gated or deferred.
+
+### 15.14 Trusted assessment source（2026-08-13）
+
+- Added the frozen one-shot API
+  `tx_trade.orders.sqlite_live_reconciliation_assessment.assess_sqlite_live_order_journal(path, *, account_id, broker_snapshot_source, clock) -> InspectedReconciliationAssessment`.
+  It seals and validates the local SQLite journal, then produces redacted
+  inspection provenance and the exact `LocalReconciliationSnapshot` from the
+  same isolated image and transaction.
+- After local validation, the service invokes exactly one atomic
+  `BrokerReconciliationSnapshotSourcePort` bundle selected by the trusted
+  in-process application bootstrap/caller, then locally recomputes the
+  assessment. That caller selection is this slice's only broker-source trust
+  decision. The runtime Protocol proves callable shape only; `snapshot_id` and
+  `source_cursor` enforce internal atomic-bundle consistency only; and the
+  local sealed-image SHA-256 detects local content change and integrity only.
+  None authenticates broker identity or provenance. No signatures or key
+  management were added.
+- Only schema-v2 ready/recovery inspection with the requested account present
+  reaches the broker source. Schema v1, missing-account, integrity, sidecar,
+  and source failures fail closed before a broker call. Aggregate broker
+  observations are capped at 25,000, nested contracts are revalidated against
+  forged frozen values, and failures expose stable sanitized codes.
+- Every result preserves `may_dispatch=False` and `commit_allowed=False`.
+  The API does not authorize resume or commit; the downstream pure planner and
+  separate explicitly authorized commit flow retain their existing checks.
+- No broker adapter/live query, COM/SKCOM, configuration/environment/
+  credential/DLL/network access, stdin/operator JSON evidence, migration or
+  schema change, journal mutation, claim/receipt/commit, dispatch/resend,
+  synthesized receipt/event/fill, cache or retry was added.
+- Current Commander evidence: format check covered 181 files; Ruff passed;
+  mypy passed over 75 source files; focused tests were `317 passed`; unit tests
+  were `1598 passed, 4 skipped`; and offline integration tests were
+  `157 passed, 1 deselected`. All tests use fake broker evidence and local
+  SQLite; they do not prove production broker authentication or querying.
+- The final full suite passed with `1755 passed, 4 skipped, 6 deselected` in
+  366.00 seconds. Implementation, the final LOW missing-slot test fix,
+  security/test hardening and all validation are complete. Correctness and
+  security delta reviews approved with no open findings; tests/maintainability
+  review approved merge. The suggested `SOURCE_CHANGED` semantic refinement
+  remains optional deferred work only. The final reviewer gate is complete
+  with no open BLOCKER/HIGH/MEDIUM/LOW findings, and all reviewers recommend
+  merge. The slice is committed; no merge is claimed. Phase 3 remains in
+  progress. No next functional slice is selected.
+  Authorization/audit schema work and query-only broker integration remain
+  separately gated; performance batch/stream/RSS benchmarking and safe WAL
+  snapshot/copy remain deferred.

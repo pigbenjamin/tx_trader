@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -18,12 +19,15 @@ from .live_journal_inspection import (
     build_schema_upgrade_required_inspection_report as _build_schema_upgrade_report,
 )
 from .live_journal_inspection_contracts import (
+    LiveJournalInspectionDisposition,
     LiveJournalInspectionError as _LiveJournalInspectionError,
     LiveJournalInspectionFailureCode as _FailureCode,
     LiveJournalInspectionIssueCode as _IssueCode,
-    LiveJournalInspectionReport as _InspectionReport,
+    LiveJournalInspectionReport,
 )
+from .live_reconciliation_contracts import LocalReconciliationSnapshot
 from .sqlite_live_order_journal import (
+    _AccountSnapshotAsOfError,
     _ConnectionBoundLiveJournalReader,
     DATABASE_SCHEMA_VERSION as _DATABASE_SCHEMA_VERSION,
     _unsafe_regular_file,
@@ -377,11 +381,12 @@ def _open_isolated_inspection_connection(serialized: bytes) -> sqlite3.Connectio
         raise _failure(_FailureCode.INTEGRITY_FAILURE) from None
 
 
-def _inspect_sqlite_live_order_journal(
+def _inspect_sqlite_live_order_journal_engine(
     path: str | Path,
     *,
     account_id: str,
-) -> _InspectionReport:
+    as_of: datetime | None,
+) -> tuple[LiveJournalInspectionReport, LocalReconciliationSnapshot | None]:
     """Inspect one local journal without exposing a writable journal object."""
 
     if (
@@ -399,7 +404,8 @@ def _inspect_sqlite_live_order_journal(
     inspection_connection: sqlite3.Connection | None = None
     before: tuple[_FileSnapshot | None, ...] | None = None
     primary_error: _LiveJournalInspectionError | None = None
-    report: _InspectionReport | None = None
+    report: LiveJournalInspectionReport | None = None
+    account_snapshot: LocalReconciliationSnapshot | None = None
     try:
         try:
             _verify_trusted_local_parent(source)
@@ -483,6 +489,19 @@ def _inspect_sqlite_live_order_journal(
                 database_schema_version=version,
                 scoped_issue_codes=issue_codes,
             )
+            if as_of is not None and report.disposition in {
+                LiveJournalInspectionDisposition.READY_NO_ACTION,
+                LiveJournalInspectionDisposition.RECOVERY_REQUIRED,
+            }:
+                try:
+                    account_snapshot = reader.load_account_snapshot(account_id, as_of)
+                except _AccountSnapshotAsOfError:
+                    raise _failure(_FailureCode.INVALID_REQUEST) from None
+                if (
+                    account_snapshot.account_id != report.account_id
+                    or account_snapshot.journal_sequence != report.journal_sequence
+                ):
+                    raise _failure(_FailureCode.INTEGRITY_FAILURE)
     except _LiveJournalInspectionError as exc:
         primary_error = exc
     except MemoryError:
@@ -552,14 +571,45 @@ def _inspect_sqlite_live_order_journal(
         raise primary_error
     if report is None:
         raise _failure(_FailureCode.INTEGRITY_FAILURE)
-    return report
+    return report, account_snapshot
+
+
+def _inspect_sqlite_live_order_journal(
+    path: str | Path,
+    *,
+    account_id: str,
+) -> LiveJournalInspectionReport:
+    return _inspect_sqlite_live_order_journal_engine(
+        path,
+        account_id=account_id,
+        as_of=None,
+    )[0]
+
+
+def _inspect_sqlite_live_order_journal_with_account_snapshot(
+    path: str | Path,
+    *,
+    account_id: str,
+    as_of: datetime,
+) -> tuple[LiveJournalInspectionReport, LocalReconciliationSnapshot | None]:
+    if (
+        type(as_of) is not datetime
+        or as_of.tzinfo is None
+        or as_of.utcoffset() != timezone.utc.utcoffset(as_of)
+    ):
+        raise _failure(_FailureCode.INVALID_REQUEST)
+    return _inspect_sqlite_live_order_journal_engine(
+        path,
+        account_id=account_id,
+        as_of=as_of,
+    )
 
 
 def inspect_sqlite_live_order_journal(
     path: str | Path,
     *,
     account_id: str,
-) -> _InspectionReport:
+) -> LiveJournalInspectionReport:
     try:
         return _inspect_sqlite_live_order_journal(path, account_id=account_id)
     except MemoryError:

@@ -16,10 +16,15 @@ PHASE3A_MODULES = (
     "tx_trade.broker.capital.trading_contracts",
     "tx_trade.broker.capital.reply_parser",
 )
+TRUSTED_ASSESSMENT_MODULES = (
+    "tx_trade.orders.live_reconciliation_assessment_contracts",
+    "tx_trade.orders.sqlite_live_reconciliation_assessment",
+)
 RUNTIME_PERSISTENCE_MODULES = frozenset(
     {
         "tx_trade.orders.sqlite_live_journal_inspection",
         "tx_trade.orders.sqlite_live_order_journal",
+        "tx_trade.orders.sqlite_live_reconciliation_assessment",
     }
 )
 BROKER_RUNTIME_MODULES = frozenset(
@@ -111,6 +116,48 @@ _ORDER_SDK_NAME_PARTS = (
     "SendFutureOrder",
     "SendOrder",
 )
+_TRUSTED_MUTATION_NAME_PARTS = (
+    "claim",
+    "commit",
+    "dispatch",
+    "migrate",
+    "receipt",
+    "resend",
+    "write",
+)
+_PURE_TRUSTED_FORBIDDEN_IMPORT_PREFIXES = (
+    "io",
+    "json",
+    "os",
+    "pathlib",
+    "shutil",
+    "sqlite3",
+    "sys",
+    "tempfile",
+    "tx_trade.broker",
+    "tx_trade.orders.live_operator_recovery",
+    "tx_trade.orders.live_reconciliation",
+    "tx_trade.orders.sqlite_live_journal_inspection",
+    "tx_trade.orders.sqlite_live_order_journal",
+    "tx_trade.orders.sqlite_live_reconciliation_assessment",
+)
+_RUNTIME_TRUSTED_APPROVED_SQLITE_IMPORTS = frozenset(
+    {
+        "tx_trade.orders.sqlite_live_journal_inspection",
+        "tx_trade.orders.sqlite_live_order_journal",
+    }
+)
+_TRUSTED_EXTERNAL_IMPORT_PREFIXES = (
+    "aiohttp",
+    "ftplib",
+    "paramiko",
+    "skcom",
+    "smtplib",
+    "ssl",
+    "subprocess",
+    "urllib3",
+    "websockets",
+)
 
 
 def _production_paths() -> tuple[Path, ...]:
@@ -128,7 +175,7 @@ def _production_modules() -> tuple[str, ...]:
         if parts[-1] == "__init__":
             parts = parts[:-1]
         modules.append(".".join(parts))
-    return tuple(modules)
+    return tuple(dict.fromkeys((*modules, *TRUSTED_ASSESSMENT_MODULES)))
 
 
 def _is_forbidden_import(module_name: str) -> bool:
@@ -147,6 +194,100 @@ def _resolved_name(node: ast.expr, bindings: dict[str, str]) -> str | None:
     if isinstance(node, ast.Call):
         return _resolved_name(node.func, bindings)
     return None
+
+
+def _module_imports(tree: ast.AST) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    imports = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend((alias.name, ()) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module is None and node.level == 1:
+                imports.extend((f"tx_trade.orders.{alias.name}", ()) for alias in node.names)
+            elif node.module is not None:
+                module_name = node.module
+                if node.level == 1:
+                    module_name = f"tx_trade.orders.{module_name}"
+                imports.append((module_name, tuple(alias.name for alias in node.names)))
+    return tuple(imports)
+
+
+def _trusted_source_violations(source: str, *, runtime: bool) -> set[str]:
+    tree = ast.parse(source)
+    violations = _safety_violations(source, allow_runtime_io=runtime)
+    imports = _module_imports(tree)
+
+    for module_name, imported_names in imports:
+        if any(
+            module_name == prefix or module_name.startswith(f"{prefix}.")
+            for prefix in _TRUSTED_EXTERNAL_IMPORT_PREFIXES
+        ):
+            violations.add(f"trusted-import:{module_name}")
+        module_parts = module_name.lower().split(".")
+        if any(
+            part in {"config", "configuration", "credentials", "environment"}
+            or "credential" in part
+            or "password" in part
+            for part in module_parts
+        ):
+            violations.add(f"trusted-import:{module_name}")
+        if any(part in module_parts[-1] for part in _TRUSTED_MUTATION_NAME_PARTS):
+            violations.add(f"mutation-import:{module_name}")
+        if runtime:
+            if module_name == "tx_trade.broker" or module_name.startswith("tx_trade.broker."):
+                violations.add(f"trusted-import:{module_name}")
+            if (
+                module_name.startswith("tx_trade.orders.sqlite_live_")
+                and module_name not in _RUNTIME_TRUSTED_APPROVED_SQLITE_IMPORTS
+            ):
+                violations.add(f"trusted-import:{module_name}")
+        elif any(
+            module_name == prefix or module_name.startswith(f"{prefix}.")
+            for prefix in _PURE_TRUSTED_FORBIDDEN_IMPORT_PREFIXES
+        ):
+            violations.add(f"trusted-import:{module_name}")
+
+        for imported_name in imported_names:
+            if "skcom" in imported_name.lower():
+                violations.add(f"trusted-import:{module_name}.{imported_name}")
+            if any(part in imported_name.lower() for part in _TRUSTED_MUTATION_NAME_PARTS):
+                violations.add(f"mutation-import:{module_name}.{imported_name}")
+
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                bindings[local_name] = alias.name if alias.asname else local_name
+        elif isinstance(node, ast.ImportFrom):
+            module_name = node.module
+            if node.level == 1:
+                module_name = "tx_trade.orders" + (
+                    f".{module_name}" if module_name is not None else ""
+                )
+            if module_name is not None:
+                for alias in node.names:
+                    bindings[alias.asname or alias.name] = f"{module_name}.{alias.name}"
+
+    for node in ast.walk(tree):
+        resolved = _resolved_name(node, bindings) if isinstance(node, ast.expr) else None
+        if isinstance(node, ast.Call) and resolved in {
+            "builtins.input",
+            "input",
+            "json.load",
+            "json.loads",
+        }:
+            violations.add(f"operator-input:{resolved}")
+        if isinstance(node, ast.Attribute) and resolved == "sys.stdin":
+            violations.add("operator-input:sys.stdin")
+        if resolved is not None and "skcom" in resolved.lower():
+            violations.add(f"broker-runtime-symbol:{resolved}")
+        if isinstance(node, (ast.Call, ast.Attribute)) and resolved is not None:
+            member = resolved.rsplit(".", maxsplit=1)[-1].lower()
+            if any(part in member for part in _TRUSTED_MUTATION_NAME_PARTS):
+                violations.add(f"mutation-symbol:{resolved}")
+
+    return violations
 
 
 def _safety_violations(
@@ -330,6 +471,33 @@ def test_phase3_sources_have_no_external_integration_dependencies() -> None:
         assert violations == set(), f"{path}: {sorted(violations)}"
 
 
+def test_trusted_assessment_modules_are_explicit_fresh_import_targets() -> None:
+    modules = _production_modules()
+
+    assert set(TRUSTED_ASSESSMENT_MODULES) <= set(modules)
+    assert all(modules.count(module_name) == 1 for module_name in TRUSTED_ASSESSMENT_MODULES)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "runtime"),
+    [
+        ("tx_trade.orders.live_reconciliation_assessment_contracts", False),
+        ("tx_trade.orders.sqlite_live_reconciliation_assessment", True),
+    ],
+)
+def test_trusted_assessment_sources_preserve_read_only_boundaries(
+    module_name: str,
+    runtime: bool,
+) -> None:
+    path = Path(*module_name.split(".")).with_suffix(".py")
+    violations = _trusted_source_violations(
+        path.read_text(encoding="utf-8"),
+        runtime=runtime,
+    )
+
+    assert violations == set(), f"{path}: {sorted(violations)}"
+
+
 def test_production_path_enumeration_includes_future_capital_and_live_modules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,6 +577,52 @@ def open_journal(path):
     return sqlite3.connect(path), descriptor
 """
     assert _safety_violations(source, allow_runtime_io=True) == set()
+
+
+@pytest.mark.parametrize(
+    ("source", "runtime", "expected"),
+    [
+        ("import sqlite3", False, "trusted-import:sqlite3"),
+        ("import json as codec\ncodec.loads(raw)", False, "operator-input:json.loads"),
+        ("import sys\nline = sys.stdin.readline()", False, "operator-input:sys.stdin"),
+        (
+            "from .live_reconciliation_commit_contracts import ReconciliationCommitRequest",
+            False,
+            "mutation-import:tx_trade.orders.live_reconciliation_commit_contracts",
+        ),
+        (
+            "from tx_trade.broker.capital.quote_adapter import CapitalQuoteStaAdapter",
+            True,
+            "trusted-import:tx_trade.broker.capital.quote_adapter",
+        ),
+        (
+            "journal.claim_dispatch(command)",
+            True,
+            "mutation-symbol:journal.claim_dispatch",
+        ),
+        ("sdk.SKCOMLib.SendOrder(order)", True, "broker-runtime-symbol:sdk.SKCOMLib"),
+        ("import app.credentials", True, "trusted-import:app.credentials"),
+        ("import websockets", True, "trusted-import:websockets"),
+    ],
+)
+def test_trusted_source_scanner_rejects_hostile_fragments(
+    source: str,
+    runtime: bool,
+    expected: str,
+) -> None:
+    assert expected in _trusted_source_violations(source, runtime=runtime)
+
+
+def test_trusted_runtime_scanner_allows_only_approved_sqlite_read_sources() -> None:
+    source = """
+from . import sqlite_live_journal_inspection
+from .sqlite_live_order_journal import SQLiteLiveOrderJournal
+
+inspection = sqlite_live_journal_inspection.inspect_live_journal(source_path)
+journal = SQLiteLiveOrderJournal
+"""
+
+    assert _trusted_source_violations(source, runtime=True) == set()
 
 
 def test_future_capital_module_does_not_inherit_broker_runtime_allowance() -> None:

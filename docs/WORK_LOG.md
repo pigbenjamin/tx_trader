@@ -971,3 +971,64 @@ Status and next work:
   trusted assessment source. Authorization/audit schema work, query-only broker
   integration, performance batch/stream/RSS benchmarking and safe WAL
   snapshot/copy remain separately gated or deferred.
+
+## 2026-08-13: Trusted assessment source
+
+Completed implementation:
+
+- Added the frozen one-shot application API
+  `tx_trade.orders.sqlite_live_reconciliation_assessment.assess_sqlite_live_order_journal(path, *, account_id, broker_snapshot_source, clock) -> InspectedReconciliationAssessment`.
+- The API seals and validates the SQLite local journal and derives both
+  redacted inspection provenance and the exact `LocalReconciliationSnapshot`
+  from the same isolated image and transaction. It then calls one injected
+  atomic `BrokerReconciliationSnapshotSourcePort` bundle and locally
+  recomputes the assessment.
+- The trusted in-process application bootstrap/caller selects the broker
+  source; that selection is this slice's only broker-source trust decision.
+  The runtime Protocol proves callable shape only. `snapshot_id` and
+  `source_cursor` enforce internal atomic-bundle consistency only. The local
+  sealed-image SHA-256 detects local content change and integrity only. None
+  authenticates broker identity or provenance. No cryptographic signatures or
+  key management were added.
+- Only schema-v2 ready/recovery results for an existing account proceed to the
+  broker query. Schema v1, account missing, integrity, sidecar, and source
+  failures stop before the broker call. Aggregate broker observations are
+  capped at 25,000; nested broker contracts are revalidated against forged
+  frozen values; public failures use stable sanitized codes.
+
+Safety boundaries:
+
+- Every result has `may_dispatch=False` and `commit_allowed=False`. This API
+  does not authorize resume or reconciliation commit. The downstream pure
+  planner and the separate explicitly authorized durable commit flow keep
+  their existing checks.
+- No broker adapter or live query, COM/SKCOM, configuration/environment/
+  credential/DLL/network access, stdin/operator JSON evidence, migration or
+  schema change, journal mutation, claim/receipt/commit, dispatch/resend,
+  synthesized receipt/event/fill, cache or retry was added or exercised.
+- All tests use fake broker evidence and local SQLite. They are not evidence of
+  production broker authentication or a production broker query.
+
+Commander validation status:
+
+- Format check covered 181 files; Ruff passed.
+- Mypy passed over 75 source files.
+- Focused trusted-assessment-source gate: `317 passed`.
+- Unit suite: `1598 passed, 4 skipped`.
+- Offline integration suite: `157 passed, 1 deselected`.
+- Final full suite: `1755 passed, 4 skipped, 6 deselected` in 366.00 seconds.
+- Implementation, the final LOW missing-slot test fix, security/test hardening
+  and all validation are complete.
+- Correctness and security delta reviews approved with no open findings;
+  tests/maintainability review approved merge. The suggested `SOURCE_CHANGED`
+  semantic refinement remains optional deferred work only.
+- The final reviewer gate is complete with no open
+  BLOCKER/HIGH/MEDIUM/LOW findings, and all reviewers recommend merge. The
+  slice is committed; no merge is claimed.
+
+Status and next work:
+
+- Phase 3 remains in progress. No next functional slice has been selected.
+- Authorization/audit schema work and query-only broker integration remain
+  separately gated. Performance batch/stream/RSS benchmarking and safe WAL
+  snapshot/copy remain deferred.
