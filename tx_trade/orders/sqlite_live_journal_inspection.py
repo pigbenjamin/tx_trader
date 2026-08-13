@@ -68,6 +68,7 @@ _V2_DURABLE_TABLES = _V1_DURABLE_TABLES + (
     "live_observation_reconciliation_resolutions",
     "live_reconciliation_requirement_resolutions",
 )
+_V3_DURABLE_TABLES = _V2_DURABLE_TABLES + ("live_reconciliation_commit_authorizations",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +273,11 @@ def _enforce_total_row_budget(
     connection: sqlite3.Connection,
     database_schema_version: int,
 ) -> None:
-    tables = _V1_DURABLE_TABLES if database_schema_version == 1 else _V2_DURABLE_TABLES
+    tables = {
+        1: _V1_DURABLE_TABLES,
+        2: _V2_DURABLE_TABLES,
+        3: _V3_DURABLE_TABLES,
+    }[database_schema_version]
     total = 0
     for table in tables:
         row = connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()
@@ -466,13 +471,13 @@ def _inspect_sqlite_live_order_journal_engine(
 
         inspection_connection = _open_isolated_inspection_connection(serialized)
         version = int(inspection_connection.execute("PRAGMA user_version").fetchone()[0])
-        if version not in {1, _DATABASE_SCHEMA_VERSION}:
+        if version not in {1, 2, _DATABASE_SCHEMA_VERSION}:
             raise _failure(_FailureCode.INTEGRITY_FAILURE)
         reader = _ConnectionBoundLiveJournalReader(inspection_connection)
         reader.validate_schema(version)
         _enforce_total_row_budget(inspection_connection, version)
         payload = reader.load(account_id, version)
-        if version == 1:
+        if version in {1, 2}:
             report = _build_schema_upgrade_report(
                 payload.identity,
                 account_id,

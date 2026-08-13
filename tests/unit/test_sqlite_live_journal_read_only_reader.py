@@ -7,7 +7,11 @@ import sqlite3
 import pytest
 
 import tx_trade.orders.sqlite_live_journal_inspection as inspection_module
-from tests.support.live_journal_inspection_scenarios import create_frozen_v1, create_v2
+from tests.support.live_journal_inspection_scenarios import (
+    create_frozen_v1,
+    create_frozen_v2,
+    create_v2 as create_current,
+)
 from tx_trade.orders.live_journal_contracts import LiveJournalIntegrityError
 from tx_trade.orders.live_journal_inspection_contracts import (
     LiveJournalInspectionError,
@@ -15,6 +19,7 @@ from tx_trade.orders.live_journal_inspection_contracts import (
 )
 from tx_trade.orders.sqlite_live_journal_inspection import _install_authorizer
 from tx_trade.orders.sqlite_live_order_journal import (
+    DATABASE_SCHEMA_VERSION,
     _ConnectionBoundLiveJournalReader,
     _ReadOnlyLiveJournalPayload,
 )
@@ -50,7 +55,7 @@ def test_isolated_begin_progress_interrupt_is_capacity_exceeded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "journal.sqlite3"
-    create_v2(path)
+    create_current(path)
     monkeypatch.setattr(inspection_module, "INSPECTION_PROGRESS_OPCODE_INTERVAL", 1)
     monkeypatch.setattr(inspection_module, "MAX_INSPECTION_PROGRESS_CALLBACKS", 0)
 
@@ -70,14 +75,14 @@ def _connection(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def test_reader_loads_v2_without_owning_transaction_or_connection(tmp_path: Path) -> None:
+def test_reader_loads_v3_without_owning_transaction_or_connection(tmp_path: Path) -> None:
     path = tmp_path / "journal.sqlite3"
-    create_v2(path, orders=(("account-a", "order-a", "command-a"),))
+    create_current(path, orders=(("account-a", "order-a", "command-a"),))
     connection = _connection(path)
     try:
         reader = _ConnectionBoundLiveJournalReader(connection)
 
-        payload = reader.load("account-a", 2)
+        payload = reader.load("account-a", DATABASE_SCHEMA_VERSION)
 
         assert type(payload) is _ReadOnlyLiveJournalPayload
         assert payload.snapshot is not None
@@ -92,14 +97,22 @@ def test_reader_loads_v2_without_owning_transaction_or_connection(tmp_path: Path
         connection.close()
 
 
-def test_reader_loads_frozen_v1_without_querying_v2_tables(tmp_path: Path) -> None:
-    path = tmp_path / "journal-v1.sqlite3"
-    create_frozen_v1(path)
+@pytest.mark.parametrize(
+    ("version", "create_legacy"),
+    ((1, create_frozen_v1), (2, create_frozen_v2)),
+)
+def test_reader_loads_legacy_schema_for_upgrade_only(
+    tmp_path: Path,
+    version: int,
+    create_legacy,
+) -> None:
+    path = tmp_path / f"journal-v{version}.sqlite3"
+    create_legacy(path)
     connection = _connection(path)
     try:
-        payload = _ConnectionBoundLiveJournalReader(connection).load("account-a", 1)
+        payload = _ConnectionBoundLiveJournalReader(connection).load("account-a", version)
 
-        assert payload.identity.schema_version == 1
+        assert payload.identity.schema_version == version
         assert payload.snapshot is None
         assert payload.issue_codes == ()
         assert connection.in_transaction is False
@@ -111,7 +124,7 @@ def test_reader_integrity_failure_does_not_rollback_or_close_caller(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "journal.sqlite3"
-    create_v2(path, orders=(("account-a", "order-a", "command-a"),))
+    create_current(path, orders=(("account-a", "order-a", "command-a"),))
     writable = sqlite3.connect(path)
     try:
         writable.execute(
@@ -128,7 +141,7 @@ def test_reader_integrity_failure_does_not_rollback_or_close_caller(
         reader = _ConnectionBoundLiveJournalReader(connection)
 
         with pytest.raises(LiveJournalIntegrityError):
-            reader.load("account-a", 2)
+            reader.load("account-a", DATABASE_SCHEMA_VERSION)
 
         assert connection.in_transaction is True
         assert connection.execute("SELECT 1").fetchone()[0] == 1

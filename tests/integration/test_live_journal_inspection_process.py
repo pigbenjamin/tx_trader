@@ -19,6 +19,7 @@ from tx_trade.orders.sqlite_live_order_journal import SqliteLiveOrderJournal
 from tests.support.live_journal_inspection_scenarios import (
     NOW,
     create_frozen_v1,
+    create_frozen_v2,
     create_v2_with_claim,
 )
 
@@ -79,7 +80,7 @@ if sys.argv[3] == "poison":
     for method_name in (
         "claim_dispatch",
         "record_dispatch_receipt",
-        "commit_reconciliation",
+        "commit_authorized_reconciliation",
     ):
         setattr(SqliteLiveOrderJournal, method_name, forbidden_runtime_path)
 
@@ -197,26 +198,32 @@ def test_fresh_process_inspection_is_independent_of_parent_cwd(
         assert REPOSITORY_ROOT not in directory.parents
         v1_path = directory / "fresh-process-v1.sqlite3"
         v2_path = directory / "fresh-process-v2.sqlite3"
+        v3_path = directory / "fresh-process-v3.sqlite3"
         _create_v1(v1_path)
-        _create_v2(v2_path)
+        create_frozen_v2(v2_path)
+        _create_v2(v3_path)
         before = _snapshot(directory)
         with monkeypatch.context() as cwd_patch:
             cwd_patch.chdir(directory)
             v1_result, v1_output = _run_inspection(v1_path, poison=True)
             v2_result, v2_output = _run_inspection(v2_path, poison=True)
+            v3_result, v3_output = _run_inspection(v3_path, poison=True)
 
         assert v1_result["database_schema_version"] == 1
         assert v1_result["disposition"] == "schema_upgrade_required"
         assert v2_result["database_schema_version"] == 2
-        assert v2_result["disposition"] == "recovery_required"
+        assert v2_result["disposition"] == "schema_upgrade_required"
+        assert v3_result["database_schema_version"] == 3
+        assert v3_result["disposition"] == "recovery_required"
         assert _snapshot(directory) == before
-        assert set(before) == {v1_path.name, v2_path.name}
+        assert set(before) == {v1_path.name, v2_path.name, v3_path.name}
         _assert_no_canaries(v1_output, v1_path)
         assert FROZEN_V1_IDENTITY_CANARY not in v1_output
         _assert_no_canaries(v2_output, v2_path)
+        _assert_no_canaries(v3_output, v3_path)
 
 
-def test_fresh_process_clean_v2_is_deterministic_and_read_only(tmp_path: Path) -> None:
+def test_fresh_process_clean_v3_is_deterministic_and_read_only(tmp_path: Path) -> None:
     path = tmp_path / f"{PATH_CANARY}.sqlite3"
     _create_v2(path)
     before = _snapshot(tmp_path)
@@ -226,7 +233,7 @@ def test_fresh_process_clean_v2_is_deterministic_and_read_only(tmp_path: Path) -
     second, second_output = _run_inspection(path, poison=True)
 
     assert first == second
-    assert first["database_schema_version"] == 2
+    assert first["database_schema_version"] == 3
     assert first["disposition"] == "recovery_required"
     assert first["may_dispatch"] is False
     assert first["commit_allowed"] is False

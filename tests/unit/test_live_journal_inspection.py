@@ -111,8 +111,8 @@ def _claim(order, token: str = "secret-token") -> OutstandingDispatchClaim:
 def test_ready_and_account_not_found_are_account_scoped() -> None:
     snapshot = _snapshot(orders=(_order("account-b", "order-b"),))
 
-    found = build_live_journal_inspection_report(snapshot, "account-b", database_schema_version=2)
-    missing = build_live_journal_inspection_report(snapshot, "account-a", database_schema_version=2)
+    found = build_live_journal_inspection_report(snapshot, "account-b", database_schema_version=3)
+    missing = build_live_journal_inspection_report(snapshot, "account-a", database_schema_version=3)
 
     assert found.disposition is LiveJournalInspectionDisposition.READY_NO_ACTION
     assert found.issue_codes == ()
@@ -124,7 +124,7 @@ def test_pending_and_claim_targets_are_redacted_and_canonical() -> None:
     pending = _order("account-a", "durable-order", "durable-command")
     snapshot = _snapshot(orders=(pending,), claims=(_claim(pending),))
 
-    report = build_live_journal_inspection_report(snapshot, "account-a", database_schema_version=2)
+    report = build_live_journal_inspection_report(snapshot, "account-a", database_schema_version=3)
 
     assert report.disposition is LiveJournalInspectionDisposition.RECOVERY_REQUIRED
     assert report.issue_codes == (
@@ -156,7 +156,7 @@ def test_permutations_and_claim_secrets_do_not_change_report() -> None:
     report = build_live_journal_inspection_report(
         _snapshot(orders=(first, second), claims=claims),
         "account-a",
-        database_schema_version=2,
+        database_schema_version=3,
     )
     permuted = build_live_journal_inspection_report(
         _snapshot(
@@ -164,7 +164,7 @@ def test_permutations_and_claim_secrets_do_not_change_report() -> None:
             claims=(_claim(second, "changed-2"), _claim(first, "changed-1")),
         ),
         "account-a",
-        database_schema_version=2,
+        database_schema_version=3,
     )
 
     assert report == permuted
@@ -175,12 +175,12 @@ def test_other_account_valid_work_does_not_affect_selected_report() -> None:
     foreign = _order("account-b", "order-b", "command-b")
 
     baseline = build_live_journal_inspection_report(
-        _snapshot(orders=(selected,)), "account-a", database_schema_version=2
+        _snapshot(orders=(selected,)), "account-a", database_schema_version=3
     )
     with_foreign_work = build_live_journal_inspection_report(
         _snapshot(orders=(selected, foreign), claims=(_claim(foreign),)),
         "account-a",
-        database_schema_version=2,
+        database_schema_version=3,
     )
 
     assert baseline == with_foreign_work
@@ -203,7 +203,7 @@ def test_scoped_recovery_issue_overrides_missing_account(
     report = build_live_journal_inspection_report(
         snapshot,
         "account-a",
-        database_schema_version=2,
+        database_schema_version=3,
         scoped_issue_codes=(scoped_issue,),
     )
 
@@ -222,7 +222,7 @@ def test_scoped_status_code_is_rejected() -> None:
         build_live_journal_inspection_report(
             snapshot,
             "account-a",
-            database_schema_version=2,
+            database_schema_version=3,
             scoped_issue_codes=(LiveJournalInspectionIssueCode.INTEGRITY_FAILURE,),
         )
 
@@ -231,7 +231,7 @@ def test_blocked_verification_has_only_generic_integrity_failure() -> None:
     order = _order("account-a", "order-a")
     object.__setattr__(order, "version", 0)
     report = build_live_journal_inspection_report(
-        _snapshot(orders=(order,)), "account-a", database_schema_version=2
+        _snapshot(orders=(order,)), "account-a", database_schema_version=3
     )
 
     assert report.disposition is LiveJournalInspectionDisposition.BLOCKED_INTEGRITY_FAILURE
@@ -262,7 +262,7 @@ def test_large_valid_aggregate_snapshot_builds_recovery_report() -> None:
     report = build_live_journal_inspection_report(
         snapshot,
         "account-a",
-        database_schema_version=2,
+        database_schema_version=3,
         scoped_issue_codes=(LiveJournalInspectionIssueCode.UNRESOLVED_OBSERVATION,),
     )
 
@@ -277,10 +277,10 @@ def test_target_change_changes_opaque_target_and_digest() -> None:
     second = _order("account-a", "order-a", "command-b")
 
     first_report = build_live_journal_inspection_report(
-        _snapshot(orders=(first,)), "account-a", database_schema_version=2
+        _snapshot(orders=(first,)), "account-a", database_schema_version=3
     )
     second_report = build_live_journal_inspection_report(
-        _snapshot(orders=(second,)), "account-a", database_schema_version=2
+        _snapshot(orders=(second,)), "account-a", database_schema_version=3
     )
 
     assert first_report.targets[0].target_id != second_report.targets[0].target_id
@@ -294,7 +294,7 @@ def test_target_limit_collapses_to_only_limit_issue(monkeypatch: pytest.MonkeyPa
     report = build_live_journal_inspection_report(
         _snapshot(orders=(pending,), claims=(_claim(pending),)),
         "account-a",
-        database_schema_version=2,
+        database_schema_version=3,
         scoped_issue_codes=(LiveJournalInspectionIssueCode.GLOBAL_RECOVERY_BLOCKER,),
     )
 
@@ -303,11 +303,18 @@ def test_target_limit_collapses_to_only_limit_issue(monkeypatch: pytest.MonkeyPa
     assert report.targets == ()
 
 
-def test_v1_builder_returns_exact_upgrade_report() -> None:
+@pytest.mark.parametrize(
+    ("database_schema_version", "identity_schema_version"),
+    ((1, 1), (2, 1), (2, 2)),
+)
+def test_legacy_builder_accepts_creation_identity_compatibility_matrix(
+    database_schema_version: int,
+    identity_schema_version: int,
+) -> None:
     report = build_schema_upgrade_required_inspection_report(
-        _identity(1),
+        _identity(identity_schema_version),
         "account-a",
-        database_schema_version=1,
+        database_schema_version=database_schema_version,
         journal_sequence=0,
     )
 
@@ -316,16 +323,29 @@ def test_v1_builder_returns_exact_upgrade_report() -> None:
     assert report.targets == ()
 
 
-def test_v2_builder_accepts_migrated_journal_with_v1_creation_identity() -> None:
+def test_v1_builder_rejects_v2_creation_identity() -> None:
+    with pytest.raises(ValueError, match="versions are incompatible"):
+        build_schema_upgrade_required_inspection_report(
+            _identity(2),
+            "account-a",
+            database_schema_version=1,
+            journal_sequence=0,
+        )
+
+
+@pytest.mark.parametrize("identity_schema_version", (1, 2, 3))
+def test_v3_builder_accepts_supported_creation_identity(
+    identity_schema_version: int,
+) -> None:
     snapshot = _snapshot(
-        identity=_identity(1),
+        identity=_identity(identity_schema_version),
         orders=(_order("account-a", "order-a"),),
     )
 
     report = build_live_journal_inspection_report(
         snapshot,
         "account-a",
-        database_schema_version=2,
+        database_schema_version=3,
     )
 
     assert report.disposition is LiveJournalInspectionDisposition.READY_NO_ACTION

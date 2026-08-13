@@ -125,12 +125,12 @@ def _submitting_order() -> tuple[NewOrderCommand, object]:
     return command, order
 
 
-def create_sealed_v2(
+def create_sealed_v3(
     path: Path,
     *,
     submission_unknown: bool = False,
 ) -> LiveJournalRecoverySnapshot:
-    """Create and cleanly close a real v2 journal for the requested scenario."""
+    """Create and cleanly close a real v3 journal for the requested scenario."""
 
     command, order = _submitting_order()
     journal = SqliteLiveOrderJournal(

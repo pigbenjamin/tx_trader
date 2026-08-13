@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 
@@ -43,6 +43,10 @@ from tx_trade.orders.live_journal_contracts import (
     OutstandingDispatchClaim,
 )
 from tx_trade.orders.live_ports import AmbiguousObservation, RawBrokerObservation
+from tx_trade.orders.live_reconciliation_authorization_contracts import (
+    ReconciliationAuthorizationAction,
+    ReconciliationCommitAuthorization,
+)
 from tx_trade.orders.live_state_machine import AppliedEvent, AppliedEventLedger
 
 NOW = datetime(2026, 7, 30, 1, 2, 3, 456789, tzinfo=timezone.utc)
@@ -355,3 +359,30 @@ def test_errors_never_echo_raw_payload_or_secret() -> None:
 
     assert secret.decode() not in str(caught.value)
     assert secret.decode() not in repr(caught.value)
+
+
+def test_reconciliation_authorization_round_trips_canonically() -> None:
+    value = ReconciliationCommitAuthorization(
+        authorization_id="authorization-1",
+        principal_id="principal-secret",
+        authority_context_digest=f"sha256:{'1' * 64}",
+        action=ReconciliationAuthorizationAction.RECONCILIATION_COMMIT,
+        journal_id="journal-secret",
+        account_id="account-secret",
+        source_inspection_digest=f"sha256:{'2' * 64}",
+        operator_plan_digest=f"sha256:{'3' * 64}",
+        commit_id="commit-1",
+        request_digest=f"sha256:{'4' * 64}",
+        broker_snapshot_id="snapshot-secret",
+        expected_journal_sequence=4,
+        authorized_at=NOW,
+        expires_at=NOW + timedelta(seconds=60),
+        reason_code="operator-approved",
+    )
+
+    payload = encode_journal_value(value)
+    decoded = decode_journal_value(payload, ReconciliationCommitAuthorization)
+
+    assert decoded == value
+    assert encode_journal_value(decoded) == payload
+    assert b"ReconciliationAuthorizationAction" in payload

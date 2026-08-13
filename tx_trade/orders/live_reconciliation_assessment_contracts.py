@@ -91,8 +91,8 @@ class InspectedReconciliationAssessment:
             raise TypeError("inspection must be LiveJournalInspectionReport")
         if type(self.assessment) is not ReconciliationAssessment:
             raise TypeError("assessment must be ReconciliationAssessment")
-        if self.inspection.database_schema_version != 2:
-            raise ValueError("inspection must use database schema version 2")
+        if self.inspection.database_schema_version != 3:
+            raise ValueError("inspection must use database schema version 3")
         if self.inspection.disposition not in {
             LiveJournalInspectionDisposition.READY_NO_ACTION,
             LiveJournalInspectionDisposition.RECOVERY_REQUIRED,

@@ -50,6 +50,8 @@ DIGEST = f"sha256:{'0' * 64}"
 
 def inspection(
     disposition: Disposition = Disposition.READY_NO_ACTION,
+    *,
+    schema_version: int | None = None,
 ) -> LiveJournalInspectionReport:
     issues = {
         Disposition.READY_NO_ACTION: (),
@@ -62,7 +64,9 @@ def inspection(
     }[disposition]
     return LiveJournalInspectionReport(
         "account-1",
-        1 if disposition is Disposition.SCHEMA_UPGRADE_REQUIRED else 2,
+        schema_version
+        if schema_version is not None
+        else (1 if disposition is Disposition.SCHEMA_UPGRADE_REQUIRED else 3),
         7,
         disposition,
         issues,
@@ -259,6 +263,28 @@ def test_terminal_inspection_dispositions_never_query_broker(
     source = Source(broker())
     assert_code(
         code,
+        lambda: subject.assess_sqlite_live_order_journal(
+            "journal.sqlite3",
+            account_id="account-1",
+            broker_snapshot_source=source,
+            clock=Clock([LOCAL_TIME]),
+        ),
+    )
+    assert source.count == 0
+
+
+def test_schema_v2_upgrade_never_queries_broker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        subject,
+        "_inspect_sqlite_live_order_journal_with_account_snapshot",
+        lambda *args, **kwargs: (
+            inspection(Disposition.SCHEMA_UPGRADE_REQUIRED, schema_version=2),
+            None,
+        ),
+    )
+    source = Source(broker())
+    assert_code(
+        FailureCode.SCHEMA_UPGRADE_REQUIRED,
         lambda: subject.assess_sqlite_live_order_journal(
             "journal.sqlite3",
             account_id="account-1",

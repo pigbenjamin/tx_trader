@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 import re
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import TypeVar
 
 from .live_contracts import LiveOrder
 from .live_reconciliation_contracts import ReconciliationAssessment
@@ -267,10 +267,3 @@ class DurableReconciliationCommitResult:
             or projections
         ):
             raise ValueError("rejected outcomes must not contain committed data")
-
-
-@runtime_checkable
-class DurableReconciliationCommitPort(Protocol):
-    def commit_reconciliation(
-        self, request: DurableReconciliationCommitRequest
-    ) -> DurableReconciliationCommitResult: ...

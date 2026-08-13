@@ -1,5 +1,5 @@
 PRAGMA application_id = 1415074890;
-PRAGMA user_version = 3;
+PRAGMA user_version = 2;
 
 CREATE TABLE live_journal_migrations (
     version INTEGER PRIMARY KEY CHECK (version > 0),
@@ -10,7 +10,7 @@ CREATE TABLE live_journal_migrations (
 CREATE TABLE "live_journal_identity" (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     journal_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version IN (1, 2, 3)),
+    schema_version INTEGER NOT NULL CHECK (schema_version IN (1, 2)),
     schema_fingerprint TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -204,55 +204,6 @@ CREATE TABLE live_reconciliation_requirement_resolutions (
         CHECK (resolution_digest GLOB 'sha256:[0-9a-f]*')
 );
 
-CREATE TABLE live_reconciliation_commit_authorizations (
-    authorization_id TEXT PRIMARY KEY,
-    commit_id TEXT NOT NULL UNIQUE
-        REFERENCES live_reconciliation_commits(commit_id),
-    journal_id TEXT NOT NULL,
-    account_id TEXT NOT NULL,
-    action_kind TEXT NOT NULL CHECK (action_kind = 'reconciliation_commit'),
-    principal_id TEXT NOT NULL,
-    authority_context_digest TEXT NOT NULL
-        CHECK (
-            length(authority_context_digest) = 71
-            AND substr(authority_context_digest, 1, 7) = 'sha256:'
-            AND substr(authority_context_digest, 8) NOT GLOB '*[^0-9a-f]*'
-        ),
-    source_inspection_digest TEXT NOT NULL
-        CHECK (
-            length(source_inspection_digest) = 71
-            AND substr(source_inspection_digest, 1, 7) = 'sha256:'
-            AND substr(source_inspection_digest, 8) NOT GLOB '*[^0-9a-f]*'
-        ),
-    operator_plan_digest TEXT NOT NULL
-        CHECK (
-            length(operator_plan_digest) = 71
-            AND substr(operator_plan_digest, 1, 7) = 'sha256:'
-            AND substr(operator_plan_digest, 8) NOT GLOB '*[^0-9a-f]*'
-        ),
-    request_digest TEXT NOT NULL
-        CHECK (
-            length(request_digest) = 71
-            AND substr(request_digest, 1, 7) = 'sha256:'
-            AND substr(request_digest, 8) NOT GLOB '*[^0-9a-f]*'
-        ),
-    broker_snapshot_id TEXT NOT NULL,
-    expected_journal_sequence INTEGER NOT NULL
-        CHECK (expected_journal_sequence >= 0),
-    authorized_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    consumed_at TEXT NOT NULL,
-    reason_code TEXT NOT NULL,
-    authorization_digest TEXT NOT NULL
-        CHECK (
-            length(authorization_digest) = 71
-            AND substr(authorization_digest, 1, 7) = 'sha256:'
-            AND substr(authorization_digest, 8) NOT GLOB '*[^0-9a-f]*'
-        ),
-    resulting_journal_sequence INTEGER NOT NULL
-        CHECK (resulting_journal_sequence > expected_journal_sequence)
-);
-
 CREATE INDEX live_orders_account_state_idx
     ON live_orders(account_id, state, client_order_id);
 CREATE INDEX live_commands_order_idx
@@ -270,23 +221,3 @@ CREATE INDEX live_observation_reconciliation_resolutions_commit_idx
     ON live_observation_reconciliation_resolutions(commit_id, resolved_at, observation_id);
 CREATE INDEX live_reconciliation_requirement_resolutions_commit_idx
     ON live_reconciliation_requirement_resolutions(commit_id, resolved_at, requirement_id);
-CREATE INDEX live_reconciliation_commit_authorizations_account_idx
-    ON live_reconciliation_commit_authorizations(
-        account_id, consumed_at, authorization_id
-    );
-CREATE INDEX live_reconciliation_commit_authorizations_principal_idx
-    ON live_reconciliation_commit_authorizations(
-        principal_id, consumed_at, authorization_id
-    );
-
-CREATE TRIGGER live_reconciliation_commit_authorizations_no_update
-BEFORE UPDATE ON live_reconciliation_commit_authorizations
-BEGIN
-    SELECT RAISE(ABORT, 'append-only authorization audit');
-END;
-
-CREATE TRIGGER live_reconciliation_commit_authorizations_no_delete
-BEFORE DELETE ON live_reconciliation_commit_authorizations
-BEGIN
-    SELECT RAISE(ABORT, 'append-only authorization audit');
-END;

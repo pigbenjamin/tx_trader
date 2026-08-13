@@ -84,6 +84,19 @@ from .live_reconciliation_commit_contracts import (
     ObservationStatus,
     ReconciliationCommitDisposition,
 )
+from .live_reconciliation_authorization_contracts import (
+    AuthorizedReconciliationCommitRequest,
+    ReconciliationAuthorizationAction,
+    ReconciliationAuthorizationError,
+    ReconciliationAuthorizationFailureCode,
+    ReconciliationCommitAuthorization,
+)
+from .live_reconciliation_authorization import (
+    RECONCILIATION_AUTHORIZATION_DIGEST_DOMAIN,
+    reconciliation_authorization_digest,
+    reconciliation_commit_request_digest,
+    validate_authorized_reconciliation_commit,
+)
 from .live_reconciliation_projection import project_authoritative_orders
 from .live_reconciliation_projection_contracts import OrderProjectionDisposition
 from .live_state_machine import (
@@ -96,7 +109,7 @@ from .live_state_machine import (
 )
 
 APPLICATION_ID = 1_415_074_890
-DATABASE_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 3
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_MAX_MAIN_DATABASE_BYTES = 256 * 1024 * 1024
 
@@ -117,12 +130,12 @@ _RECOVERY_BLOCKER_DOMAIN = b"tx_trade.live.journal.recovery-blocker.v1"
 _SCHEMA_MIGRATION_FACT_DOMAIN = "tx_trade.live.journal.schema-migration.v2"
 _COMMIT_REQUEST_DOMAIN = "tx_trade.live.journal.reconciliation-commit-request.v2"
 _COMMIT_FACT_DOMAIN = "tx_trade.live.journal.reconciliation-commit.v2"
+_AUTHORIZATION_FACT_DOMAIN = "tx_trade.live.journal.operator-authorization.v3"
 _CLAIM_RESOLUTION_DOMAIN = "tx_trade.live.journal.dispatch-claim-resolution.v2"
 _OBSERVATION_RECONCILIATION_DOMAIN = (
     "tx_trade.live.journal.observation-reconciliation-resolution.v2"
 )
 _REQUIREMENT_RESOLUTION_DOMAIN = "tx_trade.live.journal.reconciliation-requirement-resolution.v2"
-_SCHEMA_MIGRATION_RECORD_ID = str(DATABASE_SCHEMA_VERSION)
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 _COMMAND_DOMAINS = {
@@ -183,14 +196,30 @@ def _v1_schema_material() -> tuple[str, str]:
     return _sql_material("live_journal_schema_v1.sql")
 
 
-def _migration_material() -> str:
+def _v2_schema_material() -> tuple[str, str]:
+    return _sql_material("live_journal_schema_v2.sql")
+
+
+def _v1_to_v2_migration_material() -> str:
     return _sql_material("live_journal_migration_v1_to_v2.sql")[0]
+
+
+def _v2_to_v3_migration_material() -> str:
+    return _sql_material("live_journal_migration_v2_to_v3.sql")[0]
 
 
 def _expected_schema_signature(
     version: int = DATABASE_SCHEMA_VERSION,
 ) -> tuple[tuple[str, str, str], ...]:
-    script, _ = _schema_material() if version == 2 else _v1_schema_material()
+    materials = {
+        1: _v1_schema_material,
+        2: _v2_schema_material,
+        3: _schema_material,
+    }
+    try:
+        script, _ = materials[version]()
+    except KeyError:
+        raise LiveJournalIntegrityError("live journal schema mismatch") from None
     # Schema material is checked in an isolated in-memory database.  Retaining
     # the stdlib constructor keeps source-connection auditing scoped to the
     # actual journal connection.
@@ -291,6 +320,99 @@ def _scalar_digest(domain: str, values: dict[str, str | int | None]) -> str:
         sort_keys=True,
     ).encode("ascii")
     return f"sha256:{sha256(domain.encode('ascii') + bytes((0,)) + payload).hexdigest()}"
+
+
+def _validate_authorized_request(
+    value: object,
+) -> tuple[
+    DurableReconciliationCommitRequest,
+    ReconciliationCommitAuthorization,
+    bytes,
+    str,
+    str,
+]:
+    if type(value) is not AuthorizedReconciliationCommitRequest:
+        raise TypeError("request must be AuthorizedReconciliationCommitRequest")
+    try:
+        validated = validate_authorized_reconciliation_commit(value)
+        caller_authorization = validated.authorization
+        caller_request = validated.request
+        if (
+            type(caller_authorization) is not ReconciliationCommitAuthorization
+            or type(caller_request) is not DurableReconciliationCommitRequest
+        ):
+            raise ReconciliationAuthorizationError(
+                ReconciliationAuthorizationFailureCode.INVALID_AUTHORIZATION
+            )
+
+        request_payload, request_digest = _encode(caller_request, _COMMIT_REQUEST_DOMAIN)
+        request = cast(
+            DurableReconciliationCommitRequest,
+            _decode(
+                request_payload,
+                request_digest,
+                DurableReconciliationCommitRequest,
+                _COMMIT_REQUEST_DOMAIN,
+            ),
+        )
+        authorization_payload, authorization_digest = _encode(
+            caller_authorization,
+            RECONCILIATION_AUTHORIZATION_DIGEST_DOMAIN,
+        )
+        authorization = cast(
+            ReconciliationCommitAuthorization,
+            _decode(
+                authorization_payload,
+                authorization_digest,
+                ReconciliationCommitAuthorization,
+                RECONCILIATION_AUTHORIZATION_DIGEST_DOMAIN,
+            ),
+        )
+        validate_authorized_reconciliation_commit(
+            AuthorizedReconciliationCommitRequest(authorization, request)
+        )
+    except MemoryError:
+        raise
+    except (LiveJournalIntegrityError, ReconciliationAuthorizationError):
+        raise
+    except BaseException:
+        raise ReconciliationAuthorizationError(
+            ReconciliationAuthorizationFailureCode.INVALID_AUTHORIZATION
+        ) from None
+
+    if request_digest != reconciliation_commit_request_digest(request):
+        raise LiveJournalIntegrityError("live journal request digest is invalid")
+    if authorization_digest != reconciliation_authorization_digest(authorization):
+        raise LiveJournalIntegrityError("live journal authorization digest is invalid")
+    if (
+        authorization.action is not ReconciliationAuthorizationAction.RECONCILIATION_COMMIT
+        or authorization.account_id != request.account_id
+        or authorization.commit_id != request.commit_id
+        or authorization.expected_journal_sequence != request.expected_journal_sequence
+        or authorization.broker_snapshot_id != request.assessment.broker_snapshot.snapshot_id
+        or authorization.request_digest != request_digest
+    ):
+        raise ReconciliationAuthorizationError(
+            ReconciliationAuthorizationFailureCode.AUTHORIZATION_CONFLICT
+        )
+    return request, authorization, request_payload, request_digest, authorization_digest
+
+
+def _authorization_fact_digest(
+    authorization_digest: str,
+    commit_id: str,
+    consumed_at: str,
+    resulting_sequence: int,
+) -> str:
+    return _scalar_digest(
+        _AUTHORIZATION_FACT_DOMAIN,
+        {
+            "authorization_digest": authorization_digest,
+            "commit_id": commit_id,
+            "consumed_at": consumed_at,
+            "resulting_sequence": resulting_sequence,
+        },
+    )
 
 
 def _application_digest(
@@ -536,7 +658,7 @@ class SqliteLiveOrderJournal:
             connection.row_factory = sqlite3.Row
             self._connection = connection
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {1, DATABASE_SCHEMA_VERSION}:
+            if version not in {1, 2, DATABASE_SCHEMA_VERSION}:
                 raise LiveJournalIntegrityError("live journal schema mismatch")
             self._validate_schema(version)
             self._identity = self._load_identity()
@@ -582,6 +704,7 @@ class SqliteLiveOrderJournal:
     def _initialize(self, journal_id: str) -> None:
         script, fingerprint = _schema_material()
         _, v1_fingerprint = _v1_schema_material()
+        _, v2_fingerprint = _v2_schema_material()
         connection = self._require_connection()
         created_at = self._now()
         identity = LiveJournalIdentity(journal_id, DATABASE_SCHEMA_VERSION, fingerprint, created_at)
@@ -593,7 +716,11 @@ class SqliteLiveOrderJournal:
             )
             connection.execute(
                 "INSERT INTO live_journal_migrations(version, schema_fingerprint) VALUES (?, ?)",
-                (DATABASE_SCHEMA_VERSION, fingerprint),
+                (2, v2_fingerprint),
+            )
+            connection.execute(
+                "INSERT INTO live_journal_migrations(version, schema_fingerprint) VALUES (?, ?)",
+                (3, fingerprint),
             )
             connection.execute(
                 """INSERT INTO live_journal_identity(
@@ -604,51 +731,69 @@ class SqliteLiveOrderJournal:
             identity_payload, identity_digest = _encode(identity, _IDENTITY_DOMAIN)
             del identity_payload
             self._append_record("identity", journal_id, identity_digest, created_at)
-            migration_digest = _scalar_digest(
-                _SCHEMA_MIGRATION_FACT_DOMAIN,
-                {
-                    "version": DATABASE_SCHEMA_VERSION,
-                    "from_fingerprint": v1_fingerprint,
-                    "to_fingerprint": fingerprint,
-                    "recorded_at": _timestamp(created_at),
-                },
-            )
-            self._append_record(
-                "schema-migration", _SCHEMA_MIGRATION_RECORD_ID, migration_digest, created_at
-            )
+            for version, from_fingerprint, to_fingerprint in (
+                (2, v1_fingerprint, v2_fingerprint),
+                (3, v2_fingerprint, fingerprint),
+            ):
+                migration_digest = _scalar_digest(
+                    _SCHEMA_MIGRATION_FACT_DOMAIN,
+                    {
+                        "version": version,
+                        "from_fingerprint": from_fingerprint,
+                        "to_fingerprint": to_fingerprint,
+                        "recorded_at": _timestamp(created_at),
+                    },
+                )
+                self._append_record("schema-migration", str(version), migration_digest, created_at)
         self._validate_schema()
 
     def _resume_or_migrate(self) -> None:
         connection = self._require_connection()
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version == DATABASE_SCHEMA_VERSION:
+        initial_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if initial_version == DATABASE_SCHEMA_VERSION:
             self._validate_schema()
             return
-        if version != 1:
+        if initial_version not in {1, 2}:
             raise LiveJournalIntegrityError("live journal schema mismatch")
         with self._transaction():
-            self._validate_schema(1)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == DATABASE_SCHEMA_VERSION:
+                self._validate_schema()
+                self._identity = self._load_identity()
+                self._verify_durable_payloads()
+                return
+            if version not in {1, 2}:
+                raise LiveJournalIntegrityError("live journal schema mismatch")
+            self._validate_schema(version)
             self._identity = self._load_identity()
             self._verify_durable_payloads()
-            _execute_script_in_transaction(connection, _migration_material())
-            migrated_at = self._now()
             _, v1_fingerprint = _v1_schema_material()
+            _, v2_fingerprint = _v2_schema_material()
             _, fingerprint = _schema_material()
-            migration_digest = _scalar_digest(
-                _SCHEMA_MIGRATION_FACT_DOMAIN,
-                {
-                    "version": DATABASE_SCHEMA_VERSION,
-                    "from_fingerprint": v1_fingerprint,
-                    "to_fingerprint": fingerprint,
-                    "recorded_at": _timestamp(migrated_at),
-                },
+            migrations = (
+                (
+                    2,
+                    v1_fingerprint,
+                    v2_fingerprint,
+                    _v1_to_v2_migration_material(),
+                ),
+                (3, v2_fingerprint, fingerprint, _v2_to_v3_migration_material()),
             )
-            self._append_record(
-                "schema-migration",
-                _SCHEMA_MIGRATION_RECORD_ID,
-                migration_digest,
-                migrated_at,
-            )
+            for target, from_fingerprint, to_fingerprint, script in migrations:
+                if target <= version:
+                    continue
+                _execute_script_in_transaction(connection, script)
+                migrated_at = self._now()
+                migration_digest = _scalar_digest(
+                    _SCHEMA_MIGRATION_FACT_DOMAIN,
+                    {
+                        "version": target,
+                        "from_fingerprint": from_fingerprint,
+                        "to_fingerprint": to_fingerprint,
+                        "recorded_at": _timestamp(migrated_at),
+                    },
+                )
+                self._append_record("schema-migration", str(target), migration_digest, migrated_at)
             self._validate_schema()
             self._verify_durable_payloads()
 
@@ -682,6 +827,7 @@ class SqliteLiveOrderJournal:
         connection = self._require_connection()
         _, fingerprint = _schema_material()
         _, v1_fingerprint = _v1_schema_material()
+        _, v2_fingerprint = _v2_schema_material()
         if int(connection.execute("PRAGMA application_id").fetchone()[0]) != APPLICATION_ID:
             raise LiveJournalIntegrityError("live journal schema mismatch")
         if int(connection.execute("PRAGMA user_version").fetchone()[0]) != version:
@@ -694,11 +840,17 @@ class SqliteLiveOrderJournal:
         rows = connection.execute(
             "SELECT version, schema_fingerprint FROM live_journal_migrations ORDER BY version"
         ).fetchall()
-        expected_history = (
-            [(1, v1_fingerprint)]
-            if version == 1
-            else [(1, v1_fingerprint), (DATABASE_SCHEMA_VERSION, fingerprint)]
-        )
+        expected_history = {
+            1: [(1, v1_fingerprint)],
+            2: [(1, v1_fingerprint), (2, v2_fingerprint)],
+            3: [
+                (1, v1_fingerprint),
+                (2, v2_fingerprint),
+                (3, fingerprint),
+            ],
+        }.get(version)
+        if expected_history is None:
+            raise LiveJournalIntegrityError("live journal schema mismatch")
         if [tuple(row) for row in rows] != expected_history:
             raise LiveJournalIntegrityError("live journal schema mismatch")
         signature = tuple(
@@ -730,8 +882,10 @@ class SqliteLiveOrderJournal:
             raise LiveJournalIntegrityError("live journal identity is invalid") from None
         _, fingerprint = _schema_material()
         _, v1_fingerprint = _v1_schema_material()
+        _, v2_fingerprint = _v2_schema_material()
         valid_creation_identity = (identity.schema_version, identity.schema_fingerprint) in {
             (1, v1_fingerprint),
+            (2, v2_fingerprint),
             (DATABASE_SCHEMA_VERSION, fingerprint),
         }
         if not valid_creation_identity:
@@ -2033,14 +2187,18 @@ class SqliteLiveOrderJournal:
                 sequence,
             )
 
-    def commit_reconciliation(
-        self, request: DurableReconciliationCommitRequest
+    def commit_authorized_reconciliation(
+        self, authorized_request: AuthorizedReconciliationCommitRequest
     ) -> DurableReconciliationCommitResult:
-        """Atomically apply conservative, evidence-backed blocker overlays."""
+        """Atomically apply one exactly authorized reconciliation commit."""
 
-        if type(request) is not DurableReconciliationCommitRequest:
-            raise TypeError("request must be DurableReconciliationCommitRequest")
-        request_payload, request_digest = _encode(request, _COMMIT_REQUEST_DOMAIN)
+        (
+            request,
+            authorization,
+            request_payload,
+            request_digest,
+            authorization_digest,
+        ) = _validate_authorized_request(authorized_request)
 
         def rejected(
             disposition: ReconciliationCommitDisposition,
@@ -2054,6 +2212,11 @@ class SqliteLiveOrderJournal:
                 with self._transaction():
                     connection = self._require_connection()
                     self._verify_durable_payloads()
+                    if authorization.journal_id != self.identity.journal_id:
+                        raise ReconciliationAuthorizationError(
+                            ReconciliationAuthorizationFailureCode.AUTHORIZATION_CONFLICT
+                        )
+                    linearized_at = self._now()
                     existing = connection.execute(
                         """SELECT account_id, request_payload, request_digest, committed_at,
                                   resulting_journal_sequence
@@ -2066,6 +2229,46 @@ class SqliteLiveOrderJournal:
                             and existing[1] == request_payload
                             and existing[2] == request_digest
                         ):
+                            persisted_authorization = connection.execute(
+                                """SELECT authorization_id, commit_id, journal_id, account_id,
+                                          action_kind, principal_id,
+                                          authority_context_digest,
+                                          source_inspection_digest, operator_plan_digest,
+                                          request_digest, broker_snapshot_id,
+                                          expected_journal_sequence, authorized_at, expires_at,
+                                          consumed_at, reason_code, authorization_digest,
+                                          resulting_journal_sequence
+                                   FROM live_reconciliation_commit_authorizations
+                                   WHERE commit_id = ?""",
+                                (request.commit_id,),
+                            ).fetchone()
+                            expected_authorization = (
+                                authorization.authorization_id,
+                                authorization.commit_id,
+                                authorization.journal_id,
+                                authorization.account_id,
+                                authorization.action.value,
+                                authorization.principal_id,
+                                authorization.authority_context_digest,
+                                authorization.source_inspection_digest,
+                                authorization.operator_plan_digest,
+                                authorization.request_digest,
+                                authorization.broker_snapshot_id,
+                                authorization.expected_journal_sequence,
+                                _timestamp(authorization.authorized_at),
+                                _timestamp(authorization.expires_at),
+                                existing[3],
+                                authorization.reason_code,
+                                authorization_digest,
+                                int(existing[4]),
+                            )
+                            if (
+                                persisted_authorization is None
+                                or tuple(persisted_authorization) != expected_authorization
+                            ):
+                                raise ReconciliationAuthorizationError(
+                                    ReconciliationAuthorizationFailureCode.AUTHORIZATION_CONFLICT
+                                )
                             resolved_claims = tuple(
                                 row[0]
                                 for row in connection.execute(
@@ -2104,6 +2307,25 @@ class SqliteLiveOrderJournal:
                                 request.order_projections,
                             )
                         return rejected(ReconciliationCommitDisposition.ID_CONFLICT)
+                    if linearized_at < authorization.authorized_at:
+                        raise ReconciliationAuthorizationError(
+                            ReconciliationAuthorizationFailureCode.INVALID_AUTHORIZATION
+                        )
+                    if linearized_at >= authorization.expires_at:
+                        raise ReconciliationAuthorizationError(
+                            ReconciliationAuthorizationFailureCode.AUTHORIZATION_EXPIRED
+                        )
+                    if (
+                        connection.execute(
+                            """SELECT 1 FROM live_reconciliation_commit_authorizations
+                           WHERE authorization_id = ?""",
+                            (authorization.authorization_id,),
+                        ).fetchone()
+                        is not None
+                    ):
+                        raise ReconciliationAuthorizationError(
+                            ReconciliationAuthorizationFailureCode.AUTHORIZATION_CONFLICT
+                        )
                     reused = connection.execute(
                         """SELECT 1 FROM live_reconciliation_commits
                            WHERE account_id = ? AND (snapshot_id = ? OR request_digest = ?)""",
@@ -2514,7 +2736,7 @@ class SqliteLiveOrderJournal:
                         ):
                             return rejected(ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION)
 
-                    committed_at = self._now()
+                    committed_at = linearized_at
                     if committed_at < assessment.result.reconciled_at:
                         return rejected(ReconciliationCommitDisposition.NOT_AUTHORITATIVE)
                     target_count = (
@@ -2522,7 +2744,7 @@ class SqliteLiveOrderJournal:
                         + len(request.observation_resolutions)
                         + len(request.requirement_resolutions)
                     )
-                    resulting_sequence = sequence + target_count + 1
+                    resulting_sequence = sequence + target_count + 2
 
                     for projected_order in request.order_projections:
                         expected_version = expected_versions[projected_order.intent.client_order_id]
@@ -2547,6 +2769,42 @@ class SqliteLiveOrderJournal:
                             _timestamp(committed_at),
                             resulting_sequence,
                         ),
+                    )
+                    authorization_fact_digest = _authorization_fact_digest(
+                        authorization_digest,
+                        request.commit_id,
+                        _timestamp(committed_at),
+                        resulting_sequence,
+                    )
+                    connection.execute(
+                        """INSERT INTO live_reconciliation_commit_authorizations VALUES
+                           (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            authorization.authorization_id,
+                            request.commit_id,
+                            authorization.journal_id,
+                            authorization.account_id,
+                            authorization.action.value,
+                            authorization.principal_id,
+                            authorization.authority_context_digest,
+                            authorization.source_inspection_digest,
+                            authorization.operator_plan_digest,
+                            authorization.request_digest,
+                            authorization.broker_snapshot_id,
+                            authorization.expected_journal_sequence,
+                            _timestamp(authorization.authorized_at),
+                            _timestamp(authorization.expires_at),
+                            _timestamp(committed_at),
+                            authorization.reason_code,
+                            authorization_digest,
+                            resulting_sequence,
+                        ),
+                    )
+                    self._append_record(
+                        "operator-authorization",
+                        authorization.authorization_id,
+                        authorization_fact_digest,
+                        committed_at,
                     )
 
                     for directive in request.claim_resolutions:
@@ -2757,31 +3015,38 @@ class SqliteLiveOrderJournal:
             _timestamp(self._identity.created_at),
         )
         database_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if database_version == DATABASE_SCHEMA_VERSION:
-            migration_record = connection.execute(
-                """SELECT payload_digest, recorded_at FROM live_journal_records
-                   WHERE record_kind = 'schema-migration' AND record_id = ?""",
-                (_SCHEMA_MIGRATION_RECORD_ID,),
-            ).fetchone()
-            if migration_record is None:
-                raise LiveJournalIntegrityError("live journal migration record is missing")
+        if database_version >= 2:
             _, v1_fingerprint = _v1_schema_material()
-            _, fingerprint = _schema_material()
-            migration_digest = _scalar_digest(
-                _SCHEMA_MIGRATION_FACT_DOMAIN,
-                {
-                    "version": DATABASE_SCHEMA_VERSION,
-                    "from_fingerprint": v1_fingerprint,
-                    "to_fingerprint": fingerprint,
-                    "recorded_at": migration_record[1],
-                },
-            )
-            if migration_record[0] != migration_digest:
-                raise LiveJournalIntegrityError("live journal migration record is invalid")
-            expected_records[("schema-migration", _SCHEMA_MIGRATION_RECORD_ID)] = (
-                migration_digest,
-                migration_record[1],
-            )
+            _, v2_fingerprint = _v2_schema_material()
+            _, v3_fingerprint = _schema_material()
+            transitions = {
+                2: (v1_fingerprint, v2_fingerprint),
+                3: (v2_fingerprint, v3_fingerprint),
+            }
+            for version in range(2, database_version + 1):
+                migration_record = connection.execute(
+                    """SELECT payload_digest, recorded_at FROM live_journal_records
+                       WHERE record_kind = 'schema-migration' AND record_id = ?""",
+                    (str(version),),
+                ).fetchone()
+                if migration_record is None:
+                    raise LiveJournalIntegrityError("live journal migration record is missing")
+                from_fingerprint, to_fingerprint = transitions[version]
+                migration_digest = _scalar_digest(
+                    _SCHEMA_MIGRATION_FACT_DOMAIN,
+                    {
+                        "version": version,
+                        "from_fingerprint": from_fingerprint,
+                        "to_fingerprint": to_fingerprint,
+                        "recorded_at": migration_record[1],
+                    },
+                )
+                if migration_record[0] != migration_digest:
+                    raise LiveJournalIntegrityError("live journal migration record is invalid")
+                expected_records[("schema-migration", str(version))] = (
+                    migration_digest,
+                    migration_record[1],
+                )
         for reservation in connection.execute(
             """SELECT client_order_id, intent_fingerprint
                FROM live_order_id_reservations"""
@@ -3072,8 +3337,19 @@ class SqliteLiveOrderJournal:
             payload, digest = _encode(requirement, _RECONCILIATION_DOMAIN)
             del payload
             expected_records[("reconciliation", str(row[0]))] = (digest, row[4])
-        if database_version == DATABASE_SCHEMA_VERSION:
+        if database_version >= 2:
             commit_requests: dict[str, DurableReconciliationCommitRequest] = {}
+            authorization_commit_ids: set[str] = set()
+            migration_v3_sequence = (
+                int(
+                    connection.execute(
+                        """SELECT journal_sequence FROM live_journal_records
+                           WHERE record_kind = 'schema-migration' AND record_id = '3'"""
+                    ).fetchone()[0]
+                )
+                if database_version == 3
+                else None
+            )
             for row in connection.execute(
                 """SELECT commit_id, account_id, expected_journal_sequence,
                           base_journal_sequence, snapshot_id, request_payload,
@@ -3123,6 +3399,88 @@ class SqliteLiveOrderJournal:
                     commit_digest,
                     row[7],
                 )
+                if migration_v3_sequence is not None and int(record[0]) > migration_v3_sequence:
+                    authorization_row = connection.execute(
+                        """SELECT authorization_id, commit_id, journal_id, account_id,
+                                  action_kind, principal_id, authority_context_digest,
+                                  source_inspection_digest, operator_plan_digest,
+                                  request_digest, broker_snapshot_id,
+                                  expected_journal_sequence, authorized_at, expires_at,
+                                  consumed_at, reason_code, authorization_digest,
+                                  resulting_journal_sequence
+                           FROM live_reconciliation_commit_authorizations
+                           WHERE commit_id = ?""",
+                        (row[0],),
+                    ).fetchone()
+                    if authorization_row is None:
+                        raise LiveJournalIntegrityError(
+                            "live journal reconciliation authorization is missing"
+                        )
+                    try:
+                        authorization = ReconciliationCommitAuthorization(
+                            authorization_id=authorization_row[0],
+                            principal_id=authorization_row[5],
+                            authority_context_digest=authorization_row[6],
+                            action=ReconciliationAuthorizationAction(authorization_row[4]),
+                            journal_id=authorization_row[2],
+                            account_id=authorization_row[3],
+                            source_inspection_digest=authorization_row[7],
+                            operator_plan_digest=authorization_row[8],
+                            commit_id=authorization_row[1],
+                            request_digest=authorization_row[9],
+                            broker_snapshot_id=authorization_row[10],
+                            expected_journal_sequence=int(authorization_row[11]),
+                            authorized_at=_parse_timestamp(authorization_row[12]),
+                            expires_at=_parse_timestamp(authorization_row[13]),
+                            reason_code=authorization_row[15],
+                        )
+                        expected_authorization_digest = reconciliation_authorization_digest(
+                            authorization
+                        )
+                        authorization_record = connection.execute(
+                            """SELECT journal_sequence, payload_digest, recorded_at
+                               FROM live_journal_records
+                               WHERE record_kind = 'operator-authorization'
+                                 AND record_id = ?""",
+                            (authorization.authorization_id,),
+                        ).fetchone()
+                    except (TypeError, ValueError):
+                        raise LiveJournalIntegrityError(
+                            "live journal reconciliation authorization is invalid"
+                        ) from None
+                    expected_authorization_fact = _authorization_fact_digest(
+                        expected_authorization_digest,
+                        authorization.commit_id,
+                        authorization_row[14],
+                        int(authorization_row[17]),
+                    )
+                    if (
+                        authorization_record is None
+                        or authorization.commit_id != request.commit_id
+                        or authorization.journal_id != self._identity.journal_id
+                        or authorization.account_id != request.account_id
+                        or authorization.request_digest != row[6]
+                        or authorization.broker_snapshot_id != row[4]
+                        or authorization.expected_journal_sequence != int(row[2])
+                        or authorization.authorized_at > _parse_timestamp(row[7])
+                        or authorization.expires_at <= _parse_timestamp(row[7])
+                        or authorization_row[14] != row[7]
+                        or authorization_row[16] != expected_authorization_digest
+                        or int(authorization_row[17]) != int(row[8])
+                        or int(authorization_record[0]) != int(row[3]) + 1
+                        or authorization_record[1] != expected_authorization_fact
+                        or authorization_record[2] != row[7]
+                    ):
+                        raise LiveJournalIntegrityError(
+                            "live journal reconciliation authorization is invalid"
+                        )
+                    authorization_commit_ids.add(request.commit_id)
+                    expected_records[
+                        (
+                            "operator-authorization",
+                            authorization.authorization_id,
+                        )
+                    ] = (expected_authorization_fact, row[7])
                 recomputed_assessment = assess_reconciliation(
                     request.assessment.local_snapshot,
                     request.assessment.broker_snapshot,
@@ -3225,6 +3583,18 @@ class SqliteLiveOrderJournal:
                     )
                 commit_requests[row[0]] = request
 
+            if database_version == 3:
+                all_authorization_commits = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT commit_id FROM live_reconciliation_commit_authorizations"
+                    )
+                }
+                if all_authorization_commits != authorization_commit_ids:
+                    raise LiveJournalIntegrityError(
+                        "live journal reconciliation authorization mapping is invalid"
+                    )
+
             for commit_id, verified_request in commit_requests.items():
                 requested_claims = {
                     item.client_command_id for item in verified_request.claim_resolutions
@@ -3268,10 +3638,25 @@ class SqliteLiveOrderJournal:
                     )
                 }
                 commit_row = connection.execute(
-                    """SELECT base_journal_sequence, resulting_journal_sequence
-                       FROM live_reconciliation_commits WHERE commit_id = ?""",
+                    """SELECT c.base_journal_sequence, c.resulting_journal_sequence,
+                              r.journal_sequence
+                       FROM live_reconciliation_commits c
+                       JOIN live_journal_records r
+                         ON r.record_kind = 'reconciliation-commit'
+                        AND r.record_id = c.commit_id
+                       WHERE c.commit_id = ?""",
                     (commit_id,),
                 ).fetchone()
+                sequence_delta = (
+                    target_count + 1
+                    if database_version == 2
+                    or (
+                        migration_v3_sequence is not None
+                        and commit_row is not None
+                        and int(commit_row[2]) < migration_v3_sequence
+                    )
+                    else target_count + 2
+                )
                 if (
                     commit_row is None
                     or (target_count == 0 and not verified_request.order_projections)
@@ -3280,7 +3665,7 @@ class SqliteLiveOrderJournal:
                     or requested_requirements != observed_requirements
                     or int(commit_row[0]) != verified_request.expected_journal_sequence
                     or int(commit_row[1])
-                    != verified_request.expected_journal_sequence + target_count + 1
+                    != verified_request.expected_journal_sequence + sequence_delta
                 ):
                     raise LiveJournalIntegrityError(
                         "live journal reconciliation commit mapping is invalid"
@@ -3666,7 +4051,7 @@ class SqliteLiveOrderJournal:
                     """SELECT seq FROM sqlite_sequence
                        WHERE name = 'live_journal_records'"""
                 ).fetchone()
-                expected_count = 2 + sum(
+                expected_count = DATABASE_SCHEMA_VERSION + sum(
                     int(connection.execute(query).fetchone()[0])
                     for query in (
                         "SELECT count(*) FROM live_order_id_reservations",
@@ -3679,6 +4064,7 @@ class SqliteLiveOrderJournal:
                         "SELECT count(*) FROM live_normalized_events",
                         "SELECT count(*) FROM live_reconciliation_requirements",
                         "SELECT count(*) FROM live_reconciliation_commits",
+                        "SELECT count(*) FROM live_reconciliation_commit_authorizations",
                         "SELECT count(*) FROM live_dispatch_claim_resolutions",
                         "SELECT count(*) FROM live_observation_reconciliation_resolutions",
                         "SELECT count(*) FROM live_reconciliation_requirement_resolutions",
@@ -3702,6 +4088,7 @@ class SqliteLiveOrderJournal:
                     "normalized-application",
                     "reconciliation",
                     "reconciliation-commit",
+                    "operator-authorization",
                     "dispatch-claim-resolution",
                     "observation-reconciliation-resolution",
                     "reconciliation-requirement-resolution",
@@ -3769,7 +4156,7 @@ class _ConnectionBoundLiveJournalReader:
         self._view = _ConnectionBoundJournalReadView(connection)
 
     def validate_schema(self, database_schema_version: int) -> None:
-        if database_schema_version not in {1, DATABASE_SCHEMA_VERSION}:
+        if database_schema_version not in {1, 2, DATABASE_SCHEMA_VERSION}:
             raise ValueError("database_schema_version is unsupported")
         self._view._validate_schema(database_schema_version)
 
@@ -3780,13 +4167,13 @@ class _ConnectionBoundLiveJournalReader:
     ) -> _ReadOnlyLiveJournalPayload:
         if type(account_id) is not str or not _IDENTIFIER.fullmatch(account_id):
             raise ValueError("account_id must be a bounded ASCII identifier")
-        if database_schema_version not in {1, DATABASE_SCHEMA_VERSION}:
+        if database_schema_version not in {1, 2, DATABASE_SCHEMA_VERSION}:
             raise ValueError("database_schema_version is unsupported")
         view = self._view
         self.validate_schema(database_schema_version)
         identity = view._load_identity()
         view._identity = identity
-        if database_schema_version == 1:
+        if database_schema_version in {1, 2}:
             view._verify_durable_payloads()
             sequence_row = self._connection.execute(
                 "SELECT max(journal_sequence) FROM live_journal_records"

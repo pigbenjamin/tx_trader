@@ -149,12 +149,12 @@ class LiveJournalInspectionReport:
                 raise ValueError("READY_NO_ACTION must not contain issues or targets")
         elif self.disposition is LiveJournalInspectionDisposition.SCHEMA_UPGRADE_REQUIRED:
             if (
-                self.database_schema_version != 1
+                self.database_schema_version not in {1, 2}
                 or issues != (LiveJournalInspectionIssueCode.SCHEMA_UPGRADE_REQUIRED,)
                 or targets
             ):
                 raise ValueError(
-                    "SCHEMA_UPGRADE_REQUIRED requires database schema v1 and only its issue"
+                    "SCHEMA_UPGRADE_REQUIRED requires database schema v1 or v2 and only its issue"
                 )
         elif self.disposition is LiveJournalInspectionDisposition.ACCOUNT_NOT_FOUND:
             if issues != (LiveJournalInspectionIssueCode.ACCOUNT_NOT_FOUND,) or targets:

@@ -9,6 +9,8 @@ import sqlite3
 
 import pytest
 
+from tests.support.live_authorization_audit_scenarios import commit_authorized
+
 from tx_trade.orders.live_contracts import (
     BrokerCorrelation,
     BrokerOpenOrderObservation,
@@ -463,7 +465,7 @@ def test_evidence_backed_claim_commit_survives_restart_without_dispatch_authorit
     assert request.assessment.result.is_authoritative
     assert request.assessment.result.discrepancies == ()
     assert not request.assessment.may_resume
-    committed = journal.commit_reconciliation(request)
+    committed = commit_authorized(journal, request)
     assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
     assert committed.resolved_claim_ids == (COMMAND_ID,)
     assert committed.resolved_observation_ids == ()
@@ -483,7 +485,7 @@ def test_evidence_backed_claim_commit_survives_restart_without_dispatch_authorit
         expected_order_version=accepted.version,
         claimant_id="fake-dispatcher-after-restart",
     )
-    exact_retry = resumed.commit_reconciliation(request)
+    exact_retry = commit_authorized(resumed, request)
     resumed.close()
 
     assert after.orders == (accepted,)
@@ -538,7 +540,7 @@ def test_non_authoritative_or_discrepant_assessment_cannot_resolve_claim(
         ),
     )
 
-    result = journal.commit_reconciliation(request)
+    result = commit_authorized(journal, request)
     after = journal.load_recovery_snapshot()
     journal.close()
 
@@ -563,7 +565,7 @@ def test_stale_snapshot_and_cross_account_request_fail_without_writes(tmp_path: 
     journal.append_raw_observation(raw)
     before = journal.load_recovery_snapshot()
 
-    stale = journal.commit_reconciliation(request)
+    stale = commit_authorized(journal, request)
     after = journal.load_recovery_snapshot()
     assert stale.disposition is ReconciliationCommitDisposition.STALE_SNAPSHOT
     assert after == before
@@ -593,7 +595,7 @@ def test_wrong_order_version_cas_fails_without_writes(tmp_path: Path) -> None:
     )
     before = journal.load_recovery_snapshot()
 
-    result = journal.commit_reconciliation(wrong_version)
+    result = commit_authorized(journal, wrong_version)
     assert result.disposition is ReconciliationCommitDisposition.VERSION_MISMATCH
     assert journal.load_recovery_snapshot() == before
     journal.close()
@@ -630,7 +632,7 @@ def test_absence_only_outcome_unknown_claim_is_not_authoritative(tmp_path: Path)
         ),
     )
 
-    result = journal.commit_reconciliation(request)
+    result = commit_authorized(journal, request)
     assert result.disposition is ReconciliationCommitDisposition.NOT_AUTHORITATIVE
     assert journal.load_recovery_snapshot() == before
     assert not assessment.may_dispatch
@@ -641,7 +643,7 @@ def test_conflict_observation_and_requirement_must_be_resolved_together(tmp_path
     journal = _open(tmp_path / "conflict-resolution.sqlite3", JournalOpenMode.CREATE_NEW)
     _, accepted = _register_claim_and_accept(journal)
     claim_request = _claim_request(journal, commit_id="commit-precondition-claim")
-    assert journal.commit_reconciliation(claim_request).disposition is (
+    assert commit_authorized(journal, claim_request).disposition is (
         ReconciliationCommitDisposition.COMMITTED
     )
 
@@ -698,7 +700,7 @@ def test_conflict_observation_and_requirement_must_be_resolved_together(tmp_path
         observation_resolutions=(observation_directive,),
     )
 
-    rejected = journal.commit_reconciliation(partial)
+    rejected = commit_authorized(journal, partial)
     assert rejected.disposition is ReconciliationCommitDisposition.VERSION_MISMATCH
     assert journal.load_recovery_snapshot() == blocked
 
@@ -712,7 +714,7 @@ def test_conflict_observation_and_requirement_must_be_resolved_together(tmp_path
             ),
         ),
     )
-    committed = journal.commit_reconciliation(complete)
+    committed = commit_authorized(journal, complete)
     assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
     assert committed.resolved_observation_ids == (raw.observation_id,)
     assert committed.resolved_requirement_ids == (requirement.requirement_id,)
@@ -736,7 +738,7 @@ def test_ambiguous_observation_with_normalized_provenance_can_be_committed(
     journal = _open(path, JournalOpenMode.CREATE_NEW)
     _, accepted = _register_claim_and_accept(journal)
     claim_request = _claim_request(journal, commit_id="commit-ambiguity-precondition-claim")
-    assert journal.commit_reconciliation(claim_request).disposition is (
+    assert commit_authorized(journal, claim_request).disposition is (
         ReconciliationCommitDisposition.COMMITTED
     )
     candidate = _register_and_accept_ambiguity_candidate(journal)
@@ -839,7 +841,7 @@ def test_ambiguous_observation_with_normalized_provenance_can_be_committed(
             ),
         ),
     )
-    committed = resumed.commit_reconciliation(request)
+    committed = commit_authorized(resumed, request)
     assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
     assert committed.resolved_observation_ids == (raw.observation_id,)
     assert committed.resolved_requirement_ids == (requirement_id,)
@@ -901,7 +903,7 @@ def test_ambiguous_resolution_rejects_normalized_event_for_non_candidate(
     journal = _open(path, JournalOpenMode.CREATE_NEW)
     _, accepted = _register_claim_and_accept(journal)
     claim_request = _claim_request(journal, commit_id="commit-non-candidate-precondition")
-    assert journal.commit_reconciliation(claim_request).disposition is (
+    assert commit_authorized(journal, claim_request).disposition is (
         ReconciliationCommitDisposition.COMMITTED
     )
     candidate = _register_and_accept_ambiguity_candidate(journal)
@@ -990,7 +992,7 @@ def test_ambiguous_resolution_rejects_normalized_event_for_non_candidate(
     )
     before = resumed.load_recovery_snapshot()
 
-    rejected = resumed.commit_reconciliation(request)
+    rejected = commit_authorized(resumed, request)
     after = resumed.load_recovery_snapshot()
     resumed.close()
 

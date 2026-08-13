@@ -33,7 +33,7 @@ def _target(
 def _report(**changes: object) -> LiveJournalInspectionReport:
     values: dict[str, object] = {
         "account_id": ACCOUNT,
-        "database_schema_version": 2,
+        "database_schema_version": 3,
         "journal_sequence": 7,
         "disposition": LiveJournalInspectionDisposition.RECOVERY_REQUIRED,
         "issue_codes": (LiveJournalInspectionIssueCode.OUTSTANDING_DISPATCH,),
@@ -93,14 +93,17 @@ def test_target_rejects_noncanonical_identifier(target_id: str) -> None:
             DIGEST,
         ),
         _report(),
-        LiveJournalInspectionReport(
-            ACCOUNT,
-            1,
-            7,
-            LiveJournalInspectionDisposition.SCHEMA_UPGRADE_REQUIRED,
-            (LiveJournalInspectionIssueCode.SCHEMA_UPGRADE_REQUIRED,),
-            (),
-            DIGEST,
+        *(
+            LiveJournalInspectionReport(
+                ACCOUNT,
+                version,
+                7,
+                LiveJournalInspectionDisposition.SCHEMA_UPGRADE_REQUIRED,
+                (LiveJournalInspectionIssueCode.SCHEMA_UPGRADE_REQUIRED,),
+                (),
+                DIGEST,
+            )
+            for version in (1, 2)
         ),
         LiveJournalInspectionReport(
             ACCOUNT,
@@ -211,7 +214,7 @@ def test_report_requires_target_issue_to_be_reported() -> None:
         ),
         lambda: _report(
             disposition=LiveJournalInspectionDisposition.SCHEMA_UPGRADE_REQUIRED,
-            database_schema_version=2,
+            database_schema_version=3,
             issue_codes=(LiveJournalInspectionIssueCode.SCHEMA_UPGRADE_REQUIRED,),
             targets=(),
         ),

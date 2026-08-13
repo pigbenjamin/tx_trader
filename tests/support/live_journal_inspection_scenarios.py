@@ -9,6 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 import sqlite3
 
+from tests.support.live_authorization_audit_scenarios import commit_authorized
 from tx_trade.orders.live_contracts import (
     FingerprintDomain,
     BrokerCorrelation,
@@ -64,6 +65,7 @@ from tx_trade.orders.sqlite_live_order_journal import SqliteLiveOrderJournal
 NOW = datetime(2026, 8, 9, tzinfo=timezone.utc)
 ORDERS_DIR = Path(__file__).parents[2] / "tx_trade" / "orders"
 V1_SCHEMA = ORDERS_DIR / "live_journal_schema_v1.sql"
+V2_SCHEMA = ORDERS_DIR / "live_journal_schema_v2.sql"
 
 
 class AttributionBlocker(StrEnum):
@@ -364,6 +366,51 @@ def create_frozen_v1(path: Path, *, with_claim: bool = False) -> None:
                     "INSERT INTO live_journal_records VALUES (NULL, ?, ?, ?, ?)",
                     (kind, record_id, digest, recorded_at),
                 )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def create_frozen_v2(path: Path) -> None:
+    """Create a canonical, minimal schema-v2 journal without using migration code."""
+
+    schema_bytes = V2_SCHEMA.read_bytes()
+    v1_fingerprint = f"sha256:{sha256(V1_SCHEMA.read_bytes()).hexdigest()}"
+    fingerprint = f"sha256:{sha256(schema_bytes).hexdigest()}"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(schema_bytes.decode("utf-8"))
+        identity = LiveJournalIdentity("journal-v2", 2, fingerprint, NOW)
+        identity_digest = journal_digest(
+            "tx_trade.live.journal.identity.v1", encode_journal_value(identity)
+        )
+        timestamp = NOW.isoformat().replace("+00:00", "Z")
+        connection.executemany(
+            "INSERT INTO live_journal_migrations VALUES (?, ?)",
+            ((1, v1_fingerprint), (2, fingerprint)),
+        )
+        connection.execute(
+            "INSERT INTO live_journal_identity VALUES (1, ?, 2, ?, ?)",
+            (identity.journal_id, fingerprint, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO live_journal_records VALUES (NULL, 'identity', ?, ?, ?)",
+            (identity.journal_id, identity_digest, timestamp),
+        )
+        migration_digest = journal_module._scalar_digest(
+            journal_module._SCHEMA_MIGRATION_FACT_DOMAIN,
+            {
+                "version": 2,
+                "from_fingerprint": v1_fingerprint,
+                "to_fingerprint": fingerprint,
+                "recorded_at": timestamp,
+            },
+        )
+        connection.execute(
+            "INSERT INTO live_journal_records VALUES (NULL, 'schema-migration', '2', ?, ?)",
+            (migration_digest, timestamp),
+        )
         connection.commit()
     finally:
         connection.close()
@@ -676,7 +723,7 @@ def _commit_attribution_resolution(
             for item in requirement_ids
         ),
     )
-    assert journal.commit_reconciliation(request).disposition.value == "committed"
+    assert commit_authorized(journal, request).disposition.value == "committed"
 
 
 def create_attribution_scenario(

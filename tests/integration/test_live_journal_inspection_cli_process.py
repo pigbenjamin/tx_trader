@@ -16,6 +16,7 @@ from tests.support.live_journal_inspection_scenarios import (
     AttributionState,
     create_attribution_scenario,
     create_frozen_v1,
+    create_frozen_v2,
     create_semantically_blocked_v2,
     create_v2,
     create_v2_with_claim,
@@ -158,7 +159,7 @@ def forbidden_runtime_path(*args, **kwargs):
 for method_name in (
     "claim_dispatch",
     "record_dispatch_receipt",
-    "commit_reconciliation",
+    "commit_authorized_reconciliation",
 ):
     setattr(SqliteLiveOrderJournal, method_name, forbidden_runtime_path)
 
@@ -290,11 +291,12 @@ def _create_ready(path: Path) -> str:
 @pytest.mark.parametrize(
     ("fixture", "exit_code", "disposition", "schema_version"),
     (
-        ("ready", 0, "ready_no_action", 2),
-        ("recovery", 10, "recovery_required", 2),
+        ("ready", 0, "ready_no_action", 3),
+        ("recovery", 10, "recovery_required", 3),
         ("upgrade", 11, "schema_upgrade_required", 1),
-        ("account_missing", 12, "account_not_found", 2),
-        ("blocked", 13, "blocked_integrity_failure", 2),
+        ("upgrade_v2", 11, "schema_upgrade_required", 2),
+        ("account_missing", 12, "account_not_found", 3),
+        ("blocked", 13, "blocked_integrity_failure", 3),
     ),
 )
 def test_real_module_cli_status_exit_matrix_is_deterministic_and_read_only(
@@ -326,6 +328,8 @@ def test_real_module_cli_status_exit_matrix_is_deterministic_and_read_only(
         )
     elif fixture == "upgrade":
         create_frozen_v1(path)
+    elif fixture == "upgrade_v2":
+        create_frozen_v2(path)
     elif fixture == "account_missing":
         create_v2(path, orders=(("foreign-account-secret", "foreign-order", "foreign-command"),))
     else:

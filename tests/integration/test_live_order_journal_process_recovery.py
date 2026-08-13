@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 
+from tests.support.live_authorization_audit_scenarios import commit_authorized
 from tx_trade.orders.live_contracts import (
     FingerprintDomain,
     LiveOrderIntent,
@@ -297,13 +298,14 @@ from tests.integration.test_live_reconciliation_commit_fake import (
     _open,
     _register_claim_and_accept,
 )
+from tests.support.live_authorization_audit_scenarios import commit_authorized
 from tx_trade.orders.live_journal_contracts import JournalOpenMode
 
 journal = _open(sys.argv[1], JournalOpenMode.CREATE_NEW)
 _register_claim_and_accept(journal)
 request = _claim_request(journal, commit_id="commit-process-integration")
 if sys.argv[2] == "after":
-    result = journal.commit_reconciliation(request)
+    result = commit_authorized(journal, request)
     assert result.disposition.value == "committed"
 os._exit(0)
 """
@@ -328,8 +330,8 @@ os._exit(0)
 
         if phase == "before":
             assert len(recovered.outstanding_claims) == 1
-            committed = resumed.commit_reconciliation(
-                _commit_claim_request(resumed, commit_id="commit-process-parent")
+            committed = commit_authorized(
+                resumed, _commit_claim_request(resumed, commit_id="commit-process-parent")
             )
             assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
         else:
@@ -401,7 +403,7 @@ if sys.argv[2] == "after":
         clock=lambda: datetime(2026, 8, 3, 1, tzinfo=timezone.utc),
         claim_token_factory=lambda: "unused-migration-claim",
     )
-    assert journal.load_recovery_snapshot().journal_sequence == 2
+    assert journal.load_recovery_snapshot().journal_sequence == 3
 os._exit(0)
 '''
 
@@ -421,7 +423,7 @@ os._exit(0)
         if phase == "before":
             assert (version_before_resume, commit_tables) == (1, 0)
         else:
-            assert (version_before_resume, commit_tables) == (2, 1)
+            assert (version_before_resume, commit_tables) == (3, 1)
 
         resumed = SqliteLiveOrderJournal(
             path,
@@ -431,7 +433,7 @@ os._exit(0)
         )
         snapshot = resumed.load_recovery_snapshot()
         assert resumed.identity.schema_version == 1
-        assert snapshot.journal_sequence == 2
+        assert snapshot.journal_sequence == 3
         assert snapshot.orders == ()
         assert snapshot.outstanding_claims == ()
         assert not verify_recovery_snapshot(snapshot).may_dispatch

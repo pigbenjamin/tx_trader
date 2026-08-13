@@ -20,6 +20,10 @@ TRUSTED_ASSESSMENT_MODULES = (
     "tx_trade.orders.live_reconciliation_assessment_contracts",
     "tx_trade.orders.sqlite_live_reconciliation_assessment",
 )
+RECONCILIATION_AUTHORIZATION_MODULES = (
+    "tx_trade.orders.live_reconciliation_authorization_contracts",
+    "tx_trade.orders.live_reconciliation_authorization",
+)
 RUNTIME_PERSISTENCE_MODULES = frozenset(
     {
         "tx_trade.orders.sqlite_live_journal_inspection",
@@ -158,6 +162,32 @@ _TRUSTED_EXTERNAL_IMPORT_PREFIXES = (
     "urllib3",
     "websockets",
 )
+_AUTHORIZATION_FORBIDDEN_IMPORT_PREFIXES = (
+    "io",
+    "json",
+    "os",
+    "pathlib",
+    "shutil",
+    "sqlite3",
+    "sys",
+    "tempfile",
+    "tx_trade.broker",
+    "tx_trade.orders.live_operator_recovery",
+    "tx_trade.orders.live_reconciliation",
+    "tx_trade.orders.sqlite_live_journal_inspection",
+    "tx_trade.orders.sqlite_live_order_journal",
+    "tx_trade.orders.sqlite_live_reconciliation_assessment",
+    *_TRUSTED_EXTERNAL_IMPORT_PREFIXES,
+)
+_AUTHORIZATION_MUTATION_NAME_PARTS = (
+    "dispatch",
+    "migrate",
+    "receipt",
+    "resend",
+    "write",
+)
+_AUTHORIZATION_MUTATION_SYMBOL_MEMBERS = frozenset({"commit_authorized_reconciliation"})
+_AUTHORIZATION_CODEC_MODULE = "tx_trade.orders.live_journal_codec"
 
 
 def _production_paths() -> tuple[Path, ...]:
@@ -175,7 +205,15 @@ def _production_modules() -> tuple[str, ...]:
         if parts[-1] == "__init__":
             parts = parts[:-1]
         modules.append(".".join(parts))
-    return tuple(dict.fromkeys((*modules, *TRUSTED_ASSESSMENT_MODULES)))
+    return tuple(
+        dict.fromkeys(
+            (
+                *modules,
+                *TRUSTED_ASSESSMENT_MODULES,
+                *RECONCILIATION_AUTHORIZATION_MODULES,
+            )
+        )
+    )
 
 
 def _is_forbidden_import(module_name: str) -> bool:
@@ -287,6 +325,84 @@ def _trusted_source_violations(source: str, *, runtime: bool) -> set[str]:
             if any(part in member for part in _TRUSTED_MUTATION_NAME_PARTS):
                 violations.add(f"mutation-symbol:{resolved}")
 
+    return violations
+
+
+def _authorization_source_violations(
+    source: str,
+    *,
+    allow_canonical_codec: bool,
+) -> set[str]:
+    tree = ast.parse(source)
+    violations = _safety_violations(source)
+    imports = _module_imports(tree)
+
+    for module_name, imported_names in imports:
+        if any(
+            module_name == prefix or module_name.startswith(f"{prefix}.")
+            for prefix in _AUTHORIZATION_FORBIDDEN_IMPORT_PREFIXES
+        ):
+            violations.add(f"authorization-import:{module_name}")
+        module_parts = module_name.lower().split(".")
+        if any(
+            part in {"config", "configuration", "credentials", "environment"}
+            or "credential" in part
+            or "password" in part
+            for part in module_parts
+        ):
+            violations.add(f"authorization-import:{module_name}")
+        if module_name == _AUTHORIZATION_CODEC_MODULE and not allow_canonical_codec:
+            violations.add(f"authorization-import:{module_name}")
+        if any(part in module_name.lower() for part in _AUTHORIZATION_MUTATION_NAME_PARTS):
+            violations.add(f"authorization-mutation-import:{module_name}")
+        for imported_name in imported_names:
+            if any(part in imported_name.lower() for part in _AUTHORIZATION_MUTATION_NAME_PARTS):
+                violations.add(f"authorization-mutation-import:{module_name}.{imported_name}")
+
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                bindings[local_name] = alias.name if alias.asname else local_name
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            module_name = node.module
+            if node.level == 1:
+                module_name = f"tx_trade.orders.{module_name}"
+            for alias in node.names:
+                bindings[alias.asname or alias.name] = f"{module_name}.{alias.name}"
+
+    for node in ast.walk(tree):
+        resolved = _resolved_name(node, bindings) if isinstance(node, ast.expr) else None
+        if isinstance(node, ast.Call) and resolved in {
+            "builtins.input",
+            "input",
+            "json.load",
+            "json.loads",
+        }:
+            violations.add(f"authorization-input:{resolved}")
+        if isinstance(node, ast.Attribute) and resolved == "sys.stdin":
+            violations.add("authorization-input:sys.stdin")
+        if isinstance(node, (ast.Call, ast.Attribute)) and resolved is not None:
+            member = resolved.rsplit(".", maxsplit=1)[-1].lower()
+            if member in _AUTHORIZATION_MUTATION_SYMBOL_MEMBERS or any(
+                part in member for part in _AUTHORIZATION_MUTATION_NAME_PARTS
+            ):
+                violations.add(f"authorization-mutation-symbol:{resolved}")
+
+    return violations
+
+
+def _repository_commit_surface_violations(source: str) -> set[str]:
+    tree = ast.parse(source)
+    violations: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "SqliteLiveOrderJournal":
+            continue
+        for member in node.body:
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if member.name == "commit_reconciliation":
+                    violations.add("public-method:SqliteLiveOrderJournal.commit_reconciliation")
     return violations
 
 
@@ -478,6 +594,15 @@ def test_trusted_assessment_modules_are_explicit_fresh_import_targets() -> None:
     assert all(modules.count(module_name) == 1 for module_name in TRUSTED_ASSESSMENT_MODULES)
 
 
+def test_authorization_modules_are_explicit_fresh_import_targets() -> None:
+    modules = _production_modules()
+
+    assert set(RECONCILIATION_AUTHORIZATION_MODULES) <= set(modules)
+    assert all(
+        modules.count(module_name) == 1 for module_name in RECONCILIATION_AUTHORIZATION_MODULES
+    )
+
+
 @pytest.mark.parametrize(
     ("module_name", "runtime"),
     [
@@ -496,6 +621,45 @@ def test_trusted_assessment_sources_preserve_read_only_boundaries(
     )
 
     assert violations == set(), f"{path}: {sorted(violations)}"
+
+
+@pytest.mark.parametrize(
+    ("module_name", "allow_canonical_codec"),
+    [
+        ("tx_trade.orders.live_reconciliation_authorization_contracts", False),
+        ("tx_trade.orders.live_reconciliation_authorization", True),
+    ],
+)
+def test_authorization_sources_preserve_pure_boundaries(
+    module_name: str,
+    allow_canonical_codec: bool,
+) -> None:
+    path = Path(*module_name.split(".")).with_suffix(".py")
+    violations = _authorization_source_violations(
+        path.read_text(encoding="utf-8"),
+        allow_canonical_codec=allow_canonical_codec,
+    )
+
+    assert violations == set(), f"{path}: {sorted(violations)}"
+
+
+def test_sqlite_journal_exposes_only_authorized_reconciliation_commit() -> None:
+    path = Path("tx_trade/orders/sqlite_live_order_journal.py")
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    journal = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SqliteLiveOrderJournal"
+    )
+    methods = {
+        node.name
+        for node in journal.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    assert "commit_authorized_reconciliation" in methods
+    assert _repository_commit_surface_violations(source) == set()
 
 
 def test_production_path_enumeration_includes_future_capital_and_live_modules(
@@ -611,6 +775,90 @@ def test_trusted_source_scanner_rejects_hostile_fragments(
     expected: str,
 ) -> None:
     assert expected in _trusted_source_violations(source, runtime=runtime)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("import sqlite3", "authorization-import:sqlite3"),
+        ("import os", "authorization-import:os"),
+        ("from pathlib import Path", "authorization-import:pathlib"),
+        ("import app.config", "authorization-import:app.config"),
+        ("from app.credentials import TOKEN", "authorization-import:app.credentials"),
+        ("import comtypes.client", "import:comtypes.client"),
+        ("sdk.SKCOMLib.SendOrder(order)", "order-sdk-call:sdk.SKCOMLib.SendOrder"),
+        ("import websockets", "authorization-import:websockets"),
+        ("import sys\nline = sys.stdin.readline()", "authorization-input:sys.stdin"),
+        ("import json\nvalue = json.loads(raw)", "authorization-input:json.loads"),
+        (
+            "from .live_dispatch import dispatch_order",
+            "authorization-mutation-import:tx_trade.orders.live_dispatch",
+        ),
+        ("journal.resend_claim()", "authorization-mutation-symbol:journal.resend_claim"),
+        ("journal.record_receipt()", "authorization-mutation-symbol:journal.record_receipt"),
+        ("journal.migrate_schema()", "authorization-mutation-symbol:journal.migrate_schema"),
+        ("journal.write_record()", "authorization-mutation-symbol:journal.write_record"),
+        (
+            "journal.commit_authorized_reconciliation(value)",
+            "authorization-mutation-symbol:journal.commit_authorized_reconciliation",
+        ),
+        (
+            "commit = journal.commit_authorized_reconciliation",
+            "authorization-mutation-symbol:journal.commit_authorized_reconciliation",
+        ),
+        (
+            "from .live_journal_codec import journal_digest",
+            "authorization-import:tx_trade.orders.live_journal_codec",
+        ),
+    ],
+)
+def test_authorization_scanner_rejects_hostile_fragments(
+    source: str,
+    expected: str,
+) -> None:
+    assert expected in _authorization_source_violations(
+        source,
+        allow_canonical_codec=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from datetime import datetime",
+        ("from .live_reconciliation_commit_contracts import DurableReconciliationCommitRequest"),
+        (
+            "from .live_journal_codec import journal_digest\n"
+            "digest = journal_digest('domain', payload)"
+        ),
+        "def commit_authorized_reconciliation(request): return request",
+    ],
+)
+def test_authorization_binding_scanner_allows_pure_composition_fragments(
+    source: str,
+) -> None:
+    assert _authorization_source_violations(source, allow_canonical_codec=True) == set()
+
+
+def test_repository_commit_surface_scanner_rejects_only_bare_public_method() -> None:
+    hostile = """
+class SqliteLiveOrderJournal:
+    def commit_reconciliation(self, request):
+        return request
+"""
+    allowed = """
+class SqliteLiveOrderJournal:
+    def commit_authorized_reconciliation(self, request):
+        return self._commit_reconciliation(request)
+
+    def _commit_reconciliation(self, request):
+        return request
+"""
+
+    assert _repository_commit_surface_violations(hostile) == {
+        "public-method:SqliteLiveOrderJournal.commit_reconciliation"
+    }
+    assert _repository_commit_surface_violations(allowed) == set()
 
 
 def test_trusted_runtime_scanner_allows_only_approved_sqlite_read_sources() -> None:

@@ -89,7 +89,7 @@ def _assessment(account_id: str = ACCOUNT) -> ReconciliationAssessment:
 def _inspection(**changes: object) -> LiveJournalInspectionReport:
     values: dict[str, object] = {
         "account_id": ACCOUNT,
-        "database_schema_version": 2,
+        "database_schema_version": 3,
         "journal_sequence": 7,
         "disposition": LiveJournalInspectionDisposition.READY_NO_ACTION,
         "issue_codes": (),
@@ -208,13 +208,13 @@ def test_pair_requires_exact_nested_types_not_subclasses() -> None:
         InspectedReconciliationAssessment(_inspection(), object())  # type: ignore[arg-type]
 
 
-def test_pair_requires_schema_version_two() -> None:
+def test_pair_requires_schema_version_three() -> None:
     inspection = _inspection(
         database_schema_version=1,
         disposition=LiveJournalInspectionDisposition.SCHEMA_UPGRADE_REQUIRED,
         issue_codes=(LiveJournalInspectionIssueCode.SCHEMA_UPGRADE_REQUIRED,),
     )
-    with pytest.raises(ValueError, match="schema version 2"):
+    with pytest.raises(ValueError, match="schema version 3"):
         _pair(inspection)
 
 
@@ -235,7 +235,7 @@ def test_pair_rejects_non_assessment_dispositions(
             disposition=disposition,
             issue_codes=(LiveJournalInspectionIssueCode.SCHEMA_UPGRADE_REQUIRED,),
         )
-        expected = "schema version 2"
+        expected = "schema version 3"
     elif disposition is LiveJournalInspectionDisposition.ACCOUNT_NOT_FOUND:
         inspection = _inspection(
             disposition=disposition,

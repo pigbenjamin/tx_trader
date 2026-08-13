@@ -23,7 +23,6 @@ from tx_trade.orders.live_ports import (
 from tx_trade.orders.live_reconciliation_commit_contracts import (
     ClaimResolution,
     ClaimResolutionDirective,
-    DurableReconciliationCommitPort,
     DurableReconciliationCommitRequest,
     DurableReconciliationCommitResult,
     ExpectedOrderVersion,
@@ -127,24 +126,6 @@ def test_valid_request_is_frozen_slotted_and_has_no_committed_at() -> None:
     assert not hasattr(value, "__dict__")
     with pytest.raises(FrozenInstanceError):
         value.commit_id = "different"  # type: ignore[misc]
-
-
-def test_port_exposes_single_commit_operation() -> None:
-    expected = DurableReconciliationCommitResult(
-        "commit-1",
-        "account-1",
-        ReconciliationCommitDisposition.COMMITTED,
-        NOW,
-        5,
-    )
-
-    class Committer:
-        def commit_reconciliation(
-            self, value: DurableReconciliationCommitRequest
-        ) -> DurableReconciliationCommitResult:
-            return expected
-
-    assert isinstance(Committer(), DurableReconciliationCommitPort)
 
 
 @pytest.mark.parametrize("disposition", tuple(ReconciliationCommitDisposition))

@@ -226,7 +226,7 @@ def _durable_row_count(path: Path) -> int:
     try:
         return sum(
             connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
-            for table in inspection._V2_DURABLE_TABLES
+            for table in inspection._V3_DURABLE_TABLES
         )
     finally:
         connection.close()

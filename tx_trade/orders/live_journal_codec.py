@@ -72,6 +72,10 @@ from .live_reconciliation_commit_contracts import (
     RequirementResolution,
     RequirementResolutionDirective,
 )
+from .live_reconciliation_authorization_contracts import (
+    ReconciliationAuthorizationAction,
+    ReconciliationCommitAuthorization,
+)
 from .live_reconciliation_contracts import (
     BrokerReconciliationSnapshot,
     LocalReconciliationSnapshot,
@@ -134,6 +138,7 @@ _DATACLASSES: dict[str, type[object]] = {
         ObservationResolutionDirective,
         RequirementResolutionDirective,
         DurableReconciliationCommitRequest,
+        ReconciliationCommitAuthorization,
         RawBrokerObservation,
         AmbiguousObservation,
         AppliedEvent,
@@ -164,6 +169,7 @@ _ENUMS: dict[str, type[Enum]] = {
         ObservationStatus,
         ObservationResolution,
         RequirementResolution,
+        ReconciliationAuthorizationAction,
     )
 }
 

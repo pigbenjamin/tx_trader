@@ -177,8 +177,8 @@ def build_live_journal_inspection_report(
     if type(snapshot) is not LiveJournalRecoverySnapshot:
         raise TypeError("snapshot must be LiveJournalRecoverySnapshot")
     _validate_account_id(account_id)
-    identity = _validate_identity(snapshot.identity, frozenset({1, 2}))
-    _validate_schema_version(database_schema_version, 2)
+    identity = _validate_identity(snapshot.identity, frozenset({1, 2, 3}))
+    _validate_schema_version(database_schema_version, 3)
     scoped_issues = _validate_scoped_issues(scoped_issue_codes)
 
     verification = verify_recovery_snapshot(snapshot)
@@ -291,11 +291,20 @@ def build_schema_upgrade_required_inspection_report(
     database_schema_version: int,
     journal_sequence: int,
 ) -> LiveJournalInspectionReport:
-    """Build the only permitted inspection result for a valid schema-v1 journal."""
+    """Build the only permitted inspection result for a valid legacy journal."""
 
-    checked_identity = _validate_identity(identity, frozenset({1}))
+    checked_identity = _validate_identity(identity, frozenset({1, 2}))
     _validate_account_id(account_id)
-    _validate_schema_version(database_schema_version, 1)
+    if type(database_schema_version) is not int:
+        raise TypeError("database_schema_version must be an integer")
+    if database_schema_version not in {1, 2}:
+        raise ValueError("database schema version is not supported by this report builder")
+    if (database_schema_version, checked_identity.schema_version) not in {
+        (1, 1),
+        (2, 1),
+        (2, 2),
+    }:
+        raise ValueError("identity and database schema versions are incompatible")
     if type(journal_sequence) is not int:
         raise TypeError("journal_sequence must be an integer")
     if journal_sequence < 0:

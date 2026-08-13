@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 
+from tests.support.live_authorization_audit_scenarios import commit_authorized
 from tx_trade.orders.live_contracts import LiveOrderState
 from tx_trade.orders.live_journal_contracts import JournalOpenMode
 from tx_trade.orders.live_operator_recovery import build_operator_reconciliation_request
@@ -47,7 +48,7 @@ def _child(path: Path, stage: str) -> None:
             os._exit(MID_WRITE_CRASH_EXIT)
 
         journal._write_order = write_order_then_crash
-    committed = journal.commit_reconciliation(request)
+    committed = commit_authorized(journal, request)
     if committed.disposition is not ReconciliationCommitDisposition.COMMITTED:
         os._exit(3)
     os._exit(0)
@@ -116,7 +117,7 @@ def test_abrupt_exit_after_durable_commit_resumes_complete_projection(tmp_path: 
     assert recovery.applied_event_ledger.events == ()
     assert resumed.load_account_snapshot(ACCOUNT_ID).recovery_blockers == ()
     assert resumed.load_account_snapshot(ACCOUNT_ID).fills == ()
-    assert _facts(path) == (1, 1, 2, 0, 0, 0, "reconciliation-commit", 7)
+    assert _facts(path) == (1, 1, 2, 0, 0, 0, "reconciliation-commit", 9)
     resumed.close()
 
 
@@ -130,7 +131,7 @@ def test_abrupt_exit_before_commit_preserves_original_blocked_cut(tmp_path: Path
     assert order is not None and order.state is LiveOrderState.SUBMISSION_UNKNOWN
     assert len(recovery.outstanding_claims) == 1
     assert resumed.load_account_snapshot(ACCOUNT_ID).recovery_blockers
-    assert _facts(path) == (0, 0, 1, 0, 0, 0, "dispatch-claim", 5)
+    assert _facts(path) == (0, 0, 1, 0, 0, 0, "dispatch-claim", 6)
     resumed.close()
 
 
@@ -151,7 +152,7 @@ def test_abrupt_exit_during_projection_write_rolls_back_entire_commit(
     _, assessment, plan = _plan(resumed, order)
     assert not assessment.may_dispatch
     assert not plan.may_dispatch
-    assert _facts(path) == (0, 0, 1, 0, 0, 0, "dispatch-claim", 5)
+    assert _facts(path) == (0, 0, 1, 0, 0, 0, "dispatch-claim", 6)
     resumed.close()
 
 

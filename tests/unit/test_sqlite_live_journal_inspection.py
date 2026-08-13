@@ -10,8 +10,10 @@ from typing import Callable
 import pytest
 
 import tx_trade.orders.sqlite_live_journal_inspection as inspection_module
+import tx_trade.orders.sqlite_live_order_journal as journal_module
 from tests.support.live_journal_inspection_scenarios import (
     create_frozen_v1,
+    create_frozen_v2,
     create_multi_account_foreign_secrets,
     create_semantically_blocked_v2,
     create_v2,
@@ -76,7 +78,7 @@ def _assert_failure(
     return raised.value
 
 
-def test_clean_v2_is_deterministic_and_bitwise_read_only(tmp_path: Path) -> None:
+def test_clean_v3_is_deterministic_and_bitwise_read_only(tmp_path: Path) -> None:
     path = tmp_path / "journal.sqlite3"
     create_v2(path, orders=(("account-a", "order-a", "command-a"),))
     before_artifacts = _artifact_snapshot(path)
@@ -93,7 +95,7 @@ def test_clean_v2_is_deterministic_and_bitwise_read_only(tmp_path: Path) -> None
 
     assert first == second
     assert first.inspection_digest == second.inspection_digest
-    assert first.database_schema_version == 2
+    assert first.database_schema_version == 3
     assert _artifact_snapshot(path) == before_artifacts
     assert database_rows(path) == before_rows
     assert schema_signature(path) == before_schema
@@ -123,6 +125,95 @@ def test_frozen_v1_requests_upgrade_without_migration(tmp_path: Path, with_claim
     assert database_rows(path) == rows
     assert schema_signature(path) == signature
     assert "live_reconciliation_commits" not in rows
+
+
+def test_frozen_v2_requests_upgrade_without_querying_v3_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "journal-v2.sqlite3"
+    create_frozen_v2(path)
+    before = _artifact_snapshot(path)
+    original_connect = sqlite3.connect
+    statements: list[str] = []
+
+    def audited_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", audited_connect)
+    report = _inspect(path)
+
+    assert report.disposition is LiveJournalInspectionDisposition.SCHEMA_UPGRADE_REQUIRED
+    assert report.database_schema_version == 2
+    assert not any("live_reconciliation_commit_authorizations" in sql for sql in statements)
+    assert _artifact_snapshot(path) == before
+
+
+def test_v1_created_migrated_v2_requests_upgrade_bitwise_read_only(tmp_path: Path) -> None:
+    path = tmp_path / "journal-v1-created-v2.sqlite3"
+    create_frozen_v1(path)
+    connection = sqlite3.connect(path)
+    try:
+        recorded_at = connection.execute(
+            "SELECT created_at FROM live_journal_identity WHERE singleton = 1"
+        ).fetchone()[0]
+        migration = Path(journal_module.__file__).with_name("live_journal_migration_v1_to_v2.sql")
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        fingerprints = dict(
+            connection.execute("SELECT version, schema_fingerprint FROM live_journal_migrations")
+        )
+        migration_digest = journal_module._scalar_digest(
+            journal_module._SCHEMA_MIGRATION_FACT_DOMAIN,
+            {
+                "version": 2,
+                "from_fingerprint": fingerprints[1],
+                "to_fingerprint": fingerprints[2],
+                "recorded_at": recorded_at,
+            },
+        )
+        connection.execute(
+            "INSERT INTO live_journal_records VALUES (NULL, 'schema-migration', '2', ?, ?)",
+            (migration_digest, recorded_at),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    before = _artifact_snapshot(path)
+
+    report = _inspect(path)
+
+    assert report.disposition is LiveJournalInspectionDisposition.SCHEMA_UPGRADE_REQUIRED
+    assert report.issue_codes == (LiveJournalInspectionIssueCode.SCHEMA_UPGRADE_REQUIRED,)
+    assert report.database_schema_version == 2
+    assert _artifact_snapshot(path) == before
+
+
+def test_v1_created_migrated_v3_inspects_without_upgrade_bitwise_read_only(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "journal-v1-created-v3.sqlite3"
+    create_frozen_v1(path)
+    journal = SqliteLiveOrderJournal(
+        path,
+        JournalOpenMode.RESUME,
+        clock=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
+        claim_token_factory=lambda: "unused",
+    )
+    try:
+        assert journal.identity.schema_version == 1
+    finally:
+        journal.close()
+    before = _artifact_snapshot(path)
+
+    report = _inspect(path)
+
+    assert report.disposition is LiveJournalInspectionDisposition.ACCOUNT_NOT_FOUND
+    assert report.issue_codes == (LiveJournalInspectionIssueCode.ACCOUNT_NOT_FOUND,)
+    assert report.database_schema_version == 3
+    assert LiveJournalInspectionIssueCode.SCHEMA_UPGRADE_REQUIRED not in report.issue_codes
+    assert _artifact_snapshot(path) == before
+    assert set(before) == {path.name}
 
 
 @pytest.mark.parametrize("suffix", ("-wal", "-shm", "-journal"))
@@ -251,6 +342,7 @@ def test_hybrid_sqlite_header_pair_fails_closed_without_mutation(
         "UPDATE live_journal_migrations SET schema_fingerprint = 'sha256:' || printf('%064d', 1) WHERE version = 2",
         "UPDATE live_journal_records SET payload_digest = 'sha256:' || printf('%064d', 2) WHERE journal_sequence = 1",
         "UPDATE live_journal_records SET journal_sequence = journal_sequence + 100 WHERE journal_sequence = 1",
+        "ALTER TABLE live_reconciliation_commit_authorizations ADD COLUMN attacker_secret TEXT",
     ),
 )
 def test_header_schema_digest_and_sequence_tamper_fail_closed(
@@ -475,7 +567,7 @@ def test_sqlite_authorizer_observes_only_read_operations(
 
     monkeypatch.setattr(sqlite3, "connect", audited_connect)
     report = _inspect(path)
-    assert report.database_schema_version == 2
+    assert report.database_schema_version == 3
     forbidden = {
         sqlite3.SQLITE_INSERT,
         sqlite3.SQLITE_UPDATE,

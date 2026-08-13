@@ -11,6 +11,9 @@ import sqlite3
 
 import pytest
 
+from tests.support.live_authorization_audit_scenarios import commit_authorized
+
+from tx_trade.orders import sqlite_live_order_journal as journal_module
 from tx_trade.orders.live_contracts import (
     BrokerCorrelation,
     BrokerOrderEventType,
@@ -351,21 +354,21 @@ def test_commit_is_atomic_exact_and_survives_resume(tmp_path: Path) -> None:
     assert request.assessment.local_snapshot.journal_sequence == request.expected_journal_sequence
     before = _durable_state(path)
 
-    result = journal.commit_reconciliation(request)
+    result = commit_authorized(journal, request)
 
     assert result.disposition is ReconciliationCommitDisposition.COMMITTED
-    assert result.resulting_journal_sequence == before[0] + 2
+    assert result.resulting_journal_sequence == before[0] + 3
     assert result.resolved_claim_ids == (command.client_command_id,)
     assert result.order_projections == ()
     assert journal.load_account_snapshot("account-1").recovery_blockers == ()
     assert journal.get_order(order.intent.client_order_id) == order
     committed_state = _durable_state(path)
-    assert committed_state[0] == before[0] + 2
+    assert committed_state[0] == before[0] + 3
     assert committed_state[1][5:7] == (1, 1)
 
     journal.close()
     resumed = _journal(path, JournalOpenMode.RESUME, hour=2)
-    assert resumed.commit_reconciliation(request) == replace(
+    assert commit_authorized(resumed, request) == replace(
         result, disposition=ReconciliationCommitDisposition.EXACT_RETRY
     )
     assert _durable_state(path) == committed_state
@@ -399,11 +402,11 @@ def test_exact_retry_after_unrelated_sequence_advance_writes_nothing(tmp_path: P
     _, order, token = _register_claim(journal)
     order = _accept_claim(journal, order)
     request = _request(journal, order, token)
-    first = journal.commit_reconciliation(request)
+    first = commit_authorized(journal, request)
     _register_claim(journal, order_id="order-2", account_id="account-2")
     advanced = _durable_state(path)
 
-    retry = journal.commit_reconciliation(request)
+    retry = commit_authorized(journal, request)
 
     assert retry == replace(first, disposition=ReconciliationCommitDisposition.EXACT_RETRY)
     assert retry.committed_at == first.committed_at
@@ -419,7 +422,7 @@ def test_id_conflict_stale_sequence_wrong_version_and_token_are_no_write(
     _, order, token = _register_claim(journal)
     order = _accept_claim(journal, order)
     original = _request(journal, order, token)
-    committed = journal.commit_reconciliation(original)
+    committed = commit_authorized(journal, original)
     stable = _durable_state(path)
 
     conflict = _request(
@@ -430,7 +433,7 @@ def test_id_conflict_stale_sequence_wrong_version_and_token_are_no_write(
         snapshot_id="snapshot-conflict",
     )
     assert (
-        journal.commit_reconciliation(conflict).disposition
+        commit_authorized(journal, conflict).disposition
         is ReconciliationCommitDisposition.ID_CONFLICT
     )
     assert _durable_state(path) == stable
@@ -450,7 +453,7 @@ def test_id_conflict_stale_sequence_wrong_version_and_token_are_no_write(
     _register_claim(journal, order_id="order-other-account", account_id="account-2")
     before_rejections = _durable_state(stale_path)
     assert (
-        journal.commit_reconciliation(current).disposition
+        commit_authorized(journal, current).disposition
         is ReconciliationCommitDisposition.STALE_SNAPSHOT
     )
     assert _durable_state(stale_path) == before_rejections
@@ -471,7 +474,7 @@ def test_id_conflict_stale_sequence_wrong_version_and_token_are_no_write(
         ),
     )
     assert (
-        journal.commit_reconciliation(wrong_version).disposition
+        commit_authorized(journal, wrong_version).disposition
         is ReconciliationCommitDisposition.VERSION_MISMATCH
     )
     assert _durable_state(stale_path) == before_rejections
@@ -487,7 +490,7 @@ def test_id_conflict_stale_sequence_wrong_version_and_token_are_no_write(
         ),
     )
     assert (
-        journal.commit_reconciliation(wrong_token).disposition
+        commit_authorized(journal, wrong_token).disposition
         is ReconciliationCommitDisposition.VERSION_MISMATCH
     )
     assert _durable_state(stale_path) == before_rejections
@@ -512,7 +515,7 @@ def test_weak_or_absence_only_evidence_is_rejected_without_writes(
     _, order, token = _register_claim(journal)
     request = _request(journal, order, token, **changes)
     before = _durable_state(path)
-    assert journal.commit_reconciliation(request).disposition is expected
+    assert commit_authorized(journal, request).disposition is expected
     assert _durable_state(path) == before
 
 
@@ -557,7 +560,7 @@ def test_forged_clean_result_cannot_hide_broker_order_mismatch(
     forged_request = replace(request, assessment=forged)
     before = _durable_state(path)
 
-    result = journal.commit_reconciliation(forged_request)
+    result = commit_authorized(journal, forged_request)
 
     assert result.disposition is ReconciliationCommitDisposition.NOT_AUTHORITATIVE
     assert _durable_state(path) == before
@@ -588,7 +591,7 @@ def test_semantically_identical_broker_observations_are_deduplicated_for_commit(
     assert canonical.result.discrepancies == ()
     duplicate_request = replace(request, assessment=canonical)
 
-    committed = journal.commit_reconciliation(duplicate_request)
+    committed = commit_authorized(journal, duplicate_request)
 
     assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
     assert committed.resolved_claim_ids == (f"command-{order.intent.client_order_id}",)
@@ -608,7 +611,7 @@ def test_empty_and_multi_target_with_one_bad_target_are_atomic_no_write(tmp_path
     )
     before = _durable_state(path)
     assert (
-        journal.commit_reconciliation(empty).disposition
+        commit_authorized(journal, empty).disposition
         is ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION
     )
     assert _durable_state(path) == before
@@ -660,7 +663,7 @@ def test_empty_and_multi_target_with_one_bad_target_are_atomic_no_write(tmp_path
             ),
         ),
     )
-    result = journal.commit_reconciliation(bad_second)
+    result = commit_authorized(journal, bad_second)
     assert result.disposition in {
         ReconciliationCommitDisposition.VERSION_MISMATCH,
         ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION,
@@ -677,7 +680,7 @@ def test_order_projection_is_explicitly_unsupported_and_writes_nothing(tmp_path:
     projected = replace(base, order_projections=(_projection(order),))
     before = _durable_state(path)
     assert (
-        journal.commit_reconciliation(projected).disposition
+        commit_authorized(journal, projected).disposition
         is ReconciliationCommitDisposition.UNSUPPORTED_RESOLUTION
     )
     assert _durable_state(path) == before
@@ -697,7 +700,7 @@ def test_commit_mapping_tamper_fails_closed(tmp_path: Path, tamper_sql: str) -> 
     _, order, token = _register_claim(journal)
     order = _accept_claim(journal, order)
     assert (
-        journal.commit_reconciliation(_request(journal, order, token)).disposition
+        commit_authorized(journal, _request(journal, order, token)).disposition
         is ReconciliationCommitDisposition.COMMITTED
     )
     journal.close()
@@ -720,7 +723,7 @@ def test_missing_requested_overlay_fails_closed_despite_repaired_sequence_and_di
     command, order, token = _register_claim(journal)
     order = _accept_claim(journal, order)
     request = _request(journal, order, token)
-    committed = journal.commit_reconciliation(request)
+    committed = commit_authorized(journal, request)
     assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
     journal.close()
 
@@ -744,6 +747,23 @@ def test_missing_requested_overlay_fails_closed_despite_repaired_sequence_and_di
                 "resulting_sequence": repaired_sequence,
                 "committed_at": row[4],
             },
+        )
+        authorization_row = connection.execute(
+            """SELECT authorization_id, authorization_digest, consumed_at
+               FROM live_reconciliation_commit_authorizations WHERE commit_id = ?""",
+            (request.commit_id,),
+        ).fetchone()
+        authorization_trigger = connection.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type = 'trigger'
+                 AND name = 'live_reconciliation_commit_authorizations_no_update'"""
+        ).fetchone()
+        assert authorization_row is not None and authorization_trigger is not None
+        repaired_authorization_fact = journal_module._authorization_fact_digest(
+            authorization_row[1],
+            request.commit_id,
+            authorization_row[2],
+            repaired_sequence,
         )
         connection.execute(
             "DELETE FROM live_dispatch_claim_resolutions WHERE client_command_id = ?",
@@ -769,6 +789,18 @@ def test_missing_requested_overlay_fails_closed_despite_repaired_sequence_and_di
             "UPDATE sqlite_sequence SET seq = ? WHERE name = 'live_journal_records'",
             (repaired_sequence,),
         )
+        connection.execute("DROP TRIGGER live_reconciliation_commit_authorizations_no_update")
+        connection.execute(
+            """UPDATE live_reconciliation_commit_authorizations
+               SET resulting_journal_sequence = ? WHERE commit_id = ?""",
+            (repaired_sequence, request.commit_id),
+        )
+        connection.execute(authorization_trigger[0])
+        connection.execute(
+            """UPDATE live_journal_records SET payload_digest = ?
+               WHERE record_kind = 'operator-authorization' AND record_id = ?""",
+            (repaired_authorization_fact, authorization_row[0]),
+        )
         connection.commit()
 
         assert connection.execute(
@@ -783,8 +815,27 @@ def test_missing_requested_overlay_fails_closed_despite_repaired_sequence_and_di
         assert connection.execute(
             "SELECT count(*) FROM live_dispatch_claim_resolutions"
         ).fetchone() == (0,)
+        assert connection.execute(
+            """SELECT a.resulting_journal_sequence, r.journal_sequence, r.payload_digest
+               FROM live_reconciliation_commit_authorizations a
+               JOIN live_reconciliation_commits c ON c.commit_id = a.commit_id
+               JOIN live_journal_records r
+                 ON r.record_kind = 'operator-authorization'
+                AND r.record_id = a.authorization_id
+               WHERE a.commit_id = ?
+                 AND a.request_digest = c.request_digest
+                 AND a.authorization_digest = ?""",
+            (request.commit_id, authorization_row[1]),
+        ).fetchone() == (
+            repaired_sequence,
+            int(row[2]) + 1,
+            repaired_authorization_fact,
+        )
     finally:
         connection.close()
 
-    with pytest.raises(LiveJournalIntegrityError):
+    with pytest.raises(
+        LiveJournalIntegrityError,
+        match="live journal reconciliation commit mapping is invalid",
+    ):
         _journal(path, JournalOpenMode.RESUME)

@@ -1032,3 +1032,85 @@ Status and next work:
 - Authorization/audit schema work and query-only broker integration remain
   separately gated. Performance batch/stream/RSS benchmarking and safe WAL
   snapshot/copy remain deferred.
+
+## 2026-08-13: Phase 3B-6 authorized reconciliation commit audit and SQLite v2-to-v3
+
+Completed implementation:
+
+- Advanced the writable live-order journal to SQLite schema v3. Writable open
+  migrates v1 through v2 to v3, migrates v2 to v3, and creates fresh v3
+  journals. The migration remains transactional and preserves creation
+  identity, existing facts and resolution overlays.
+- Preserved pre-v3 reconciliation commits as historical authoritative records.
+  They are not rewritten and no principal or authorization audit is invented
+  for commits made before the v3 migration boundary.
+- Narrowed sealed inspection semantics: valid v1 and v2 sources are
+  upgrade-only and return `SCHEMA_UPGRADE_REQUIRED`; only a verified current-v3
+  sealed image can feed the trusted assessment source.
+- Kept assessment, recovery planning, operator selection, and commit-request
+  construction pure. A trusted in-process caller authenticates the principal,
+  supplies the authorization context, and invokes the one atomic persistence
+  operation, `commit_authorized_reconciliation`. The bare public repository
+  `commit_reconciliation` method is removed.
+- Added exactly one authorized action, `reconciliation_commit`, bound to the
+  journal/account, source inspection, operator plan, exact request and broker
+  snapshot, commit ID, and expected journal sequence. TTL is positive and at
+  most five minutes; first use requires
+  `authorized_at <= commit_time < expires_at`.
+- Made authorization audit, projections/history, resolution overlays, and the
+  reconciliation commit atomic. Audit rows and global facts are append-only
+  and verified during reopen. Missing, changed, forged, or orphan audit
+  mappings fail closed.
+- Preserved exact retry semantics: only the complete persisted authorization
+  plus identical request returns `EXACT_RETRY`, with the original commit time
+  and resulting sequence and no additional writes, even after expiry. Changed
+  authorization or request material and reused identifiers/bindings conflict.
+
+Safety and trust boundaries:
+
+- Authorization and authorized-request wrappers keep `may_dispatch=False`, and
+  the workflow has no dispatch capability. No dispatch, resend, broker query
+  or adapter, COM/SKCOM, credential access, signature, generic token,
+  receipt/event/fill synthesis, or real order is added.
+- SHA-256 and canonical digests are integrity and exact-content bindings only.
+  They do not authenticate a principal or broker, provide a cryptographic
+  signature, or establish non-repudiation. Principal identity and
+  authentication are responsibilities of the trusted caller.
+- Production broker authentication and evidence freshness remain later gates.
+  Append-only in-database audit does not replace an external audit capable of
+  detecting privileged database or trusted-host tampering.
+
+Commander validation status:
+
+- Format check covered 192 files.
+- The formal Ruff scope `tx_trade tests` passed.
+- Mypy passed over 77 source files.
+- The earlier focused Phase 3B-6 result was `493 passed`, but it predates the
+  review fixes and was not rerun with the same matrix; it is not final
+  evidence.
+- Unit suite: `1735 passed, 4 skipped`.
+- Offline integration suite: `176 passed, 1 deselected`.
+- Full default offline suite: `1911 passed, 4 skipped, 6 deselected` in
+  288.23 seconds.
+- An additional repository-root Ruff diagnostic found lint in three
+  pre-existing COM/debug scripts. They are unchanged, outside this slice, and
+  not part of the formal `tx_trade tests` Ruff gate.
+- Implementation and Commander final validation are complete.
+- Findings fixed before the final Commander runs: commit-time TOCTOU
+  linearization; the legacy `+1` versus authorized `+2` sequence boundary;
+  concurrent migration; legacy inspection identity; deeper tamper coverage;
+  shared fixtures and guards; and late-crash recovery.
+- The final LOW requesting explicit v1-created-to-v3 inspection coverage was
+  fixed before the final counts above.
+- Final correctness, security, and tests/maintainability reviewer status:
+  delta reviews complete. No open BLOCKER/HIGH/MEDIUM/LOW findings remain, and
+  all reviewers recommend merge.
+- The slice is committed; no merge is claimed.
+
+Status and next work:
+
+- Phase 3 remains in progress. No next functional slice has been selected.
+- Query-only broker integration remains separately gated. Every dispatch and
+  real-order step still requires separate planning and explicit authorization;
+  performance benchmarking and a safe WAL snapshot/copy protocol remain
+  deferred.

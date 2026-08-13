@@ -242,14 +242,18 @@ def test_create_resume_and_create_resume_boundaries(tmp_path: Path) -> None:
     path = tmp_path / "live.sqlite3"
     journal = _journal(path, JournalOpenMode.CREATE_NEW, journal_id="journal-1")
     assert journal.identity.journal_id == "journal-1"
-    assert journal.load_recovery_snapshot().journal_sequence == 2
+    assert journal.load_recovery_snapshot().journal_sequence == 3
     connection = sqlite3.connect(path)
     initial_records = connection.execute(
         """SELECT record_kind, record_id FROM live_journal_records
            ORDER BY journal_sequence"""
     ).fetchall()
     connection.close()
-    assert initial_records == [("identity", "journal-1"), ("schema-migration", "2")]
+    assert initial_records == [
+        ("identity", "journal-1"),
+        ("schema-migration", "2"),
+        ("schema-migration", "3"),
+    ]
     journal.close()
     with pytest.raises(LiveJournalConflictError):
         _journal(path, JournalOpenMode.CREATE_NEW, journal_id="journal-2")
@@ -268,12 +272,12 @@ def test_register_claim_receipt_and_reopen(tmp_path: Path) -> None:
         command, order, intent_fingerprint=intent_fingerprint(command.intent)
     )
     assert registered.disposition is RegistrationDisposition.REGISTERED
-    assert journal.load_recovery_snapshot().journal_sequence == 4
+    assert journal.load_recovery_snapshot().journal_sequence == 5
     retry = journal.register_new_order(
         command, order, intent_fingerprint=intent_fingerprint(command.intent)
     )
     assert retry.disposition is RegistrationDisposition.EXACT_RETRY
-    assert journal.load_recovery_snapshot().journal_sequence == 4
+    assert journal.load_recovery_snapshot().journal_sequence == 5
     fingerprint = payload_fingerprint(command, FingerprintDomain.NEW_COMMAND_V1)
     claim = journal.claim_dispatch(
         command.client_command_id,
@@ -283,7 +287,7 @@ def test_register_claim_receipt_and_reopen(tmp_path: Path) -> None:
     )
     assert claim.disposition is DispatchClaimDisposition.ACQUIRED
     assert claim.claim_token is not None
-    assert journal.load_recovery_snapshot().journal_sequence == 5
+    assert journal.load_recovery_snapshot().journal_sequence == 6
     journal.close()
 
     journal = _journal(path, JournalOpenMode.RESUME)
@@ -298,7 +302,7 @@ def test_register_claim_receipt_and_reopen(tmp_path: Path) -> None:
         claimant_id="dispatcher-2",
     )
     assert already.disposition is DispatchClaimDisposition.ALREADY_CLAIMED
-    assert journal.load_recovery_snapshot().journal_sequence == 5
+    assert journal.load_recovery_snapshot().journal_sequence == 6
     receipt = DispatchReceipt(
         command.client_command_id,
         fingerprint,
@@ -312,14 +316,14 @@ def test_register_claim_receipt_and_reopen(tmp_path: Path) -> None:
         expected_order_version=order.version,
     )
     assert result.disposition is ReceiptRecordDisposition.RECORDED
-    assert journal.load_recovery_snapshot().journal_sequence == 6
+    assert journal.load_recovery_snapshot().journal_sequence == 7
     retry_result = journal.record_dispatch_receipt(
         receipt,
         claim_token=claim.claim_token,
         expected_order_version=order.version,
     )
     assert retry_result.disposition is ReceiptRecordDisposition.EXACT_RETRY
-    assert journal.load_recovery_snapshot().journal_sequence == 6
+    assert journal.load_recovery_snapshot().journal_sequence == 7
     assert journal.load_recovery_snapshot().outstanding_claims == ()
     journal.close()
 
@@ -329,11 +333,11 @@ def test_raw_observation_exact_retry_conflict_and_reopen(tmp_path: Path) -> None
     journal = _journal(path, JournalOpenMode.CREATE_NEW, journal_id="journal-1")
     raw = RawBrokerObservation("raw-1", "capital", 1, 1, NOW, b"payload")
     assert journal.append_raw_observation(raw).disposition is JournalAppendDisposition.APPENDED
-    assert journal.load_recovery_snapshot().journal_sequence == 3
+    assert journal.load_recovery_snapshot().journal_sequence == 4
     assert (
         journal.append_raw_observation(raw).disposition is JournalAppendDisposition.EXACT_DUPLICATE
     )
-    assert journal.load_recovery_snapshot().journal_sequence == 3
+    assert journal.load_recovery_snapshot().journal_sequence == 4
     changed = RawBrokerObservation("raw-1", "capital", 1, 2, NOW, b"changed")
     assert (
         journal.append_raw_observation(changed).disposition is JournalAppendDisposition.ID_CONFLICT
@@ -380,7 +384,7 @@ def test_global_journal_sequence_gap_fails_closed(tmp_path: Path) -> None:
     journal.register_new_order(
         command, order, intent_fingerprint=intent_fingerprint(command.intent)
     )
-    assert journal.load_recovery_snapshot().journal_sequence == 4
+    assert journal.load_recovery_snapshot().journal_sequence == 5
     journal.close()
 
     connection = sqlite3.connect(path)
@@ -421,7 +425,7 @@ def test_injected_clock_and_claim_token_are_validated_at_use(tmp_path: Path) -> 
         )
     snapshot = journal.load_recovery_snapshot()
     assert snapshot.outstanding_claims == ()
-    assert snapshot.journal_sequence == 4
+    assert snapshot.journal_sequence == 5
     journal.close()
 
 

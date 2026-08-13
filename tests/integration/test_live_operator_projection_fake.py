@@ -8,6 +8,8 @@ import sqlite3
 
 import pytest
 
+from tests.support.live_authorization_audit_scenarios import commit_authorized
+
 from tx_trade.orders.live_contracts import (
     BrokerCorrelation,
     BrokerOpenOrderObservation,
@@ -232,7 +234,7 @@ def test_fake_full_projection_plan_build_commit_retry_and_restart(tmp_path: Path
         assessment,
     )
 
-    committed = journal.commit_reconciliation(request)
+    committed = commit_authorized(journal, request)
     assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
     assert committed.order_projections == request.order_projections
     accepted = journal.get_order(ORDER_ID)
@@ -244,7 +246,7 @@ def test_fake_full_projection_plan_build_commit_retry_and_restart(tmp_path: Path
     assert after.applied_event_ledger.events == ()
     assert _row_counts(path) == (1, 1, 0, 0)
 
-    retry = journal.commit_reconciliation(request)
+    retry = commit_authorized(journal, request)
     assert retry == replace(committed, disposition=ReconciliationCommitDisposition.EXACT_RETRY)
     assert journal.load_recovery_snapshot() == after
     reacquire = journal.claim_dispatch(
@@ -280,7 +282,7 @@ def test_stale_request_after_sequence_advance_writes_no_commit(tmp_path: Path) -
     )
     before = journal.load_recovery_snapshot()
     counts = _row_counts(path)
-    result = journal.commit_reconciliation(request)
+    result = commit_authorized(journal, request)
     assert result.disposition is ReconciliationCommitDisposition.STALE_SNAPSHOT
     assert journal.load_recovery_snapshot() == before
     assert _row_counts(path) == counts == (0, 0, 0, 0)

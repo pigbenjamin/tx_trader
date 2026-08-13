@@ -9,10 +9,11 @@ import pytest
 
 
 ORDERS_DIR = Path(__file__).parents[2] / "tx_trade" / "orders"
-CURRENT_SCHEMA = ORDERS_DIR / "live_journal_schema.sql"
+V2_SCHEMA = ORDERS_DIR / "live_journal_schema_v2.sql"
 V1_SCHEMA = ORDERS_DIR / "live_journal_schema_v1.sql"
 V1_TO_V2 = ORDERS_DIR / "live_journal_migration_v1_to_v2.sql"
 V1_SHA256 = "2e2a378b3babf61c7458f7354e875a733eba803ffc9d7bf460a9644db5c724c1"
+V2_SHA256 = "d9c6c23fdce811b9a85efafa8eadd6083842c0d1d9007c33943d028a6d103b3b"
 
 
 def _connect() -> sqlite3.Connection:
@@ -34,7 +35,7 @@ def _signature(connection: sqlite3.Connection) -> tuple[tuple[str, str, str], ..
 
 def _fresh_v2() -> sqlite3.Connection:
     connection = _connect()
-    connection.executescript(CURRENT_SCHEMA.read_text(encoding="utf-8"))
+    connection.executescript(V2_SCHEMA.read_text(encoding="utf-8"))
     return connection
 
 
@@ -104,8 +105,9 @@ def _seed_resolution_targets(connection: sqlite3.Connection) -> None:
     )
 
 
-def test_v1_schema_is_byte_for_byte_frozen() -> None:
+def test_v1_and_v2_schemas_are_byte_for_byte_frozen() -> None:
     assert sha256(V1_SCHEMA.read_bytes()).hexdigest() == V1_SHA256
+    assert sha256(V2_SCHEMA.read_bytes()).hexdigest() == V2_SHA256
 
 
 def test_fresh_v2_has_expected_version_and_overlay_tables() -> None:
@@ -150,7 +152,7 @@ def test_v1_migration_matches_fresh_v2_schema_and_preserves_creation_identity() 
 
 
 def test_migration_leaves_transaction_management_to_caller() -> None:
-    for sql_path in (CURRENT_SCHEMA, V1_TO_V2):
+    for sql_path in (V2_SCHEMA, V1_TO_V2):
         script = sql_path.read_text(encoding="utf-8")
         assert re.search(r"\b(?:BEGIN|COMMIT|ROLLBACK)\b", script, re.IGNORECASE) is None
 

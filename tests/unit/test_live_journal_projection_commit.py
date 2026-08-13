@@ -9,6 +9,8 @@ import sqlite3
 
 import pytest
 
+from tests.support.live_authorization_audit_scenarios import commit_authorized
+
 from tx_trade.orders import sqlite_live_order_journal as journal_module
 from tx_trade.orders.live_contracts import (
     BrokerCorrelation,
@@ -65,6 +67,85 @@ from tx_trade.orders.live_state_machine import advance_local, create_live_order,
 from tx_trade.orders.sqlite_live_order_journal import SqliteLiveOrderJournal
 
 NOW = datetime(2026, 8, 4, tzinfo=timezone.utc)
+
+
+def _repair_authorization_binding(
+    connection: sqlite3.Connection,
+    *,
+    commit_id: str,
+    request_digest: str,
+    resulting_sequence: int,
+) -> None:
+    row = connection.execute(
+        """SELECT authorization_id, principal_id, authority_context_digest,
+                  action_kind, journal_id, account_id, source_inspection_digest,
+                  operator_plan_digest, broker_snapshot_id,
+                  expected_journal_sequence, authorized_at, expires_at,
+                  consumed_at, reason_code
+           FROM live_reconciliation_commit_authorizations WHERE commit_id = ?""",
+        (commit_id,),
+    ).fetchone()
+    trigger = connection.execute(
+        """SELECT sql FROM sqlite_master
+           WHERE type = 'trigger'
+             AND name = 'live_reconciliation_commit_authorizations_no_update'"""
+    ).fetchone()
+    assert row is not None and trigger is not None
+    authorization = journal_module.ReconciliationCommitAuthorization(
+        authorization_id=row[0],
+        principal_id=row[1],
+        authority_context_digest=row[2],
+        action=journal_module.ReconciliationAuthorizationAction(row[3]),
+        journal_id=row[4],
+        account_id=row[5],
+        source_inspection_digest=row[6],
+        operator_plan_digest=row[7],
+        commit_id=commit_id,
+        request_digest=request_digest,
+        broker_snapshot_id=row[8],
+        expected_journal_sequence=int(row[9]),
+        authorized_at=datetime.fromisoformat(row[10]),
+        expires_at=datetime.fromisoformat(row[11]),
+        reason_code=row[13],
+    )
+    authorization_digest = journal_module.reconciliation_authorization_digest(authorization)
+    authorization_fact = journal_module._authorization_fact_digest(
+        authorization_digest,
+        commit_id,
+        row[12],
+        resulting_sequence,
+    )
+    connection.execute("DROP TRIGGER live_reconciliation_commit_authorizations_no_update")
+    connection.execute(
+        """UPDATE live_reconciliation_commit_authorizations
+           SET request_digest = ?, authorization_digest = ?,
+               resulting_journal_sequence = ? WHERE commit_id = ?""",
+        (request_digest, authorization_digest, resulting_sequence, commit_id),
+    )
+    connection.execute(trigger[0])
+    connection.execute(
+        """UPDATE live_journal_records SET payload_digest = ?
+           WHERE record_kind = 'operator-authorization' AND record_id = ?""",
+        (authorization_fact, row[0]),
+    )
+    assert connection.execute(
+        """SELECT a.request_digest, a.authorization_digest,
+                  a.resulting_journal_sequence, r.journal_sequence, r.payload_digest
+           FROM live_reconciliation_commit_authorizations a
+           JOIN live_journal_records r
+             ON r.record_kind = 'operator-authorization'
+            AND r.record_id = a.authorization_id
+           WHERE a.commit_id = ?""",
+        (commit_id,),
+    ).fetchone() == (
+        request_digest,
+        authorization_digest,
+        resulting_sequence,
+        int(row[9]) + 1,
+        authorization_fact,
+    )
+
+
 UNKNOWN_AT = NOW + timedelta(hours=1)
 SNAPSHOT_AT = NOW + timedelta(hours=5)
 
@@ -334,10 +415,10 @@ def test_projection_claim_commit_is_atomic_exact_and_survives_resume(
     request = _request(journal, (fixture,))
     before = _state(path)
 
-    result = journal.commit_reconciliation(request)
+    result = commit_authorized(journal, request)
 
     assert result.disposition is ReconciliationCommitDisposition.COMMITTED
-    assert result.resulting_journal_sequence == before[0] + 2
+    assert result.resulting_journal_sequence == before[0] + 3
     assert result.resolved_claim_ids == (command.client_command_id,)
     assert result.order_projections == request.order_projections
     projected = request.order_projections[0]
@@ -352,7 +433,7 @@ def test_projection_claim_commit_is_atomic_exact_and_survives_resume(
 
     journal.close()
     resumed = _journal(path, JournalOpenMode.RESUME)
-    retry = resumed.commit_reconciliation(request)
+    retry = commit_authorized(resumed, request)
     assert retry == replace(result, disposition=ReconciliationCommitDisposition.EXACT_RETRY)
     assert retry.order_projections == request.order_projections
     assert _state(path) == committed_state
@@ -386,7 +467,7 @@ def test_id_conflict_and_forged_projection_write_nothing(tmp_path: Path) -> None
     journal = _journal(path, JournalOpenMode.CREATE_NEW)
     fixture = _register_unknown(journal, "order-1", sequence=1)
     request = _request(journal, (fixture,))
-    committed = journal.commit_reconciliation(request)
+    committed = commit_authorized(journal, request)
     stable = _state(path)
 
     conflict = replace(
@@ -399,7 +480,7 @@ def test_id_conflict_and_forged_projection_write_nothing(tmp_path: Path) -> None
         ),
     )
     assert (
-        journal.commit_reconciliation(conflict).disposition
+        commit_authorized(journal, conflict).disposition
         is ReconciliationCommitDisposition.ID_CONFLICT
     )
     assert _state(path) == stable
@@ -417,7 +498,7 @@ def test_id_conflict_and_forged_projection_write_nothing(tmp_path: Path) -> None
     forged = replace(request, order_projections=(forged_order,))
     before = _state(forged_path)
     assert (
-        journal.commit_reconciliation(forged).disposition
+        commit_authorized(journal, forged).disposition
         is ReconciliationCommitDisposition.NOT_AUTHORITATIVE
     )
     assert _state(forged_path) == before
@@ -430,7 +511,7 @@ def test_projection_verifier_allows_a_legitimate_later_current_version(
     journal = _journal(path, JournalOpenMode.CREATE_NEW)
     fixture = _register_unknown(journal, "order-1", sequence=1)
     request = _request(journal, (fixture,))
-    result = journal.commit_reconciliation(request)
+    result = commit_authorized(journal, request)
     assert result.disposition is ReconciliationCommitDisposition.COMMITTED
     projected = request.order_projections[0]
 
@@ -450,7 +531,7 @@ def test_projection_verifier_allows_a_legitimate_later_current_version(
 
     resumed = _journal(path, JournalOpenMode.RESUME)
     assert resumed.get_order("order-1") == later
-    assert resumed.commit_reconciliation(request) == replace(
+    assert commit_authorized(resumed, request) == replace(
         result,
         disposition=ReconciliationCommitDisposition.EXACT_RETRY,
     )
@@ -468,7 +549,7 @@ def test_projection_only_stale_sequence_version_and_token_are_no_write(
     projection_only = replace(request, commit_id="projection-only", claim_resolutions=())
     before = _state(path)
     assert (
-        journal.commit_reconciliation(projection_only).disposition
+        commit_authorized(journal, projection_only).disposition
         is ReconciliationCommitDisposition.VERSION_MISMATCH
     )
     assert _state(path) == before
@@ -479,7 +560,7 @@ def test_projection_only_stale_sequence_version_and_token_are_no_write(
         order_projections=(),
     )
     assert (
-        journal.commit_reconciliation(missing_projection).disposition
+        commit_authorized(journal, missing_projection).disposition
         is ReconciliationCommitDisposition.NOT_AUTHORITATIVE
     )
     assert _state(path) == before
@@ -498,7 +579,7 @@ def test_projection_only_stale_sequence_version_and_token_are_no_write(
         ),
     )
     assert (
-        journal.commit_reconciliation(wrong_version).disposition
+        commit_authorized(journal, wrong_version).disposition
         is ReconciliationCommitDisposition.NOT_AUTHORITATIVE
     )
     assert _state(path) == before
@@ -509,7 +590,7 @@ def test_projection_only_stale_sequence_version_and_token_are_no_write(
         claim_resolutions=(replace(request.claim_resolutions[0], claim_token="wrong-token"),),
     )
     assert (
-        journal.commit_reconciliation(wrong_token).disposition
+        commit_authorized(journal, wrong_token).disposition
         is ReconciliationCommitDisposition.VERSION_MISMATCH
     )
     assert _state(path) == before
@@ -520,7 +601,7 @@ def test_projection_only_stale_sequence_version_and_token_are_no_write(
     )
     stale_state = _state(path)
     assert (
-        journal.commit_reconciliation(stale).disposition
+        commit_authorized(journal, stale).disposition
         is ReconciliationCommitDisposition.STALE_SNAPSHOT
     )
     assert _state(path) == stale_state
@@ -543,7 +624,7 @@ def test_reordered_plan_and_mixed_multi_order_bad_target_roll_back_everything(
         order_projections=tuple(reversed(request.order_projections)),
     )
     assert (
-        journal.commit_reconciliation(reordered).disposition
+        commit_authorized(journal, reordered).disposition
         is ReconciliationCommitDisposition.NOT_AUTHORITATIVE
     )
     assert _state(path) == before
@@ -557,7 +638,7 @@ def test_reordered_plan_and_mixed_multi_order_bad_target_roll_back_everything(
         ),
     )
     assert (
-        journal.commit_reconciliation(bad_second).disposition
+        commit_authorized(journal, bad_second).disposition
         is ReconciliationCommitDisposition.VERSION_MISMATCH
     )
     assert _state(path) == before
@@ -573,8 +654,7 @@ def test_projection_history_tamper_fails_closed_on_resume(tmp_path: Path, tamper
     fixture = _register_unknown(journal, "order-1", sequence=1)
     request = _request(journal, (fixture,))
     assert (
-        journal.commit_reconciliation(request).disposition
-        is ReconciliationCommitDisposition.COMMITTED
+        commit_authorized(journal, request).disposition is ReconciliationCommitDisposition.COMMITTED
     )
     projected = request.order_projections[0]
     journal.close()
@@ -629,7 +709,7 @@ def test_repaired_projection_only_commit_mapping_fails_closed_on_resume(
     fixture = _register_unknown(journal, "order-1", sequence=1)
     command, _, _ = fixture
     request = _request(journal, (fixture,))
-    committed = journal.commit_reconciliation(request)
+    committed = commit_authorized(journal, request)
     assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
     journal.close()
 
@@ -690,6 +770,12 @@ def test_repaired_projection_only_commit_mapping_fails_closed_on_resume(
             "UPDATE sqlite_sequence SET seq = ? WHERE name = 'live_journal_records'",
             (repaired_sequence,),
         )
+        _repair_authorization_binding(
+            connection,
+            commit_id=request.commit_id,
+            request_digest=repaired_request_digest,
+            resulting_sequence=repaired_sequence,
+        )
         connection.commit()
 
         assert connection.execute(
@@ -702,7 +788,10 @@ def test_repaired_projection_only_commit_mapping_fails_closed_on_resume(
     finally:
         connection.close()
 
-    with pytest.raises(LiveJournalIntegrityError):
+    with pytest.raises(
+        LiveJournalIntegrityError,
+        match="live journal reconciliation projection history is invalid",
+    ):
         _journal(path, JournalOpenMode.RESUME)
 
 
@@ -714,7 +803,7 @@ def test_repaired_no_projection_non_authoritative_assessment_fails_closed(
     command, unknown_order, token = _register_unknown(journal, "order-1", sequence=1)
     accepted_order = _accept_unknown_order(journal, unknown_order, sequence=2)
     request = _no_projection_request(journal, command, accepted_order, token)
-    committed = journal.commit_reconciliation(request)
+    committed = commit_authorized(journal, request)
     assert committed.disposition is ReconciliationCommitDisposition.COMMITTED
     journal.close()
 
@@ -770,11 +859,20 @@ def test_repaired_no_projection_non_authoritative_assessment_fails_closed(
                WHERE record_kind = 'reconciliation-commit' AND record_id = ?""",
             (repaired_commit_digest, request.commit_id),
         )
+        _repair_authorization_binding(
+            connection,
+            commit_id=request.commit_id,
+            request_digest=repaired_request_digest,
+            resulting_sequence=int(row[2]),
+        )
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(LiveJournalIntegrityError):
+    with pytest.raises(
+        LiveJournalIntegrityError,
+        match="live journal reconciliation assessment is invalid",
+    ):
         _journal(path, JournalOpenMode.RESUME)
 
 
@@ -785,8 +883,7 @@ def test_repaired_projection_fill_claim_resolution_fails_closed(tmp_path: Path) 
     command, _, _ = fixture
     request = _request(journal, (fixture,))
     assert (
-        journal.commit_reconciliation(request).disposition
-        is ReconciliationCommitDisposition.COMMITTED
+        commit_authorized(journal, request).disposition is ReconciliationCommitDisposition.COMMITTED
     )
     journal.close()
 
@@ -859,11 +956,20 @@ def test_repaired_projection_fill_claim_resolution_fails_closed(tmp_path: Path) 
                WHERE record_kind = 'reconciliation-commit' AND record_id = ?""",
             (repaired_commit_digest, request.commit_id),
         )
+        _repair_authorization_binding(
+            connection,
+            commit_id=request.commit_id,
+            request_digest=repaired_request_digest,
+            resulting_sequence=int(commit_row[2]),
+        )
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(LiveJournalIntegrityError):
+    with pytest.raises(
+        LiveJournalIntegrityError,
+        match="live journal reconciliation projection history is invalid",
+    ):
         _journal(path, JournalOpenMode.RESUME)
 
 
@@ -874,8 +980,7 @@ def test_repaired_projection_version_audit_fails_closed(tmp_path: Path) -> None:
     command, prior_order, token = fixture
     request = _request(journal, (fixture,))
     assert (
-        journal.commit_reconciliation(request).disposition
-        is ReconciliationCommitDisposition.COMMITTED
+        commit_authorized(journal, request).disposition is ReconciliationCommitDisposition.COMMITTED
     )
     journal.close()
 
@@ -966,8 +1071,7 @@ def test_order_history_recorded_at_tamper_fails_closed(tmp_path: Path) -> None:
     fixture = _register_unknown(journal, "order-1", sequence=1)
     request = _request(journal, (fixture,))
     assert (
-        journal.commit_reconciliation(request).disposition
-        is ReconciliationCommitDisposition.COMMITTED
+        commit_authorized(journal, request).disposition is ReconciliationCommitDisposition.COMMITTED
     )
     projected = request.order_projections[0]
     journal.close()

@@ -33,6 +33,7 @@ from tx_trade.orders.sqlite_live_reconciliation_assessment import (
 
 from tests.support.live_journal_inspection_scenarios import (
     create_frozen_v1,
+    create_frozen_v2,
     create_semantically_blocked_v2,
 )
 from tests.support.trusted_assessment_source_scenarios import (
@@ -42,7 +43,7 @@ from tests.support.trusted_assessment_source_scenarios import (
     AtomicBrokerSource,
     CountingClock,
     complete_broker_snapshot,
-    create_sealed_v2,
+    create_sealed_v3,
     directory_snapshot,
     forged_snapshot,
 )
@@ -61,7 +62,11 @@ def _forbid_mutating_journal_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     def forbidden(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("trusted assessment attempted a mutating journal call")
 
-    for name in ("claim_dispatch", "record_dispatch_receipt", "commit_reconciliation"):
+    for name in (
+        "claim_dispatch",
+        "record_dispatch_receipt",
+        "commit_authorized_reconciliation",
+    ):
         monkeypatch.setattr(SqliteLiveOrderJournal, name, forbidden)
 
 
@@ -70,7 +75,7 @@ def test_clean_close_assessment_has_provenance_is_recomputed_and_never_writes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "clean.sqlite3"
-    recovery = create_sealed_v2(path)
+    recovery = create_sealed_v3(path)
     expected_inspection = inspect_sqlite_live_order_journal(path, account_id=ACCOUNT_ID)
     before = directory_snapshot(tmp_path)
     source = AtomicBrokerSource(complete_broker_snapshot())
@@ -106,7 +111,7 @@ def test_repeated_one_shot_calls_are_deterministic_and_do_not_reuse_evidence(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "repeat.sqlite3"
-    create_sealed_v2(path)
+    create_sealed_v3(path)
     before = directory_snapshot(tmp_path)
     source = AtomicBrokerSource(complete_broker_snapshot())
     clock = CountingClock()
@@ -126,7 +131,7 @@ def test_local_clock_before_durable_order_event_fails_before_broker_and_never_wr
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "local-clock-before-durable-event.sqlite3"
-    create_sealed_v2(path)
+    create_sealed_v3(path)
     before = directory_snapshot(tmp_path)
     source = AtomicBrokerSource(complete_broker_snapshot())
     clock = CountingClock((CREATED_AT + timedelta(seconds=1),))
@@ -147,7 +152,7 @@ def test_submission_unknown_flows_to_operator_plan_without_committing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "submission-unknown.sqlite3"
-    recovery = create_sealed_v2(path, submission_unknown=True)
+    recovery = create_sealed_v3(path, submission_unknown=True)
     before = directory_snapshot(tmp_path)
     source = AtomicBrokerSource(complete_broker_snapshot())
     clock = CountingClock()
@@ -169,6 +174,7 @@ def test_submission_unknown_flows_to_operator_plan_without_committing(
     ("scenario", "expected_code"),
     (
         ("v1", TrustedAssessmentSourceFailureCode.SCHEMA_UPGRADE_REQUIRED),
+        ("v2", TrustedAssessmentSourceFailureCode.SCHEMA_UPGRADE_REQUIRED),
         ("missing-account", TrustedAssessmentSourceFailureCode.ACCOUNT_NOT_FOUND),
         ("blocked", TrustedAssessmentSourceFailureCode.INTEGRITY_FAILURE),
         ("sidecar", TrustedAssessmentSourceFailureCode.ACTIVE_OR_UNCLEAN_SOURCE),
@@ -186,6 +192,8 @@ def test_local_source_failures_precede_broker_query_and_are_zero_write(
     account_id = ACCOUNT_ID
     if scenario == "v1":
         create_frozen_v1(path)
+    elif scenario == "v2":
+        create_frozen_v2(path)
     elif scenario == "blocked":
         create_semantically_blocked_v2(path)
         account_id = "account-a"
@@ -194,7 +202,7 @@ def test_local_source_failures_precede_broker_query_and_are_zero_write(
     elif scenario == "missing":
         pass
     else:
-        create_sealed_v2(path)
+        create_sealed_v3(path)
         if scenario == "missing-account":
             account_id = "account-not-present"
         elif scenario == "sidecar":
@@ -227,7 +235,7 @@ def test_hostile_broker_sources_fail_closed_without_writing(
     kind: str,
 ) -> None:
     path = tmp_path / f"broker-{kind}.sqlite3"
-    create_sealed_v2(path)
+    create_sealed_v3(path)
     snapshot = complete_broker_snapshot()
     expected = TrustedAssessmentSourceFailureCode.MALFORMED_EVIDENCE
     failure: BaseException | None = None
@@ -290,7 +298,7 @@ def test_non_authoritative_evidence_remains_fail_closed(
     expected_status: str,
 ) -> None:
     path = tmp_path / f"{expected_status}.sqlite3"
-    create_sealed_v2(path)
+    create_sealed_v3(path)
     before = directory_snapshot(tmp_path)
     source = AtomicBrokerSource(
         complete_broker_snapshot(evidence_status=status, correlation_status=correlation)
@@ -311,7 +319,7 @@ def test_trusted_path_does_not_consult_runtime_integrations_or_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "poison.sqlite3"
-    create_sealed_v2(path)
+    create_sealed_v3(path)
     source = AtomicBrokerSource(complete_broker_snapshot())
     clock = CountingClock()
     _forbid_mutating_journal_calls(monkeypatch)

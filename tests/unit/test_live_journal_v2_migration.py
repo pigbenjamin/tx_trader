@@ -282,12 +282,12 @@ def _add_ambiguity_rows(
         connection.close()
 
 
-def test_create_new_is_v2_and_empty_frozen_v1_resumes_via_atomic_migration(
+def test_create_new_is_v3_and_empty_frozen_v1_resumes_via_atomic_migration(
     tmp_path: Path,
 ) -> None:
     fresh_path = tmp_path / "fresh.sqlite3"
     fresh = _open(fresh_path, JournalOpenMode.CREATE_NEW, "journal-v2")
-    assert fresh.identity.schema_version == 2
+    assert fresh.identity.schema_version == 3
     fresh.close()
 
     migrated_path = tmp_path / "empty-v1.sqlite3"
@@ -295,20 +295,24 @@ def test_create_new_is_v2_and_empty_frozen_v1_resumes_via_atomic_migration(
     migrated = _open(migrated_path, JournalOpenMode.RESUME)
     assert migrated.identity.schema_version == 1
     assert migrated.identity.schema_fingerprint == f"sha256:{V1_SHA256}"
-    assert migrated.load_recovery_snapshot().journal_sequence == 2
+    assert migrated.load_recovery_snapshot().journal_sequence == 3
     migrated.close()
 
     assert _schema_signature(migrated_path) == _schema_signature(fresh_path)
     connection = sqlite3.connect(migrated_path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         assert connection.execute(
             "SELECT version FROM live_journal_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,)]
+        ).fetchall() == [(1,), (2,), (3,)]
         assert connection.execute(
             """SELECT record_kind, record_id FROM live_journal_records
                ORDER BY journal_sequence"""
-        ).fetchall() == [("identity", "journal-v1"), ("schema-migration", "2")]
+        ).fetchall() == [
+            ("identity", "journal-v1"),
+            ("schema-migration", "2"),
+            ("schema-migration", "3"),
+        ]
         assert connection.execute(
             """SELECT payload_digest FROM live_journal_records
                WHERE record_kind = 'identity'"""
